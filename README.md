@@ -59,7 +59,7 @@ Requires Node.js ≥ 22.13. Real workers additionally require the upstream CLI
 
 ```bash
 npm run demo     # Scene A: sync delegate-and-wait; Scene B: submit→waiting→approve→succeeded
-npm test         # 26 tests: state machine, persistence, timeout, cancel, approvals, remote daemon + reconciliation
+npm test         # 29 tests: state machine, persistence, timeout, cancel, approvals, remote daemon + resume
 npm run smoke    # drives the real MCP server over stdio through the full task lifecycle
 ```
 
@@ -302,6 +302,31 @@ Because the daemon cancels orphaned tasks when a socket closes, a task that was
 running at drop time reconciles to `cancelled` — never a false `succeeded`.
 `RemoteWorkerDriver.queryTask(remote, taskId)` exposes the same call.
 
+For a **still-running** task you'd rather resume than re-run, start the daemon
+with an orphan grace window (`orphanGraceMs`) and re-attach: the daemon replays
+every persisted event after a sequence boundary, then streams live events to
+completion — no re-submission, no duplicated work.
+
+```ts
+import { attachRemoteTask } from "agentmesh";
+
+const rec = await attachRemoteTask(
+  { endpoint: "https://gpu.example.com:8790", tokenEnv: "AGENTMESH_REMOTE_TOKEN" },
+  taskId,
+  {
+    afterSequence: lastSeq,               // resume where we left off (0 = full replay)
+    onEvent: (ev) => render(ev),          // replayed + live events, deduped by sequence
+    onPermissionRequest: async (req) => decide(req), // approvals still round-trip
+  },
+);
+// rec is the authoritative terminal TaskRecord.
+```
+
+With `orphanGraceMs: 0` (the default) a drop cancels the task immediately and
+`queryRemoteTask` reads back `cancelled`; with a grace window the task survives a
+brief disconnect and `attachRemoteTask` picks its stream back up. Aborting an
+attach detaches without cancelling the remote task.
+
 ### Security model
 
 - **Token required.** The daemon refuses to start if `tokenEnv` is unset or the
@@ -317,7 +342,9 @@ running at drop time reconciles to `cancelled` — never a false `succeeded`.
 - **ACP stdio stays local.** The daemon runs ACP in-process on machine B; only
   typed task events cross the wire. There is no raw stdio passthrough.
 - **No orphans.** If the WebSocket drops, the daemon cancels any non-terminal
-  task it was running for that connection.
+  task it was running for that connection — unless an `orphanGraceMs` window is
+  configured, during which the task stays alive so a client can `attach` and
+  resume it. Either way a dropped task is never silently reported as success.
 
 ### Remote tests
 
@@ -326,8 +353,10 @@ a real `RemoteWorkerDriver` client through it — dispatch + streamed events,
 approval round-trip, cancel, bad-token rejection, cwd-whitelist refusal, the
 `/healthz` vs `/profiles` auth split, reconnect reconciliation (completed-task
 query, unknown-id → `undefined`, and a dropped mid-run connection reconciling to
-`cancelled` not `succeeded`), and unit coverage of `assertSafeBind` /
-`assertCwdAllowed`. 11 remote tests, no network, no API cost.
+`cancelled` not `succeeded`), push-based resumption (`attach` replays a
+dropped-but-grace task to success, `afterSequence` replays only newer events,
+unknown-task attach rejects), and unit coverage of `assertSafeBind` /
+`assertCwdAllowed`. 14 remote tests, no network, no API cost.
 
 ## Architecture
 
@@ -366,17 +395,18 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **26/26** pass:
+- `npm test` — **29/29** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
   - `test/tasks.test.ts` (9) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
     idempotency de-dup, SQLite restart-and-requery, store column-merge safety.
-  - `test/remote.test.ts` (11) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
+  - `test/remote.test.ts` (14) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
     streamed events, approval round-trip, cancel, bad-token rejection,
     cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, reconnect
     reconciliation (completed-task query, unknown-id → `undefined`, dropped
-    mid-run → `cancelled` not `succeeded`), and unit guards for `assertSafeBind` /
-    `assertCwdAllowed`.
+    mid-run → `cancelled` not `succeeded`), push-based resumption (`attach`
+    replays to success, `afterSequence` boundary, unknown-task reject), and unit
+    guards for `assertSafeBind` / `assertCwdAllowed`.
 - `npm run demo` — Scene A (sync dispatch to two workers) and Scene B
   (submit → waiting → approve → succeeded) both close.
 - `npm run smoke` — real MCP stdio server through the full lifecycle; event

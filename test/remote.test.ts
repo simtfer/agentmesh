@@ -6,6 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,7 +14,7 @@ import { WebSocket as WS } from "ws";
 import { parseConfig } from "../src/config.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { WorkerDaemon } from "../src/remote/daemon.js";
-import { queryRemoteTask } from "../src/remote/client.js";
+import { queryRemoteTask, attachRemoteTask } from "../src/remote/client.js";
 import { assertCwdAllowed, assertSafeBind, SecurityError } from "../src/remote/security.js";
 import type { RemoteSettings, TaskRecord } from "../src/types.js";
 import { TERMINAL_TASK_STATUSES } from "../src/types.js";
@@ -28,6 +29,8 @@ const daemonConfig = parseConfig({
     { name: "fast", driver: "mock", mock: { delayMs: 2, toolCalls: 2 } },
     { name: "approver", driver: "mock", mock: { delayMs: 2, requireApproval: true } },
     { name: "slow", driver: "mock", mock: { delayMs: 40, toolCalls: 80 } },
+    // ~1.2s run: long enough to drop mid-flight and re-attach within grace.
+    { name: "resumable", driver: "mock", mock: { delayMs: 20, toolCalls: 60 } },
   ],
 });
 
@@ -39,7 +42,10 @@ interface Harness {
   stop: () => Promise<void>;
 }
 
-async function startDaemon(allowCwd: string[]): Promise<Harness> {
+async function startDaemon(
+  allowCwd: string[],
+  opts: { orphanGraceMs?: number } = {},
+): Promise<Harness> {
   const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-remote-"));
   const dOrch = new Orchestrator(daemonConfig, { baseCwd: dir, persist: false });
   const daemon = new WorkerDaemon({
@@ -49,6 +55,7 @@ async function startDaemon(allowCwd: string[]): Promise<Harness> {
     port: 0, // ephemeral
     token: TOKEN,
     allowCwd,
+    orphanGraceMs: opts.orphanGraceMs,
   });
   const info = await daemon.start();
   return {
@@ -62,6 +69,29 @@ async function startDaemon(allowCwd: string[]): Promise<Harness> {
       rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+/** Open an authenticated raw WebSocket to the daemon's /ws endpoint. */
+function openWs(url: string): Promise<WS> {
+  const ws = new WS(`${url.replace(/^http/, "ws")}/ws`, {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  return new Promise((res, rej) => {
+    ws.once("open", () => res(ws));
+    ws.once("error", rej);
+  });
+}
+
+/** Submit a task over a raw socket and resolve with its daemon-side taskId. */
+function submitRaw(ws: WS, profile: string, prompt: string, cwd: string, timeoutMs = 30000): Promise<string> {
+  const submitted = new Promise<string>((res) => {
+    ws.on("message", (d) => {
+      const m = JSON.parse(d.toString()) as { type: string; taskId?: string };
+      if (m.type === "submitted" && m.taskId) res(m.taskId);
+    });
+  });
+  ws.send(JSON.stringify({ type: "submit", submitId: randomUUID(), profile, prompt, cwd, timeoutMs }));
+  return submitted;
 }
 
 function clientOrch(url: string, baseCwd: string, tokenEnv = TOKEN_ENV) {
@@ -285,6 +315,88 @@ test("a dropped connection reconciles to cancelled, never a false success", asyn
     assert.ok(rec, "expected an authoritative record after reconnect");
     assert.notEqual(rec!.status, "succeeded", "a dropped running task must not read as success");
     assert.equal(rec!.status, "cancelled");
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------- push-based resumption ------------------------ */
+
+test("attach resumes a dropped-but-grace task and streams it to success", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir], { orphanGraceMs: 5000 });
+  const remote: RemoteSettings = { endpoint: harness.url, tokenEnv: TOKEN_ENV };
+  try {
+    const ws = await openWs(harness.url);
+    const taskId = await submitRaw(ws, "resumable", "resume me", dir);
+    await new Promise((r) => setTimeout(r, 120)); // let some events accrue
+    ws.terminate(); // abrupt drop mid-run
+
+    const seen: number[] = [];
+    const rec = await attachRemoteTask(remote, taskId, {
+      afterSequence: 0,
+      onEvent: (ev) => {
+        seen.push(ev.sequence);
+      },
+    });
+    assert.equal(rec.status, "succeeded", "grace window must keep the task alive to finish");
+    assert.match(rec.text ?? "", /resumable/);
+    assert.ok(seen.length > 0, "expected replayed + live events");
+    for (let i = 1; i < seen.length; i++) {
+      assert.ok(seen[i]! > seen[i - 1]!, `sequences must strictly increase: ${seen.join(",")}`);
+    }
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attach with afterSequence replays only newer events", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  const remote: RemoteSettings = { endpoint: harness.url, tokenEnv: TOKEN_ENV };
+  try {
+    // Run a fast task to completion over a raw socket, then detach.
+    const ws = await openWs(harness.url);
+    const taskId = await submitRaw(ws, "fast", "quick", dir);
+    await new Promise<void>((res) => {
+      ws.on("message", (d) => {
+        const m = JSON.parse(d.toString()) as { type: string };
+        if (m.type === "result") res();
+      });
+    });
+    ws.close();
+
+    // Full replay from 0 sees every event.
+    const all: number[] = [];
+    const rec1 = await attachRemoteTask(remote, taskId, { onEvent: (e) => all.push(e.sequence) });
+    assert.equal(rec1.status, "succeeded");
+    assert.ok(all.length > 0);
+    const maxSeq = all[all.length - 1]!;
+
+    // Resuming from the last sequence replays nothing new but still resolves.
+    const none: number[] = [];
+    const rec2 = await attachRemoteTask(remote, taskId, {
+      afterSequence: maxSeq,
+      onEvent: (e) => none.push(e.sequence),
+    });
+    assert.equal(rec2.status, "succeeded");
+    assert.equal(none.length, 0, "no events should replay at or below afterSequence");
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attach to an unknown task rejects", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  try {
+    await assert.rejects(
+      attachRemoteTask({ endpoint: harness.url, tokenEnv: TOKEN_ENV }, "task-does-not-exist"),
+      /no such task|task_not_found/i,
+    );
   } finally {
     await harness.stop();
     rmSync(dir, { recursive: true, force: true });

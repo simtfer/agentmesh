@@ -155,6 +155,12 @@ export interface DaemonSettings {
   tls?: { cert?: string; key?: string; ca?: string };
   /** advertise only these profiles remotely (default: all non-remote profiles) */
   exposeProfiles?: string[];
+  /**
+   * Grace window (ms) to keep an orphaned, still-running task alive after its
+   * socket drops so a client can `attach` and resume it. Default 0 = cancel
+   * immediately (no orphans).
+   */
+  orphanGraceMs?: number;
 }
 
 export interface MeshConfig {

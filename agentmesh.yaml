@@ -88,3 +88,5 @@ profiles:
 #     key:  ./certs/daemon-key.pem
 #     # ca: ./certs/client-ca.pem      # enables mTLS client verification
 #   exposeProfiles: [opencode, pi]      # default: every non-remote profile
+#   orphanGraceMs: 30000                # keep a dropped task alive 30s so a client
+#                                       # can `attach` and resume it (0 = cancel now)

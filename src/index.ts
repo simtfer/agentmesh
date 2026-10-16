@@ -14,7 +14,8 @@ export { ApprovalBroker } from "./approvals.js";
 export { canTransition, assertTransition, isTerminal } from "./statemachine.js";
 export { SqliteTaskStore } from "./store/sqlite.js";
 export { MemoryTaskStore } from "./store/memory.js";
-export { RemoteWorkerDriver, queryRemoteTask } from "./remote/client.js";
+export { RemoteWorkerDriver, queryRemoteTask, attachRemoteTask } from "./remote/client.js";
+export type { AttachOptions } from "./remote/client.js";
 export { WorkerDaemon } from "./remote/daemon.js";
 export type { WorkerDaemonOptions } from "./remote/daemon.js";
 export {

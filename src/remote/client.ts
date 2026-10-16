@@ -20,7 +20,9 @@ import type {
   TurnResult,
   RunTurnOptions,
   PermissionRequest,
+  PermissionHandler,
   ElicitationRequest,
+  ElicitationHandler,
   RemoteSettings,
   TaskEvent,
   TaskRecord,
@@ -407,4 +409,155 @@ export function queryRemoteTask(
       done(() => reject(new Error("query: daemon closed the connection before answering")));
     });
   });
+}
+
+export interface AttachOptions {
+  /** resume after this event sequence (default 0 = replay the whole log) */
+  afterSequence?: number;
+  /** receive each replayed + live TaskEvent (deduplicated by sequence) */
+  onEvent?: (ev: TaskEvent) => void;
+  /** answer a permission request that arrives while attached */
+  onPermissionRequest?: PermissionHandler;
+  /** answer an elicitation request that arrives while attached */
+  onElicitation?: ElicitationHandler;
+  /** aborting detaches (closes the socket); it does NOT cancel the task */
+  signal?: AbortSignal;
+}
+
+/**
+ * Push-based resumption: attach to an existing task and stream its events from a
+ * sequence boundary to completion. Use after a dropped connection (within the
+ * daemon's orphan grace window) to resume a still-running task instead of
+ * re-submitting it. Resolves with the authoritative terminal TaskRecord.
+ *
+ * Unlike `queryRemoteTask` (a one-shot pull), this holds the connection open,
+ * replays missed events, forwards live ones, and round-trips approvals. Aborting
+ * the signal detaches without cancelling the remote task.
+ */
+export function attachRemoteTask(
+  remote: RemoteSettings,
+  taskId: string,
+  opts: AttachOptions = {},
+): Promise<TaskRecord> {
+  if (!remote?.endpoint) return Promise.reject(new Error("attachRemoteTask: remote.endpoint is required"));
+  const token = resolveToken(remote.tokenEnv);
+  if (!token) {
+    return Promise.reject(
+      new Error(`attachRemoteTask: token env var "${remote.tokenEnv ?? ""}" is not set`),
+    );
+  }
+
+  const url = toWsUrl(remote.endpoint);
+  const attachId = randomUUID();
+  const after = typeof opts.afterSequence === "number" ? opts.afterSequence : 0;
+
+  return new Promise<TaskRecord>((resolve, reject) => {
+    let settled = false;
+    let lastSeq = after;
+    const ws = new WSClient(url, {
+      headers: { authorization: `Bearer ${token}` },
+      maxPayload: MAX_PAYLOAD_BYTES,
+      handshakeTimeout: remote.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+      ...(remote.ca ? { ca: remote.ca } : {}),
+      ...(remote.cert ? { cert: remote.cert } : {}),
+      ...(remote.key ? { key: remote.key } : {}),
+    });
+
+    const done = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
+      try {
+        if (ws.readyState === WSClient.OPEN || ws.readyState === WSClient.CONNECTING) ws.close();
+      } catch {
+        /* ignore */
+      }
+      fn();
+    };
+    const send = (m: ClientMsg) => {
+      if (ws.readyState === WSClient.OPEN) ws.send(encode(m));
+    };
+
+    const onAbort = () => {
+      // Detach only; the daemon's orphan-grace policy decides the task's fate.
+      done(() => reject(new Error("attach aborted")));
+    };
+    if (opts.signal) {
+      if (opts.signal.aborted) ws.once("open", () => onAbort());
+      else opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    ws.on("open", () => {
+      send({ type: "attach", attachId, taskId, afterSequence: after } satisfies ClientMsg);
+    });
+
+    ws.on("message", (data) => {
+      let msg: unknown;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+      if (!isRecord(msg) || typeof msg.type !== "string") return;
+
+      if (msg.type === "error") {
+        done(() => reject(new Error(`${String(msg.message)}${msg.code ? ` (${msg.code})` : ""}`)));
+        return;
+      }
+      if (msg.type === "task_event") {
+        const ev = msg.event as TaskEvent;
+        // Defensive dedupe: never replay an event at or below the last sequence.
+        if (typeof ev.sequence === "number" && ev.sequence <= lastSeq) return;
+        if (typeof ev.sequence === "number") lastSeq = ev.sequence;
+        opts.onEvent?.(ev);
+        if (ev.type === "waiting") handleWaiting(ev, send, opts);
+        return;
+      }
+      if (msg.type === "result") {
+        done(() => resolve(msg.record as TaskRecord));
+        return;
+      }
+      // `attached` / `welcome` / `pong` are informational.
+    });
+
+    ws.on("error", (err: Error & { code?: string }) => {
+      done(() => reject(new Error(`attach connection error: ${err.message}${err.code ? ` (${err.code})` : ""}`)));
+    });
+    ws.on("close", () => {
+      done(() => reject(new Error("attach: daemon closed the connection before the task finished")));
+    });
+  });
+}
+
+/** Route a `waiting` event to the caller's approval handlers (mirrors runTurn). */
+function handleWaiting(
+  ev: TaskEvent,
+  send: (m: ClientMsg) => void,
+  opts: AttachOptions,
+): void {
+  const approvalId = ev.data?.approvalId as string | undefined;
+  if (!approvalId) return;
+  const kind = (ev.data?.kind as string | undefined) ?? "permission";
+  if (kind === "elicitation") {
+    if (!opts.onElicitation) {
+      send({ type: "respond", approvalId, action: "cancel" });
+      return;
+    }
+    const req: ElicitationRequest = { id: approvalId, raw: ev.data };
+    void opts.onElicitation(req).then((resp) =>
+      send({ type: "respond", approvalId, action: resp.action, content: resp.content ?? null }),
+    );
+    return;
+  }
+  if (!opts.onPermissionRequest) {
+    send({ type: "approve", approvalId, decision: "cancel" });
+    return;
+  }
+  const req: PermissionRequest = {
+    id: approvalId,
+    toolKind: ev.data?.toolKind as string | undefined,
+    title: ev.data?.title as string | undefined,
+    raw: ev.data,
+  };
+  void opts.onPermissionRequest(req).then((decision) => send({ type: "approve", approvalId, decision }));
 }

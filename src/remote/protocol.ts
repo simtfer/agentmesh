@@ -66,6 +66,22 @@ export interface QueryMsg {
   taskId: string;
 }
 
+/**
+ * Re-attach to a running (or finished) task and resume its event stream. The
+ * daemon replays every persisted event with `sequence > afterSequence`, then
+ * routes live events to this connection until the task reaches a terminal state.
+ * This is the push-based complement to `query`: instead of polling for the final
+ * record, a reconnecting master resumes the stream where it left off.
+ */
+export interface AttachMsg {
+  type: "attach";
+  /** client-chosen correlation id, echoed back in `attached` */
+  attachId: string;
+  taskId: string;
+  /** replay events with sequence strictly greater than this (default 0 = all) */
+  afterSequence?: number;
+}
+
 export interface PingMsg {
   type: "ping";
 }
@@ -76,6 +92,7 @@ export type ClientMsg =
   | RespondMsg
   | CancelMsg
   | QueryMsg
+  | AttachMsg
   | PingMsg;
 
 /* ----------------------------- server → client ---------------------------- */
@@ -114,6 +131,19 @@ export interface QueryResultMsg {
   record?: import("../types.js").TaskRecord;
 }
 
+/**
+ * Acknowledges a successful `attach`. Sent before the replayed events so the
+ * client knows the reattach took; `status` is the task's state at attach time and
+ * `replayFrom` is the exclusive sequence boundary the replay starts after.
+ */
+export interface AttachedMsg {
+  type: "attached";
+  attachId: string;
+  taskId: string;
+  status: import("../types.js").TaskStatus;
+  replayFrom: number;
+}
+
 export interface ErrorMsg {
   type: "error";
   submitId?: string;
@@ -139,6 +169,7 @@ export type ServerMsg =
   | TaskEventMsg
   | ResultMsg
   | QueryResultMsg
+  | AttachedMsg
   | ErrorMsg
   | PongMsg;
 
@@ -178,6 +209,10 @@ export function parseClientMsg(raw: string): ClientMsg | undefined {
     case "query":
       if (typeof v.queryId !== "string" || typeof v.taskId !== "string") return undefined;
       return v as unknown as QueryMsg;
+    case "attach":
+      if (typeof v.attachId !== "string" || typeof v.taskId !== "string") return undefined;
+      if (v.afterSequence !== undefined && typeof v.afterSequence !== "number") return undefined;
+      return v as unknown as AttachMsg;
     case "ping":
       return { type: "ping" };
     default:

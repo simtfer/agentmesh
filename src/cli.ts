@@ -27,6 +27,7 @@ interface Args {
   tlsKey?: string;
   tlsCa?: string;
   allowInsecure?: boolean;
+  orphanGraceMs?: number;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -51,6 +52,7 @@ function parseArgs(argv: string[]): Args {
       case "--tls-cert": out.tlsCert = next(); break;
       case "--tls-key": out.tlsKey = next(); break;
       case "--tls-ca": out.tlsCa = next(); break;
+      case "--orphan-grace-ms": out.orphanGraceMs = Number(next()); break;
       case "--worktree": out.worktree = true; break;
       case "--allow-insecure": out.allowInsecure = true; break;
       default:
@@ -97,9 +99,11 @@ Usage:
   # remote worker daemon (run on the worker host; ACP stdio never crosses the wire)
   agentmesh daemon [--config f] [--host h] [--port p]
                    [--token-env VAR] [--tls-cert c --tls-key k [--tls-ca ca]]
-                   [--allow-insecure]
+                   [--orphan-grace-ms N] [--allow-insecure]
     token is read from the env var named by --token-env / daemon.tokenEnv (never
     from config). Non-loopback binds require TLS unless --allow-insecure.
+    --orphan-grace-ms keeps a dropped task alive N ms so a client can re-attach
+    and resume its stream (default 0 = cancel immediately, no orphans).
 
 Roles are config-driven: any MCP-capable agent (opencode, pi, ...) can be the
 master; workers are driven over ACP via acpx, locally or on a remote daemon.
@@ -235,6 +239,7 @@ async function cmdDaemon(args: Args): Promise<void> {
         ? { cert: args.tlsCert, key: args.tlsKey, ca: args.tlsCa }
         : cfg.daemon?.tls,
     allowInsecure: args.allowInsecure,
+    orphanGraceMs: args.orphanGraceMs ?? cfg.daemon?.orphanGraceMs,
   });
 
   const info = await daemon.start();
