@@ -190,7 +190,29 @@ export interface MeshConfig {
   /** where git worktrees / session state live (default: ./.agentmesh) */
   workdir?: string;
   daemon?: DaemonSettings;
+  /**
+   * Resource & recursion limits (PLAN §7). A master is itself an agent, so
+   * without a cap a delegation chain (or a master↔worker loop) can recurse
+   * forever. `maxDelegationDepth` bounds how deep this process will accept;
+   * the depth is propagated to spawned agents via `DELEGATION_DEPTH_ENV` so any
+   * nested agentmesh inherits parentDepth + 1.
+   */
+  limits?: {
+    /** max accepted delegation depth; a submit at depth >= this is refused. Default 8. */
+    maxDelegationDepth?: number;
+  };
 }
+
+/**
+ * Environment variable carrying this process's delegation depth. An agentmesh
+ * reads it as its base depth and injects base+1 into every agent it spawns, so
+ * a nested agentmesh (mounted as the agent's MCP server) inherits the chain
+ * depth across process boundaries. Absent/invalid → 0 (top-level master).
+ */
+export const DELEGATION_DEPTH_ENV = "AGENTMESH_DELEGATION_DEPTH";
+
+/** Default cap on delegation depth when `limits.maxDelegationDepth` is unset. */
+export const DEFAULT_MAX_DELEGATION_DEPTH = 8;
 
 export interface WorkerDriver {
   readonly kind: "acpx" | "mock" | "remote";

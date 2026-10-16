@@ -59,7 +59,7 @@ Requires Node.js ≥ 22.13. Real workers additionally require the upstream CLI
 
 ```bash
 npm run demo     # Scene A: sync delegate-and-wait; Scene B: submit→waiting→approve→succeeded
-npm test         # 33 tests: state machine, persistence, timeout, cancel, approvals, remote daemon + resume + rotation + audit
+npm test         # 36 tests: state machine, persistence, timeout, cancel, approvals, recursion guard, remote daemon + resume + rotation + audit
 npm run smoke    # drives the real MCP server over stdio through the full task lifecycle
 ```
 
@@ -377,6 +377,14 @@ profiles:
   to a 12-hex non-reversible fingerprint, and untrusted task/agent text is not
   logged at all. Writes are buffered so a flood of bad-token attempts can't block
   the event loop. Set `auditPath: ""` to disable.
+- **Recursion guard.** A master is itself an agent, so a delegation chain (or a
+  master↔worker loop) could recurse forever. `limits.maxDelegationDepth` (default
+  8) caps it: agentmesh reads its own level from `$AGENTMESH_DELEGATION_DEPTH`
+  (0 for a top-level master) and injects level+1 into every agent it spawns, so a
+  nested agentmesh inherits the chain depth across process boundaries. A submit
+  whose effective depth reaches the cap fails with `delegation_depth_exceeded`
+  *without spawning a worker*; a caller-stamped depth can only raise it, never
+  lower the inherited base.
 
 ### Remote tests
 
@@ -432,11 +440,13 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **33/33** pass:
+- `npm test` — **36/36** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
-  - `test/tasks.test.ts` (9) — happy path, worker failure, `timeout → timed_out`,
+  - `test/tasks.test.ts` (12) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
-    idempotency de-dup, SQLite restart-and-requery, store column-merge safety.
+    idempotency de-dup, SQLite restart-and-requery, store column-merge safety, and
+    the recursion guard (depth-stamped success within the cap, refusal at the cap
+    with no worker spawned, and an inherited env depth tripping the cap).
   - `test/remote.test.ts` (18) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
     streamed events, approval round-trip, cancel, bad-token rejection,
     cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, reconnect
@@ -474,7 +484,6 @@ Next:
 - Cross-worker handoff (pipe one worker's diff into another's context).
 - Structured result contracts (JSON output schema per task) + cost/usage roll-up
   from ACP `usage_update` events.
-- Recursion guard: cap delegation depth to prevent infinite master↔worker loops.
 
 ## License
 

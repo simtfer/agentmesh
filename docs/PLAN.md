@@ -261,6 +261,11 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 密钥从环境变量或安全凭证存储读取（**不入配置文件/版本库**）；结构化审计日志；超时/最大并发/输出大小限制；
 **防无限递归委派**（Master 也是 Agent，需深度/预算上限）；Agent 输出视为不可信；不可逆操作人工确认；
 记录 Agent/Adapter/协议版本。
+
+**落地状态**：远程认证/TLS ✅、工作目录白名单 ✅、密钥仅存环境 ✅、零停机密钥轮换 ✅、结构化审计日志（NDJSON，密钥仅记指纹、不落不可信文本）✅、超时 ✅、
+**防无限递归委派 ✅**（`limits.maxDelegationDepth` 默认 8；进程从 `$AGENTMESH_DELEGATION_DEPTH` 读自身层级，向所 spawn 的 agent 注入 层级+1，
+嵌套 agentmesh 经环境继承链路深度；有效深度达上限的 submit 以 `delegation_depth_exceeded` 失败且**不 spawn worker**，调用方 metadata 只能抬高、不能压低继承的 base）。
+⏳ 待补：最大并发上限、单任务输出大小上限（Stage 5 随并行引入）。
 补充（acpx 相关）：`permissionMode` 默认 `approve-all` 便于自动执行，但**远程/生产应降为 `approve-reads` 或 `deny-all` + 显式批准回调**；
 acpx 会话作用域按 `(agentCommand, cwd, sessionKey)` 精确匹配，跨目录不继承。
 
@@ -279,7 +284,7 @@ acpx 会话作用域按 `(agentCommand, cwd, sessionKey)` 精确匹配，跨目�
 | Agent 要求人工输入 | `waiting` 态 + 批准接口 |
 | 远程权限过大 | 白名单、最小权限、审计、人工审批 |
 | **acpx pre-1.0 接口演进** | 锁 `acpx` 版本；封装在 `adapter-acp` 内，隔离上游变更 |
-| **递归委派失控** | Master 侧深度/预算/并发上限 |
+| **递归委派失控** | ✅ 深度上限 `limits.maxDelegationDepth` + `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播；达上限的 submit 失败且不 spawn worker（预算/并发上限待 Stage 5） |
 
 ---
 
@@ -309,13 +314,16 @@ acpx 会话作用域按 `(agentCommand, cwd, sessionKey)` 精确匹配，跨目�
 Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向「跑得多、跑得稳、跑得像产品」：
 
 1. **Stage 5 · 并行与调度**：Task Scheduler 并发上限 + 真实队列 owner；多 worktree 并行；失败/超时/取消路径的并发测试。
-2. **远程生产化补强**：状态对账已落地（`query` 主动查询式）；下一步是断线**自动重连并续订事件流**（推送式续流，
-   幂等键先对账再重放，绝不盲目重跑非幂等任务）、密钥轮换、开机启动/日志轮转、防火墙与部署样例；
-   把 loopback 验证形态推向真实双机 TLS 部署。
+   （并发上限与单任务输出大小上限是 §7 尚余的两项限制。）
+2. **远程生产化补强**：状态对账（`query`）、推送式续订（`attach` + orphan 宽限）、透明自动重连（`resume`）、
+   **零停机密钥轮换**（多 token + `SIGHUP`/`reloadTokens()`）、**结构化审计日志**（NDJSON，密钥仅记指纹）均已落地。
+   ⏳ 余下：开机启动/日志轮转、防火墙与部署样例；把 loopback 验证形态推向真实双机 TLS 部署。
 3. **Master 侧提示词/技能包**：让 Master 默认就会「好好委派」（何时拆任务、如何写 prompt、如何读事件）。
 4. **跨 Worker 交接**：把一个 Worker 的 diff 注入另一个 Worker 的上下文。
 5. **结构化结果契约**：每任务 JSON 输出 schema + 从 ACP `usage_update` 汇总成本/用量。
-6. **递归守卫**：Master 也是 Agent，需委派深度/预算/并发上限，防无限 master↔worker 环。
-7. **可选 Web 控制台 / 审计日志**：可视化任务与远程 Worker 状态。
+6. ~~**递归守卫**~~ ✅ 已落地：`limits.maxDelegationDepth`（默认 8）+ `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播，
+   达上限的 submit 以 `delegation_depth_exceeded` 失败且不 spawn worker（预算/并发上限并入 Stage 5）。
+7. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
 
-> Stage 0–3 已完成并通过 23 项测试（含真实 opencode/pi 与 loopback 远程端到端）。下一步优先并行调度与远程生产化。
+> Stage 0–3 已完成并通过 36 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志与递归守卫）。
+> 下一步优先并行调度（含并发/输出上限）与远程真实双机部署。

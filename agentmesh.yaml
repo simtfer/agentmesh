@@ -8,6 +8,15 @@
 # where git worktrees and acpx session state live (relative to the run dir)
 workdir: .agentmesh
 
+# --- Resource & recursion limits --------------------------------------------
+# A master is itself an agent, so a delegation chain (or a master↔worker loop)
+# can recurse forever. agentmesh bounds the depth: it reads its own level from
+# $AGENTMESH_DELEGATION_DEPTH (0 for a top-level master) and injects level+1 into
+# every agent it spawns, so a nested agentmesh inherits the chain depth. A submit
+# whose effective depth reaches the cap is refused without spawning a worker.
+# limits:
+#   maxDelegationDepth: 8        # default 8; lower it for tighter environments
+
 defaults:
   # acpx permission mode for workers: deny-all | approve-reads | approve-all
   permissionMode: approve-all

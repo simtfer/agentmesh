@@ -10,6 +10,7 @@ import type {
   TaskSubmitInput,
   WorkerProfile,
 } from "./types.js";
+import { DEFAULT_MAX_DELEGATION_DEPTH, DELEGATION_DEPTH_ENV } from "./types.js";
 import { getProfile } from "./config.js";
 import { createDrivers, type DriverSet } from "./drivers/factory.js";
 import { WorkerRegistry, describeWorker, type WorkerRecord } from "./registry.js";
@@ -18,6 +19,12 @@ import { TaskManager, type WorkerProvider } from "./tasks.js";
 import { ApprovalBroker } from "./approvals.js";
 import { SqliteTaskStore } from "./store/sqlite.js";
 import { MemoryTaskStore } from "./store/memory.js";
+
+/** Parse the inherited delegation depth; anything absent/invalid/negative → 0. */
+function readDelegationDepth(raw: string | undefined): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
 
 export interface OrchestratorOptions {
   baseCwd?: string;
@@ -61,6 +68,8 @@ export class Orchestrator {
   readonly config: MeshConfig;
   readonly baseCwd: string;
   readonly workdir: string;
+  /** this process's inherited delegation depth (0 for a top-level master) */
+  readonly delegationDepth: number;
   private drivers: DriverSet;
   private registry = new WorkerRegistry();
   private store: TaskStore;
@@ -71,7 +80,10 @@ export class Orchestrator {
     this.config = config;
     this.baseCwd = path.resolve(opts.baseCwd ?? config.defaults?.cwd ?? process.cwd());
     this.workdir = path.resolve(opts.workdir ?? config.workdir ?? ".agentmesh");
-    this.drivers = createDrivers(config, this.baseCwd);
+    // This process's own delegation depth, inherited from whoever spawned it. A
+    // top-level master has no env set → 0. Any agentmesh we spawn inherits +1.
+    this.delegationDepth = readDelegationDepth(process.env[DELEGATION_DEPTH_ENV]);
+    this.drivers = createDrivers(config, this.baseCwd, this.delegationDepth);
 
     this.store =
       opts.store ??
@@ -93,6 +105,8 @@ export class Orchestrator {
       provider,
       defaultTimeoutMs: opts.defaultTimeoutMs,
       inferProfile: () => this.inferSingleProfile(),
+      baseDelegationDepth: this.delegationDepth,
+      maxDelegationDepth: config.limits?.maxDelegationDepth ?? DEFAULT_MAX_DELEGATION_DEPTH,
     });
   }
 

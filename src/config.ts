@@ -67,6 +67,11 @@ const ConfigSchema = z.object({
     .optional(),
   workdir: z.string().optional(),
   daemon: DaemonSettings.optional(),
+  limits: z
+    .object({
+      maxDelegationDepth: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
 });
 
 export function parseConfig(raw: unknown): MeshConfig {

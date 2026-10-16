@@ -160,6 +160,12 @@ export interface AcpxDriverOptions {
   stateDir: string;
   overrides?: Record<string, string | string[]>;
   defaultPermissionMode?: string;
+  /**
+   * Extra environment for every spawned agent process. Used to propagate the
+   * delegation depth (AGENTMESH_DELEGATION_DEPTH) so a nested agentmesh mounted
+   * as the agent's MCP server inherits the chain depth for the recursion guard.
+   */
+  agentProcessEnv?: Record<string, string>;
 }
 
 /**
@@ -183,7 +189,7 @@ export class AcpxWorkerDriver implements WorkerDriver {
         const mode = this.permBySessionKey.get(session.sessionKey);
         return mode ? { permissionMode: mode } : undefined;
       },
-      agentProcessEnv: {},
+      agentProcessEnv: opts.agentProcessEnv ?? {},
     });
   }
 

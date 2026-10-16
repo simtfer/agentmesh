@@ -11,6 +11,7 @@ import type {
   TaskSubmitInput,
   WorkerEvent,
 } from "./types.js";
+import { DEFAULT_MAX_DELEGATION_DEPTH } from "./types.js";
 import { isTerminal, canTransition } from "./statemachine.js";
 import type { ApprovalBroker } from "./approvals.js";
 import type { WorkerRecord } from "./registry.js";
@@ -40,6 +41,14 @@ export interface TaskManagerOptions {
   provider: WorkerProvider;
   defaultTimeoutMs?: number;
   inferProfile: () => string;
+  /**
+   * Recursion guard (PLAN §7). `baseDelegationDepth` is this process's own depth
+   * (from AGENTMESH_DELEGATION_DEPTH); a submit whose effective depth — the
+   * larger of the base and any `metadata.delegationDepth` a caller supplies —
+   * reaches `maxDelegationDepth` is refused without spawning a worker.
+   */
+  baseDelegationDepth?: number;
+  maxDelegationDepth?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -51,6 +60,8 @@ export class TaskManager {
   private provider: WorkerProvider;
   private defaultTimeoutMs: number;
   private inferProfile: () => string;
+  private baseDelegationDepth: number;
+  private maxDelegationDepth: number;
 
   constructor(opts: TaskManagerOptions) {
     this.store = opts.store;
@@ -58,6 +69,8 @@ export class TaskManager {
     this.provider = opts.provider;
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.inferProfile = opts.inferProfile;
+    this.baseDelegationDepth = Math.max(0, Math.trunc(opts.baseDelegationDepth ?? 0));
+    this.maxDelegationDepth = opts.maxDelegationDepth ?? DEFAULT_MAX_DELEGATION_DEPTH;
   }
 
   /* ------------------------------ submit ------------------------------ */
@@ -82,6 +95,12 @@ export class TaskManager {
     const workerRec = input.workerId ? this.provider.getWorkerRecord(input.workerId) : undefined;
     const cwd = input.cwd ?? workerRec?.cwd ?? process.cwd();
 
+    // Effective delegation depth: the deeper of this process's own depth and any
+    // depth the caller stamped into metadata. Stored back so a nested agentmesh
+    // reading the forwarded metadata sees the same level.
+    const metaDepth = Number((input.metadata as Record<string, unknown> | undefined)?.delegationDepth ?? 0);
+    const depth = Math.max(this.baseDelegationDepth, Number.isFinite(metaDepth) ? Math.trunc(metaDepth) : 0);
+
     const now = Date.now();
     const taskId = randomUUID();
     const rec: TaskRecord = {
@@ -95,7 +114,7 @@ export class TaskManager {
       updatedAt: now,
       workerId: input.workerId,
       idempotencyKey: input.idempotencyKey,
-      metadata: input.metadata,
+      metadata: { ...(input.metadata ?? {}), delegationDepth: depth },
     };
     this.store.createTask(rec);
 
@@ -113,6 +132,23 @@ export class TaskManager {
     });
 
     this.append(taskId, "accepted", `task accepted for profile ${profile}`);
+
+    // Recursion guard: refuse to go deeper than the cap. Fail fast WITHOUT
+    // spawning a worker so a master↔worker loop (or a runaway delegation chain)
+    // cannot consume unbounded agents/processes.
+    if (depth >= this.maxDelegationDepth) {
+      const message =
+        `delegation depth ${depth} reaches the configured maximum ${this.maxDelegationDepth}; ` +
+        `refusing to delegate further (possible recursive master/worker loop)`;
+      this.setState(taskId, "failed", {
+        finishedAt: Date.now(),
+        error: { code: "delegation_depth_exceeded", message, retryable: false },
+      });
+      const failed = this.store.getTask(taskId)!;
+      this.live.get(taskId)?.resolveDone(failed);
+      this.live.delete(taskId);
+      return failed;
+    }
 
     // fire and forget; errors are captured into the task record
     void this.run(taskId, input).catch((err) => {
