@@ -243,3 +243,98 @@ test("an inherited env depth raises the effective depth and trips the cap", asyn
   }
 });
 
+/* ------------------------- resource limits (PLAN §7) -------------------- */
+
+// Tight caps make both guards easy to exercise with mock workers.
+const limitedConfig = parseConfig({
+  workdir: ".agentmesh-test",
+  limits: { maxConcurrentTasks: 2, maxOutputBytes: 16 },
+  profiles: [
+    { name: "slow", driver: "mock", mock: { delayMs: 40, toolCalls: 60 } },
+    { name: "fast", driver: "mock", mock: { delayMs: 1, toolCalls: 1 } },
+    { name: "chatty", driver: "mock", mock: { delayMs: 1, reply: "A".repeat(200) } },
+    { name: "unicode", driver: "mock", mock: { delayMs: 1, reply: "😀".repeat(50) } },
+  ],
+});
+
+const limitedOrch = () =>
+  new Orchestrator(limitedConfig, { baseCwd: process.cwd(), persist: false });
+
+test("a submit beyond the concurrency cap is refused without spawning a worker", async () => {
+  const orch = limitedOrch();
+  try {
+    // Two slow tasks occupy both in-flight slots.
+    const a = orch.submitTask({ profile: "slow", prompt: "one", timeoutMs: 30000 });
+    const b = orch.submitTask({ profile: "slow", prompt: "two", timeoutMs: 30000 });
+    assert.notEqual(a.status, "failed");
+    assert.notEqual(b.status, "failed");
+
+    // The third is refused synchronously — never starts a worker.
+    const c = orch.submitTask({ profile: "slow", prompt: "three", timeoutMs: 30000 });
+    assert.equal(c.status, "failed");
+    assert.equal(c.error?.code, "concurrency_limit_exceeded");
+    assert.equal(c.workerId, undefined, "no worker should be spawned past the cap");
+    const kinds = orch.taskEvents(c.taskId).map((e) => e.type);
+    assert.ok(kinds.includes("failed"));
+    assert.ok(!kinds.includes("started"), "a refused task must not start a worker");
+
+    // Drain the two running tasks so shutdown is clean.
+    await orch.waitTask(a.taskId, 10000);
+    await orch.waitTask(b.taskId, 10000);
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("a task that settles frees its slot for the next submit", async () => {
+  const orch = limitedOrch();
+  try {
+    const a = orch.submitTask({ profile: "fast", prompt: "one" });
+    const b = orch.submitTask({ profile: "fast", prompt: "two" });
+    await orch.waitTask(a.taskId, 5000);
+    await orch.waitTask(b.taskId, 5000);
+    // Both settled → live set is empty again → a new submit is accepted.
+    const c = orch.submitTask({ profile: "fast", prompt: "three" });
+    assert.notEqual(c.status, "failed");
+    const rc = await orch.waitTask(c.taskId, 5000);
+    assert.equal(rc?.status, "succeeded");
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("an oversized result is truncated and flagged outputTruncated", async () => {
+  const orch = limitedOrch();
+  try {
+    const sub = orch.submitTask({ profile: "chatty", prompt: "say a lot" });
+    const rec = await orch.waitTask(sub.taskId, 5000);
+    assert.equal(rec?.status, "succeeded");
+    assert.equal(rec?.outputTruncated, true);
+    assert.ok(Buffer.byteLength(rec!.text ?? "", "utf8") <= 16);
+    // A truncation note is recorded as an event for observability.
+    const evs = orch.taskEvents(sub.taskId);
+    assert.ok(
+      evs.some((e) => e.type === "output" && (e.data as Record<string, unknown>)?.truncated === true),
+      "expected a truncation output event",
+    );
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("truncation never splits a multibyte codepoint", async () => {
+  const orch = limitedOrch();
+  try {
+    const sub = orch.submitTask({ profile: "unicode", prompt: "emoji wall" });
+    const rec = await orch.waitTask(sub.taskId, 5000);
+    assert.equal(rec?.status, "succeeded");
+    assert.equal(rec?.outputTruncated, true);
+    // 16 bytes / 4 bytes-per-emoji = exactly 4 whole emoji, no replacement char.
+    assert.equal(rec?.text, "😀😀😀😀");
+    assert.ok(!(rec?.text ?? "").includes("\uFFFD"), "must not contain a replacement char");
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+

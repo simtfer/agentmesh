@@ -385,6 +385,15 @@ profiles:
   whose effective depth reaches the cap fails with `delegation_depth_exceeded`
   *without spawning a worker*; a caller-stamped depth can only raise it, never
   lower the inherited base.
+- **Resource limits.** Two further guards bound the blast radius of a busy or
+  runaway master. `limits.maxConcurrentTasks` (default unlimited) caps how many
+  tasks may be in flight at once — a submit beyond the cap fails immediately with
+  `concurrency_limit_exceeded` *without spawning a worker* rather than queueing,
+  so a fan-out burst can't exhaust the host; a slot frees as soon as a task
+  settles. `limits.maxOutputBytes` (default 1 MiB) caps the result text persisted
+  per task: a larger result is truncated on a UTF-8 boundary (never splitting a
+  multibyte codepoint), the record is flagged `outputTruncated`, and a truncation
+  note is recorded as an event so the clip is observable rather than silent.
 
 ### Remote tests
 
@@ -440,13 +449,16 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **36/36** pass:
+- `npm test` — **40/40** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
-  - `test/tasks.test.ts` (12) — happy path, worker failure, `timeout → timed_out`,
+  - `test/tasks.test.ts` (16) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
-    idempotency de-dup, SQLite restart-and-requery, store column-merge safety, and
-    the recursion guard (depth-stamped success within the cap, refusal at the cap
-    with no worker spawned, and an inherited env depth tripping the cap).
+    idempotency de-dup, SQLite restart-and-requery, store column-merge safety, the
+    recursion guard (depth-stamped success within the cap, refusal at the cap with
+    no worker spawned, and an inherited env depth tripping the cap), and the
+    resource limits (a submit past `maxConcurrentTasks` refused with no worker,
+    a settled task freeing its slot, an oversized result truncated + flagged
+    `outputTruncated`, and truncation never splitting a multibyte codepoint).
   - `test/remote.test.ts` (18) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
     streamed events, approval round-trip, cancel, bad-token rejection,
     cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, reconnect

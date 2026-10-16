@@ -200,6 +200,17 @@ export interface MeshConfig {
   limits?: {
     /** max accepted delegation depth; a submit at depth >= this is refused. Default 8. */
     maxDelegationDepth?: number;
+    /**
+     * Max non-terminal tasks in flight at once; a submit beyond the cap is
+     * refused (code `concurrency_limit_exceeded`) without spawning a worker.
+     * 0/undefined = unlimited.
+     */
+    maxConcurrentTasks?: number;
+    /**
+     * Cap on the result text persisted per task (bytes). Larger results are
+     * truncated and the record is flagged `outputTruncated`. Default 1 MiB.
+     */
+    maxOutputBytes?: number;
   };
 }
 
@@ -284,6 +295,8 @@ export interface TaskRecord {
   finishedAt?: number;
   /** final assistant text (may be truncated by output limits) */
   text?: string;
+  /** true when `text` was clipped by `limits.maxOutputBytes` */
+  outputTruncated?: boolean;
   stopReason?: string;
   waitingReason?: string;
   error?: { code: string; message: string; retryable: boolean };

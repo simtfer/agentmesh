@@ -70,6 +70,8 @@ const ConfigSchema = z.object({
   limits: z
     .object({
       maxDelegationDepth: z.number().int().nonnegative().optional(),
+      maxConcurrentTasks: z.number().int().nonnegative().optional(),
+      maxOutputBytes: z.number().int().nonnegative().optional(),
     })
     .optional(),
 });

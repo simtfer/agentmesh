@@ -14,8 +14,16 @@ workdir: .agentmesh
 # $AGENTMESH_DELEGATION_DEPTH (0 for a top-level master) and injects level+1 into
 # every agent it spawns, so a nested agentmesh inherits the chain depth. A submit
 # whose effective depth reaches the cap is refused without spawning a worker.
+#
+# Two further guards bound blast radius: maxConcurrentTasks caps how many tasks
+# may be in flight at once (a submit beyond the cap is refused, not queued, so a
+# fan-out burst cannot exhaust the host); maxOutputBytes caps the result text
+# persisted per task, truncating on a UTF-8 boundary and flagging the record
+# `outputTruncated` so a runaway agent cannot blow up the store.
 # limits:
 #   maxDelegationDepth: 8        # default 8; lower it for tighter environments
+#   maxConcurrentTasks: 0        # 0/omitted = unlimited in-flight tasks
+#   maxOutputBytes: 1048576      # default 1 MiB of persisted result text/task
 
 defaults:
   # acpx permission mode for workers: deny-all | approve-reads | approve-all

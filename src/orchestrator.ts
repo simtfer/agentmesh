@@ -107,6 +107,8 @@ export class Orchestrator {
       inferProfile: () => this.inferSingleProfile(),
       baseDelegationDepth: this.delegationDepth,
       maxDelegationDepth: config.limits?.maxDelegationDepth ?? DEFAULT_MAX_DELEGATION_DEPTH,
+      maxConcurrentTasks: config.limits?.maxConcurrentTasks,
+      maxOutputBytes: config.limits?.maxOutputBytes,
     });
   }
 

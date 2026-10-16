@@ -49,9 +49,40 @@ export interface TaskManagerOptions {
    */
   baseDelegationDepth?: number;
   maxDelegationDepth?: number;
+  /**
+   * Resource limits (PLAN §7). `maxConcurrentTasks` caps how many non-terminal
+   * tasks may be in flight at once (0/undefined = unlimited); a submit beyond
+   * the cap is refused without spawning a worker. `maxOutputBytes` bounds the
+   * result text persisted per task, truncating (and flagging) anything larger so
+   * a runaway agent cannot blow up the store.
+   */
+  maxConcurrentTasks?: number;
+  maxOutputBytes?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+/** Default cap on persisted result text: 1 MiB. Normal results are far smaller. */
+const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+
+/**
+ * Truncate `text` to at most `maxBytes` UTF-8 bytes, backing off to a character
+ * boundary so a multibyte codepoint is never split. `maxBytes <= 0` disables the
+ * cap. Returns the (possibly truncated) text, whether it was truncated, and the
+ * original byte length for diagnostics.
+ */
+function capText(
+  text: string,
+  maxBytes: number,
+): { text: string; truncated: boolean; originalBytes: number } {
+  const buf = Buffer.from(text, "utf8");
+  if (maxBytes <= 0 || buf.length <= maxBytes) {
+    return { text, truncated: false, originalBytes: buf.length };
+  }
+  let end = maxBytes;
+  // Walk back off any UTF-8 continuation bytes (10xxxxxx) so we cut cleanly.
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return { text: buf.subarray(0, end).toString("utf8"), truncated: true, originalBytes: buf.length };
+}
 
 export class TaskManager {
   private live = new Map<string, LiveTask>();
@@ -62,6 +93,8 @@ export class TaskManager {
   private inferProfile: () => string;
   private baseDelegationDepth: number;
   private maxDelegationDepth: number;
+  private maxConcurrentTasks: number;
+  private maxOutputBytes: number;
 
   constructor(opts: TaskManagerOptions) {
     this.store = opts.store;
@@ -71,6 +104,8 @@ export class TaskManager {
     this.inferProfile = opts.inferProfile;
     this.baseDelegationDepth = Math.max(0, Math.trunc(opts.baseDelegationDepth ?? 0));
     this.maxDelegationDepth = opts.maxDelegationDepth ?? DEFAULT_MAX_DELEGATION_DEPTH;
+    this.maxConcurrentTasks = Math.max(0, Math.trunc(opts.maxConcurrentTasks ?? 0));
+    this.maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   }
 
   /* ------------------------------ submit ------------------------------ */
@@ -137,17 +172,25 @@ export class TaskManager {
     // spawning a worker so a master↔worker loop (or a runaway delegation chain)
     // cannot consume unbounded agents/processes.
     if (depth >= this.maxDelegationDepth) {
-      const message =
+      return this.refuse(
+        taskId,
+        "delegation_depth_exceeded",
         `delegation depth ${depth} reaches the configured maximum ${this.maxDelegationDepth}; ` +
-        `refusing to delegate further (possible recursive master/worker loop)`;
-      this.setState(taskId, "failed", {
-        finishedAt: Date.now(),
-        error: { code: "delegation_depth_exceeded", message, retryable: false },
-      });
-      const failed = this.store.getTask(taskId)!;
-      this.live.get(taskId)?.resolveDone(failed);
-      this.live.delete(taskId);
-      return failed;
+          `refusing to delegate further (possible recursive master/worker loop)`,
+      );
+    }
+
+    // Concurrency guard: bound in-flight tasks so a fan-out burst cannot exhaust
+    // the host. `this.live` holds exactly the non-terminal tasks (terminal ones
+    // are removed in run()'s finally), and the new task is already counted, so
+    // exceeding the cap means "strictly more than max". 0 = unlimited.
+    if (this.maxConcurrentTasks > 0 && this.live.size > this.maxConcurrentTasks) {
+      return this.refuse(
+        taskId,
+        "concurrency_limit_exceeded",
+        `concurrency limit reached (${this.maxConcurrentTasks} tasks in flight); ` +
+          `refusing to start another — retry once a running task settles`,
+      );
     }
 
     // fire and forget; errors are captured into the task record
@@ -195,10 +238,22 @@ export class TaskManager {
       } else if (live.abortReason === "cancel") {
         this.setState(taskId, "cancelled", { finishedAt: Date.now() });
       } else if (turn.status === "completed") {
+        // Bound the persisted result text so a runaway agent cannot blow up the
+        // store; truncation is flagged in metadata and noted as an event.
+        const capped = capText(turn.text ?? "", this.maxOutputBytes);
+        if (capped.truncated) {
+          this.append(
+            taskId,
+            "output",
+            `result text truncated to ${this.maxOutputBytes} bytes (was ${capped.originalBytes})`,
+            { kind: "status", truncated: true, maxOutputBytes: this.maxOutputBytes },
+          );
+        }
         this.setState(taskId, "succeeded", {
-          text: turn.text,
+          text: capped.text,
           stopReason: turn.stopReason,
           finishedAt: Date.now(),
+          ...(capped.truncated ? { outputTruncated: true } : {}),
         });
       } else if (turn.status === "cancelled") {
         this.setState(taskId, "cancelled", { finishedAt: Date.now() });
@@ -414,6 +469,26 @@ export class TaskManager {
   }
 
   /* ------------------------------ helpers ----------------------------- */
+
+  /**
+   * Fail a task fast, before any worker is spawned. Used by the recursion and
+   * concurrency guards: settle the record to `failed` (queued → failed is a
+   * legal transition), resolve any `wait()` racing on it, and drop it from the
+   * live set so it no longer counts against the concurrency cap.
+   */
+  private refuse(taskId: string, code: string, message: string): TaskRecord {
+    this.setState(taskId, "failed", {
+      finishedAt: Date.now(),
+      error: { code, message, retryable: false },
+    });
+    const failed = this.store.getTask(taskId)!;
+    const live = this.live.get(taskId);
+    if (live) {
+      live.resolveDone(failed);
+      this.live.delete(taskId);
+    }
+    return failed;
+  }
 
   private taskProfile(taskId: string): string {
     return this.store.getTask(taskId)?.profile ?? this.inferProfile();
