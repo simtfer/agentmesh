@@ -1,0 +1,57 @@
+# agentmesh configuration
+#
+# Roles are NOT tied to agent type. The "master" is whichever agent you attach
+# this MCP server to (see README). Everything below describes WORKERS the master
+# can spawn. Mix and match freely: opencode master -> pi workers, pi master ->
+# opencode workers, etc.
+
+# where git worktrees and acpx session state live (relative to the run dir)
+workdir: .agentmesh
+
+defaults:
+  # acpx permission mode for workers: deny-all | approve-reads | approve-all
+  permissionMode: approve-all
+  # default working directory for workers (defaults to the process cwd)
+  # cwd: /path/to/repo
+
+profiles:
+  # --- deterministic mocks: run anywhere, no API keys, no cost ---------------
+  - name: mock-analyst
+    driver: mock
+    description: read-only research/analysis stand-in (mock)
+    mock: { delayMs: 20, toolCalls: 2 }
+
+  - name: mock-implementer
+    driver: mock
+    description: code-writing stand-in (mock)
+    mock: { delayMs: 20, toolCalls: 3 }
+
+  - name: mock-approver
+    driver: mock
+    description: blocks on a permission request before finishing (mock)
+    mock: { delayMs: 10, requireApproval: true }
+
+  # --- real agents driven over ACP via acpx ----------------------------------
+  # Requires the upstream CLI installed + authenticated on this machine.
+  # `agent` is an acpx built-in name (pi -> `npx pi-acp`, opencode -> `npx -y opencode-ai acp`).
+
+  - name: pi
+    driver: acpx
+    agent: pi
+    description: Pi coding agent worker (ACP via pi-acp)
+    worktree: true          # isolate parallel edits in a git worktree
+
+  - name: opencode
+    driver: acpx
+    agent: opencode
+    description: OpenCode worker (ACP via `opencode acp`)
+    worktree: true
+
+  # Example: a real agent with an explicit custom launch command + model.
+  # - name: opencode-sonnet
+  #   driver: acpx
+  #   agent: opencode-custom
+  #   command: ["npx", "-y", "opencode-ai", "acp"]
+  #   model: anthropic/claude-sonnet-4-5
+  #   permissionMode: approve-reads
+  #   worktree: true

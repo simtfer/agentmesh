@@ -1,0 +1,58 @@
+{
+  "name": "agentmesh",
+  "version": "0.1.0",
+  "description": "Protocol-native adapter that lets one coding agent (master) orchestrate heterogeneous worker agents (opencode, pi, ...) over ACP, exposed as MCP tools.",
+  "type": "module",
+  "license": "MIT",
+  "author": "simtfer",
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "mcp",
+    "model-context-protocol",
+    "multi-agent",
+    "orchestration",
+    "opencode",
+    "pi",
+    "coding-agent",
+    "acpx"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/simtfer/agentmesh.git"
+  },
+  "homepage": "https://github.com/simtfer/agentmesh#readme",
+  "bugs": {
+    "url": "https://github.com/simtfer/agentmesh/issues"
+  },
+  "bin": {
+    "agentmesh": "dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "demo": "tsx src/cli.ts demo",
+    "mcp": "tsx src/cli.ts mcp",
+    "list": "tsx src/cli.ts list",
+    "smoke": "node scripts/mcp-smoke.mjs",
+    "real": "tsx scripts/real-smoke.ts",
+    "test": "tsx --test test/orchestrator.test.ts test/tasks.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "acpx": "^0.19.5",
+    "yaml": "^2.5.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
