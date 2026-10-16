@@ -20,7 +20,9 @@ export { WorkerDaemon } from "./remote/daemon.js";
 export type { WorkerDaemonOptions } from "./remote/daemon.js";
 export {
   resolveToken,
+  resolveTokens,
   tokensEqual,
+  anyTokenEqual,
   bearerFromHeader,
   isLoopbackHost,
   isLoopbackEndpoint,

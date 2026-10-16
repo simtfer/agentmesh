@@ -30,10 +30,10 @@ import {
   SecurityError,
   assertCwdAllowed,
   assertSafeBind,
+  anyTokenEqual,
   bearerFromHeader,
   loadTls,
-  resolveToken,
-  tokensEqual,
+  resolveTokens,
 } from "./security.js";
 
 export interface WorkerDaemonOptions {
@@ -41,10 +41,13 @@ export interface WorkerDaemonOptions {
   orchestrator: Orchestrator;
   host?: string;
   port?: number;
-  /** env var name holding the bearer token (required unless allowInsecure) */
+  /** env var name(s) holding bearer token(s), comma-separated for rotation
+   *  (required unless a token/tokens value is supplied directly) */
   tokenEnv?: string;
   /** explicit token value (tests); overrides tokenEnv */
   token?: string;
+  /** explicit set of valid token values (tests / rotation); overrides tokenEnv */
+  tokens?: string[];
   allowCwd?: string[];
   tls?: { cert?: string; key?: string; ca?: string };
   /** permit a non-loopback bind without TLS (dangerous; explicit opt-in) */
@@ -74,7 +77,7 @@ export class WorkerDaemon {
   private wss: WebSocketServer;
   private sockets = new Set<SocketState>();
   private heartbeat?: NodeJS.Timeout;
-  private token: string | undefined;
+  private tokens: string[];
   private host: string;
   private port: number;
   private allowCwd: string[] | undefined;
@@ -94,13 +97,13 @@ export class WorkerDaemon {
     this.daemonId = opts.daemonId ?? `daemon-${randomUUID().slice(0, 8)}`;
     this.heartbeatMs = opts.heartbeatMs ?? 20000;
     this.orphanGraceMs = opts.orphanGraceMs ?? opts.config.daemon?.orphanGraceMs ?? 0;
-    this.token = opts.token ?? resolveToken(opts.tokenEnv ?? opts.config.daemon?.tokenEnv);
+    this.tokens = this.resolveTokens();
     this.exposedProfiles = this.computeExposedProfiles();
 
     const tls = loadTls(opts.tls ?? opts.config.daemon?.tls);
     // Fail-safe: never bind a reachable interface in cleartext without opt-in.
     assertSafeBind(this.host, Boolean(tls), Boolean(opts.allowInsecure));
-    if (!this.token) {
+    if (this.tokens.length === 0) {
       throw new SecurityError(
         "daemon requires a bearer token (set tokenEnv or token); refusing to start unauthenticated",
         "no_token",
@@ -121,6 +124,38 @@ export class WorkerDaemon {
       .filter((p) => p.driver !== "remote")
       .map((p) => p.name);
     return explicit && explicit.length > 0 ? explicit.filter((n) => local.includes(n)) : local;
+  }
+
+  /**
+   * Resolve the accepted bearer tokens. Explicit values (tests) win; otherwise
+   * read from the configured env var name(s), which may be comma-separated to
+   * carry several valid tokens at once during a rotation.
+   */
+  private resolveTokens(): string[] {
+    if (this.opts.tokens && this.opts.tokens.length > 0) {
+      return this.opts.tokens.filter((t) => t.length > 0);
+    }
+    if (this.opts.token) return [this.opts.token];
+    return resolveTokens(this.opts.tokenEnv ?? this.opts.config.daemon?.tokenEnv);
+  }
+
+  /**
+   * Re-read accepted tokens from the environment for zero-downtime rotation.
+   * An operator adds a new secret alongside the old, migrates clients, calls
+   * this (or sends SIGHUP), then drops the old env var and calls it again.
+   * Refuses to rotate to an empty set so the daemon can never become either
+   * unauthenticated or lock itself out. Returns the new valid-token count.
+   */
+  reloadTokens(): number {
+    const next = this.resolveTokens();
+    if (next.length === 0) {
+      throw new SecurityError(
+        "refusing to rotate to an empty token set; daemon would become unauthenticated",
+        "no_token",
+      );
+    }
+    this.tokens = next;
+    return this.tokens.length;
   }
 
   /* ------------------------------- HTTP -------------------------------- */
@@ -151,7 +186,7 @@ export class WorkerDaemon {
 
   private authorized(req: http.IncomingMessage): boolean {
     const provided = bearerFromHeader(req.headers.authorization);
-    return tokensEqual(provided, this.token);
+    return anyTokenEqual(provided, this.tokens);
   }
 
   /* ------------------------------ upgrade ------------------------------ */
@@ -164,10 +199,11 @@ export class WorkerDaemon {
       return;
     }
     // Token may arrive via Authorization header or ?token= (clients that cannot
-    // set upgrade headers). Both are compared in constant time.
+    // set upgrade headers). Both are compared in constant time against every
+    // accepted token, so a rotated-in secret works without a restart.
     const headerToken = bearerFromHeader(req.headers.authorization);
     const queryToken = url.searchParams.get("token") ?? undefined;
-    if (!tokensEqual(headerToken, this.token) && !tokensEqual(queryToken, this.token)) {
+    if (!anyTokenEqual(headerToken, this.tokens) && !anyTokenEqual(queryToken, this.tokens)) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
       return;

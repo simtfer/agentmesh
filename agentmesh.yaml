@@ -84,6 +84,9 @@ profiles:
 #   host: 127.0.0.1              # non-loopback bind REQUIRES tls (or --allow-insecure)
 #   port: 8790
 #   tokenEnv: AGENTMESH_DAEMON_TOKEN   # daemon refuses to start if the env var is unset
+#                                      # rotate with no downtime: list several names
+#                                      # (VAR_OLD,VAR_NEW) or several comma-separated
+#                                      # values in one var, then send SIGHUP to reload
 #   allowCwd:                    # a remote task's cwd must sit inside one of these
 #     - /srv/agentmesh/repos
 #   tls:

@@ -30,6 +30,37 @@ export function resolveToken(tokenEnv: string | undefined): string | undefined {
 }
 
 /**
+ * Resolve the full set of currently-valid bearer tokens for credential
+ * rotation. `tokenEnv` may name several environment variables (comma-separated),
+ * and each variable's value may itself hold several tokens (comma-separated), so
+ * an operator can add a new secret alongside the old one, migrate clients, then
+ * drop the old var — all without downtime.
+ *
+ * Only env var NAMES live in config; secret VALUES stay in the environment and
+ * never in the config file or version control. Results are trimmed, de-duplicated
+ * (first wins) and empties dropped.
+ */
+export function resolveTokens(tokenEnv: string | undefined): string[] {
+  if (!tokenEnv) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const name of tokenEnv.split(",")) {
+    const key = name.trim();
+    if (!key) continue;
+    const raw = process.env[key];
+    if (!raw) continue;
+    for (const tok of raw.split(",")) {
+      const value = tok.trim();
+      if (value && !seen.has(value)) {
+        seen.add(value);
+        out.push(value);
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Constant-time token comparison to avoid leaking the token via timing.
  * Returns false (never throws) on any mismatch or malformed input.
  */
@@ -43,6 +74,20 @@ export function tokensEqual(provided: string | undefined, expected: string | und
   } catch {
     return false;
   }
+}
+
+/**
+ * Constant-time membership test against a set of accepted tokens (rotation).
+ * Every candidate is compared (no early return) so the result does not leak
+ * which token matched or how many are configured via short-circuit timing.
+ */
+export function anyTokenEqual(provided: string | undefined, expected: string[]): boolean {
+  if (!provided || expected.length === 0) return false;
+  let matched = false;
+  for (const tok of expected) {
+    if (tokensEqual(provided, tok)) matched = true;
+  }
+  return matched;
 }
 
 /** Extract a bearer token from an Authorization header value. */

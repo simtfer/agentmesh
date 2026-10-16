@@ -44,7 +44,7 @@ interface Harness {
 
 async function startDaemon(
   allowCwd: string[],
-  opts: { orphanGraceMs?: number } = {},
+  opts: { orphanGraceMs?: number; tokenEnv?: string } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-remote-"));
   const dOrch = new Orchestrator(daemonConfig, { baseCwd: dir, persist: false });
@@ -53,7 +53,9 @@ async function startDaemon(
     orchestrator: dOrch,
     host: "127.0.0.1",
     port: 0, // ephemeral
-    token: TOKEN,
+    // tokenEnv makes the daemon resolve its accepted set from the environment on
+    // every reloadTokens(); otherwise a single fixed test token is used.
+    ...(opts.tokenEnv ? { tokenEnv: opts.tokenEnv } : { token: TOKEN }),
     allowCwd,
     orphanGraceMs: opts.orphanGraceMs,
   });
@@ -216,6 +218,88 @@ test("/healthz is reachable without a token", async () => {
   } finally {
     await harness.stop();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Probe /profiles with a specific bearer token; returns the HTTP status. */
+async function profilesStatus(url: string, token: string): Promise<number> {
+  const r = await fetch(`${url}/profiles`, { headers: { authorization: `Bearer ${token}` } });
+  return r.status;
+}
+
+/** Open an authenticated raw WS with an arbitrary token; resolves null on 401. */
+function openWsWith(url: string, token: string): Promise<WS | null> {
+  const ws = new WS(`${url.replace(/^http/, "ws")}/ws`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  return new Promise((res) => {
+    ws.once("open", () => res(ws));
+    // A rejected upgrade surfaces as an error before any open event.
+    ws.once("error", () => res(null));
+    ws.once("unexpected-response", (_req, r) => res(r.statusCode === 101 ? ws : null));
+  });
+}
+
+test("daemon accepts multiple valid tokens during a rotation", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const ROT_ENV = "AGENTMESH_ROT_TOKENS";
+  process.env[ROT_ENV] = "old-secret, new-secret"; // comma-separated, whitespace tolerated
+  const harness = await startDaemon([dir], { tokenEnv: ROT_ENV });
+  try {
+    // Both the old and the rotated-in token authorize over HTTP...
+    assert.equal(await profilesStatus(harness.url, "old-secret"), 200);
+    assert.equal(await profilesStatus(harness.url, "new-secret"), 200);
+    // ...and a token that was never issued is still rejected.
+    assert.equal(await profilesStatus(harness.url, "never-issued"), 401);
+
+    // Both also pass the WebSocket upgrade; the bogus one does not connect.
+    const wsOld = await openWsWith(harness.url, "old-secret");
+    assert.ok(wsOld, "old token should upgrade");
+    wsOld?.close();
+    const wsNew = await openWsWith(harness.url, "new-secret");
+    assert.ok(wsNew, "new token should upgrade");
+    wsNew?.close();
+    const wsBad = await openWsWith(harness.url, "never-issued");
+    assert.equal(wsBad, null, "unissued token must be rejected at upgrade");
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+    delete process.env[ROT_ENV];
+  }
+});
+
+test("reloadTokens() rotates credentials with no restart and refuses an empty set", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const ROT_ENV = "AGENTMESH_ROT_LIVE";
+  // Start with only the old secret present in the environment.
+  process.env[ROT_ENV] = "old-secret";
+  const harness = await startDaemon([dir], { tokenEnv: ROT_ENV });
+  try {
+    assert.equal(await profilesStatus(harness.url, "old-secret"), 200);
+    assert.equal(await profilesStatus(harness.url, "new-secret"), 401);
+
+    // Operator adds the new secret alongside the old and triggers a reload.
+    process.env[ROT_ENV] = "old-secret,new-secret";
+    assert.equal(harness.daemon.reloadTokens(), 2);
+    assert.equal(await profilesStatus(harness.url, "new-secret"), 200, "new token live after reload");
+    assert.equal(await profilesStatus(harness.url, "old-secret"), 200, "old token still valid during overlap");
+
+    // Operator drops the old secret and reloads again; it stops working, the
+    // daemon never goes unauthenticated.
+    process.env[ROT_ENV] = "new-secret";
+    assert.equal(harness.daemon.reloadTokens(), 1);
+    assert.equal(await profilesStatus(harness.url, "old-secret"), 401, "retired token rejected after reload");
+    assert.equal(await profilesStatus(harness.url, "new-secret"), 200);
+
+    // Rotating to an empty set is refused so the daemon can't be locked out or
+    // silently become unauthenticated; the previous set keeps working.
+    process.env[ROT_ENV] = "";
+    assert.throws(() => harness.daemon.reloadTokens(), SecurityError);
+    assert.equal(await profilesStatus(harness.url, "new-secret"), 200);
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+    delete process.env[ROT_ENV];
   }
 });
 

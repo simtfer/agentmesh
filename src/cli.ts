@@ -98,10 +98,13 @@ Usage:
 
   # remote worker daemon (run on the worker host; ACP stdio never crosses the wire)
   agentmesh daemon [--config f] [--host h] [--port p]
-                   [--token-env VAR] [--tls-cert c --tls-key k [--tls-ca ca]]
+                   [--token-env VAR[,VAR2]] [--tls-cert c --tls-key k [--tls-ca ca]]
                    [--orphan-grace-ms N] [--allow-insecure]
-    token is read from the env var named by --token-env / daemon.tokenEnv (never
-    from config). Non-loopback binds require TLS unless --allow-insecure.
+    token is read from the env var(s) named by --token-env / daemon.tokenEnv
+    (never from config). Pass several comma-separated names — or several
+    comma-separated values in one var — to accept multiple valid tokens during a
+    rotation; send SIGHUP to re-read them from the environment with no downtime.
+    Non-loopback binds require TLS unless --allow-insecure.
     --orphan-grace-ms keeps a dropped task alive N ms so a client can re-attach
     and resume its stream (default 0 = cancel immediately, no orphans).
 
@@ -264,6 +267,20 @@ async function cmdDaemon(args: Args): Promise<void> {
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  // Zero-downtime credential rotation: re-read accepted tokens from the
+  // environment on SIGHUP. Add a new secret alongside the old, migrate clients,
+  // then `kill -HUP <pid>` and drop the old env var. Failures are non-fatal —
+  // the daemon keeps serving with the previously-accepted tokens.
+  process.on("SIGHUP", () => {
+    try {
+      const n = daemon.reloadTokens();
+      process.stderr.write(`[agentmesh] SIGHUP — reloaded bearer tokens (${n} accepted)\n`);
+    } catch (e) {
+      process.stderr.write(
+        `[agentmesh] SIGHUP — token reload failed: ${e instanceof Error ? e.message : String(e)}\n`,
+      );
+    }
+  });
 }
 
 async function main(): Promise<void> {
