@@ -55,3 +55,36 @@ profiles:
   #   model: anthropic/claude-sonnet-4-5
   #   permissionMode: approve-reads
   #   worktree: true
+
+  # --- remote workers: a profile that lives on a Worker Daemon (machine B) ----
+  # The daemon wraps the same local stack behind HTTP+WS; here you only point at
+  # it. ACP stdio never crosses the network — the daemon runs ACP locally and
+  # forwards typed task events back to the master.
+  #
+  # - name: big-gpu-impl
+  #   driver: remote
+  #   description: remote implementer running on the GPU box
+  #   remote:
+  #     endpoint: https://gpu.example.com:8790   # wss:// is derived automatically
+  #     tokenEnv: AGENTMESH_REMOTE_TOKEN          # VALUE read from env, never here
+  #     remoteProfile: opencode                   # which daemon-side profile to run
+  #     # ca: ./certs/daemon-ca.pem               # trust a self-signed daemon cert
+  #     # cert: ./certs/client.pem                # optional mTLS client cert
+  #     # key:  ./certs/client-key.pem
+  #     # connectTimeoutMs: 15000
+
+# --- Worker Daemon (host side) ----------------------------------------------
+# Only meaningful on the machine running `agentmesh daemon`. Defaults can be
+# overridden per-launch with --host/--port/--token-env/--tls-cert/--tls-key.
+#
+# daemon:
+#   host: 127.0.0.1              # non-loopback bind REQUIRES tls (or --allow-insecure)
+#   port: 8790
+#   tokenEnv: AGENTMESH_DAEMON_TOKEN   # daemon refuses to start if the env var is unset
+#   allowCwd:                    # a remote task's cwd must sit inside one of these
+#     - /srv/agentmesh/repos
+#   tls:
+#     cert: ./certs/daemon.pem
+#     key:  ./certs/daemon-key.pem
+#     # ca: ./certs/client-ca.pem      # enables mTLS client verification
+#   exposeProfiles: [opencode, pi]      # default: every non-remote profile

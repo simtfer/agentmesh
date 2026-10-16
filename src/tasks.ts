@@ -217,6 +217,7 @@ export class TaskManager {
     this.append(taskId, "waiting", `awaiting approval for ${req.toolKind ?? "tool"}`, {
       approvalId: id,
       kind: "permission",
+      toolKind: req.toolKind,
       title: req.title,
     });
     this.signalWaiting(taskId);

@@ -39,10 +39,11 @@ between them.
 ## Status
 
 Working and verified end-to-end: an **8-state persistent task machine** (SQLite),
-**async task lifecycle** (`task_submit` / `task_wait` / `task_result` / …), and a
-**human-in-the-loop approval flow** for worker permission/elicitation requests —
-driven against **real local OpenCode and Pi agents** as well as deterministic
-mocks. See [Verification](#verification).
+**async task lifecycle** (`task_submit` / `task_wait` / `task_result` / …), a
+**human-in-the-loop approval flow** for worker permission/elicitation requests,
+and a **remote Worker Daemon** for cross-machine workers over an authenticated,
+TLS-capable channel — driven against **real local OpenCode and Pi agents** as well
+as deterministic mocks. See [Verification](#verification).
 
 ## Install
 
@@ -58,7 +59,7 @@ Requires Node.js ≥ 22.13. Real workers additionally require the upstream CLI
 
 ```bash
 npm run demo     # Scene A: sync delegate-and-wait; Scene B: submit→waiting→approve→succeeded
-npm test         # 15 unit tests: state machine, persistence, timeout, cancel, approvals
+npm test         # 23 tests: state machine, persistence, timeout, cancel, approvals, remote daemon
 npm run smoke    # drives the real MCP server over stdio through the full task lifecycle
 ```
 
@@ -216,11 +217,95 @@ npx tsx src/cli.ts dispatch --profile pi --task "fix the auth bug" --worktree
 npx tsx src/cli.ts submit   --profile pi --prompt "fix the auth bug"   # prints taskId
 npx tsx src/cli.ts tasks    --config agentmesh.yaml
 npx tsx src/cli.ts approve  --approval-id A --decision allow_once
+
+# run workers on another machine (see "Remote Worker Daemon")
+npx tsx src/cli.ts daemon   --config agentmesh.yaml --host 127.0.0.1 --port 8790 \
+  --token-env AGENTMESH_DAEMON_TOKEN
 ```
 
 > Note: `submit` from the one-shot CLI persists the task but its live run ends
 > with the process. For real async use, submit through the long-lived `mcp`
 > server (or a resident orchestrator) so the run continues in the background.
+
+## Remote Worker Daemon (cross-machine workers)
+
+Run workers on another machine — a GPU box, a build server, a colleague's
+checkout — without ever putting an ACP stdio bridge on the network. The daemon
+wraps the **same** local stack (Orchestrator + TaskManager + acpx drivers) behind
+an authenticated HTTP+WebSocket endpoint; on the master side a remote worker is
+just another `driver: remote` profile, so dispatch, approvals, events and
+persistence behave identically to a local worker.
+
+```
+master (machine A)                                  worker daemon (machine B)
+┌───────────────────┐   WSS + Bearer token   ┌──────────────────────────────────┐
+│ driver: remote     │ ─────────────────────▶ │ agentmesh daemon                 │
+│  profile ──────────┼── submit/approve/… ───▶│  • HTTP /healthz, /profiles      │
+│ RemoteWorkerDriver │ ◀───────────────────── │  • WS /ws  (typed task events)   │
+└───────────────────┘   task events, result   │  • local Orchestrator + acpx     │──▶ ACP stdio (LOCAL ONLY)
+                                              └──────────────────────────────────┘
+```
+
+### Start the daemon (machine B)
+
+```bash
+export AGENTMESH_DAEMON_TOKEN="$(openssl rand -hex 32)"   # value never goes in config
+npx tsx src/cli.ts daemon \
+  --config agentmesh.yaml \
+  --host 0.0.0.0 --port 8790 \
+  --token-env AGENTMESH_DAEMON_TOKEN \
+  --tls-cert ./certs/daemon.pem --tls-key ./certs/daemon-key.pem
+```
+
+Flags: `--host` `--port` `--token-env` `--tls-cert` `--tls-key` `--tls-ca`
+(enables mTLS) `--allow-insecure` (explicit opt-out of the TLS requirement for
+non-loopback binds). The same keys can live under a `daemon:` block in
+`agentmesh.yaml`. Two probes are available:
+
+- `GET /healthz` — **unauthenticated** `{ ok, daemonId, protocol }` liveness.
+- `GET /profiles` — **authenticated**; lists the profiles the daemon exposes.
+
+### Point a master at it (machine A)
+
+```yaml
+profiles:
+  - name: big-gpu-impl
+    driver: remote
+    remote:
+      endpoint: https://gpu.example.com:8790   # wss:// derived automatically
+      tokenEnv: AGENTMESH_REMOTE_TOKEN          # value read from env, never stored
+      remoteProfile: opencode                   # which daemon-side profile to run
+      # ca: ./certs/daemon-ca.pem               # trust a self-signed daemon cert
+```
+
+Then the master drives it exactly like a local worker — `task_submit { profile:
+"big-gpu-impl" }`, `task_wait`, `task_approve` when a remote permission request
+arrives. Remote events are streamed back and persisted locally.
+
+### Security model
+
+- **Token required.** The daemon refuses to start if `tokenEnv` is unset or the
+  variable is empty; every upgrade/request is checked with a constant-time
+  comparison (`timingSafeEqual`). Tokens are read from the environment — never
+  written to config or committed to version control.
+- **Workdir whitelist.** `daemon.allowCwd` restricts where a remote task may run;
+  a `cwd` outside it (including `../` traversal and sibling-prefix tricks like
+  `/srv/repos_evil`) is rejected before any worker starts.
+- **TLS for anything non-loopback.** `assertSafeBind` refuses to bind a
+  non-loopback host without TLS unless you pass `--allow-insecure`. Loopback
+  `http://` is allowed for local dev/tests.
+- **ACP stdio stays local.** The daemon runs ACP in-process on machine B; only
+  typed task events cross the wire. There is no raw stdio passthrough.
+- **No orphans.** If the WebSocket drops, the daemon cancels any non-terminal
+  task it was running for that connection.
+
+### Remote tests
+
+`test/remote.test.ts` boots an ephemeral loopback daemon against mocks and drives
+a real `RemoteWorkerDriver` client through it — dispatch + streamed events,
+approval round-trip, cancel, bad-token rejection, cwd-whitelist refusal, the
+`/healthz` vs `/profiles` auth split, and unit coverage of `assertSafeBind` /
+`assertCwdAllowed`. 8 remote tests, no network, no API cost.
 
 ## Architecture
 
@@ -238,11 +323,16 @@ src/
     sqlite.ts          durable TaskStore on node:sqlite (default)
   orchestrator.ts      the core facade: workers + tasks + store + drivers
   drivers/
-    factory.ts         picks a driver per profile (acpx lazily constructed)
+    factory.ts         picks a driver per profile (acpx/remote lazily constructed)
     acpxDriver.ts      real ACP workers via acpx runtime (+ permission/elicitation hooks)
     mockDriver.ts      deterministic offline worker (demo/tests, incl. requireApproval)
+  remote/
+    protocol.ts        versioned wire messages (submit/approve/respond/cancel + events)
+    security.ts        token compare, cwd whitelist, TLS load, safe-bind guard
+    daemon.ts          WorkerDaemon: HTTP+WS shim wrapping a local Orchestrator
+    client.ts          RemoteWorkerDriver: a remote profile as a normal WorkerDriver
   mcp/server.ts        exposes the orchestrator as 15 MCP tools over stdio
-  cli.ts               demo | list | mcp | dispatch | submit | tasks
+  cli.ts               demo | list | mcp | dispatch | submit | tasks | daemon
 ```
 
 **Role symmetry:** nothing in the code says "opencode is master". The master is
@@ -254,13 +344,21 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **15/15** pass: happy path, worker failure, `timeout → timed_out`,
-  `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
-  idempotency de-dup, SQLite restart-and-requery, and store column-merge safety.
+- `npm test` — **23/23** pass:
+  - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
+  - `test/tasks.test.ts` (9) — happy path, worker failure, `timeout → timed_out`,
+    `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
+    idempotency de-dup, SQLite restart-and-requery, store column-merge safety.
+  - `test/remote.test.ts` (8) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
+    streamed events, approval round-trip, cancel, bad-token rejection,
+    cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, and unit guards
+    for `assertSafeBind` / `assertCwdAllowed`.
 - `npm run demo` — Scene A (sync dispatch to two workers) and Scene B
   (submit → waiting → approve → succeeded) both close.
 - `npm run smoke` — real MCP stdio server through the full lifecycle; event
   sequence `accepted, started, output…, waiting, resumed, output…, completed`.
+- `agentmesh daemon` boot check — `/healthz` open, `/profiles` 401 without a token
+  and 200 with `Authorization: Bearer …`, clean SIGINT shutdown.
 - `scripts/real-smoke.ts` — **real local OpenCode and Pi** driven through
   `task_submit → task_wait → task_result`; both return `OK`, reach `succeeded`,
   and persist their tasks + events to SQLite (2 tasks / 27 events observed).
@@ -272,14 +370,14 @@ Done:
 - ✅ Async task lifecycle with an 8-state machine + SQLite persistence.
 - ✅ Human-in-the-loop approvals (permission + elicitation) via the broker.
 - ✅ Real ACP workers (OpenCode, Pi) verified end-to-end.
+- ✅ Remote Worker Daemon: run workers on other machines over an authenticated,
+  TLS-capable channel (ACP stdio never crosses the network).
 
 Next:
 
 - Parallel fan-out across concurrent workers + a real queue owner.
 - Master-side prompt/skill pack so the master delegates well by default.
 - Cross-worker handoff (pipe one worker's diff into another's context).
-- Remote Worker Daemon: run workers on other machines over an authenticated,
-  TLS-protected channel (never expose a raw ACP stdio bridge to the LAN).
 - Structured result contracts (JSON output schema per task) + cost/usage roll-up
   from ACP `usage_update` events.
 - Recursion guard: cap delegation depth to prevent infinite master↔worker loops.

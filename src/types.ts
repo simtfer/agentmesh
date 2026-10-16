@@ -103,10 +103,30 @@ export interface MockBehavior {
   requireApproval?: boolean;
 }
 
+/** Settings for a `driver: "remote"` profile (a worker that lives on a daemon). */
+export interface RemoteSettings {
+  /** Daemon base URL: https://host:port (TLS) or http://host:port (loopback dev). */
+  endpoint: string;
+  /**
+   * Name of the environment variable holding the bearer token. The token VALUE
+   * is read from process.env at runtime and is never stored in config/VCS.
+   */
+  tokenEnv?: string;
+  /** Which profile on the daemon to run (defaults to this profile's name). */
+  remoteProfile?: string;
+  /** Optional PEM CA bundle to trust a self-signed daemon cert. */
+  ca?: string;
+  /** Optional client certificate/key for mTLS (paths or PEM). */
+  cert?: string;
+  key?: string;
+  /** Connect/handshake timeout in ms (default 15000). */
+  connectTimeoutMs?: number;
+}
+
 export interface WorkerProfile {
   /** unique profile name referenced by config and MCP tools */
   name: string;
-  driver: "acpx" | "mock";
+  driver: "acpx" | "mock" | "remote";
   /** acpx built-in agent name (pi, opencode, codex, ...) or a custom key */
   agent?: string;
   /** custom ACP launch command override (string or argv array) */
@@ -119,7 +139,22 @@ export interface WorkerProfile {
   /** run each spawn in an isolated git worktree of the base repo */
   worktree?: boolean;
   mock?: MockBehavior;
+  /** present when driver === "remote" */
+  remote?: RemoteSettings;
   description?: string;
+}
+
+/** Daemon-side settings (only meaningful for the host running `agentmesh daemon`). */
+export interface DaemonSettings {
+  host?: string;
+  port?: number;
+  /** env var name holding the bearer token clients must present */
+  tokenEnv?: string;
+  /** working directories a remote task's cwd is allowed to be within */
+  allowCwd?: string[];
+  tls?: { cert?: string; key?: string; ca?: string };
+  /** advertise only these profiles remotely (default: all non-remote profiles) */
+  exposeProfiles?: string[];
 }
 
 export interface MeshConfig {
@@ -131,10 +166,11 @@ export interface MeshConfig {
   };
   /** where git worktrees / session state live (default: ./.agentmesh) */
   workdir?: string;
+  daemon?: DaemonSettings;
 }
 
 export interface WorkerDriver {
-  readonly kind: "acpx" | "mock";
+  readonly kind: "acpx" | "mock" | "remote";
   createWorker(
     profile: WorkerProfile,
     opts: { id: string; cwd: string },

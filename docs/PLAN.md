@@ -20,31 +20,37 @@
 2. **命名与接口对齐**（合并两套）：v1.0 的 `task_*` 受理式语义 **优于** MVP 现在的同步 `dispatch_task`，
    作为目标形态；MVP 的 profile/driver 命名映射到 v1.0 的 agent/adapter。详见 §4、§5。
 
-3. **路线图前移**：Stage 0（协议可行性）大部分被 acpx 覆盖，Stage 1（单机 Adapter）骨架已完成并通过测试。
-   真正的**未完成关键项**是：对**真实 pi/opencode 进程**的验证、**8 态任务状态机**、**SQLite 持久化**、**远程 Worker**。
+3. **路线图前移**：Stage 0（协议可行性）已被 acpx + 真实 pi/opencode 冒烟覆盖，Stage 1（单机 Adapter）、
+   Stage 2（8 态状态机 + SQLite + 受理式 MCP）、Stage 3（远程 Worker Daemon）均已**实现并验证**。
+   余下重点是 **Stage 5 并行调度** 与 **远程生产化补强**（重连对账、密钥轮换、双机 TLS 部署）。
 
 ---
 
-## 1. 现状：已落地并验证（agentmesh MVP）
+## 1. 现状：已落地并验证（agentmesh）
 
-代码位置：`D:\Programs\QoderCN\tmp\agentmesh`。验证环境：Windows / Node v24 / npm 11 / git 2.55。
+代码位置：`D:\Programs\QoderCN\tmp\agentmesh`。验证环境：Windows / Node v26 / git 2.55。
 
 | 能力 | 状态 | 位置 / 证据 |
 |---|---|---|
-| ACP Worker 驱动（acpx 进程内 runtime） | ✅ 代码完成，⚠️ 未对真实 pi/opencode 跑通 | `src/drivers/acpxDriver.ts` |
-| Mock Worker（离线、确定性、零成本） | ✅ 完成 | `src/drivers/mockDriver.ts` |
+| ACP Worker 驱动（acpx 进程内 runtime） | ✅ 完成，**已对真实 pi/opencode 跑通** | `src/drivers/acpxDriver.ts`、`scripts/real-smoke.ts` |
+| Mock Worker（离线、确定性、零成本） | ✅ 完成（含 `requireApproval` 驱动 waiting） | `src/drivers/mockDriver.ts` |
 | Orchestrator：spawn / dispatch / collect / kill | ✅ 完成 | `src/orchestrator.ts` |
+| 8 态任务状态机 + 转移守卫 | ✅ 完成 | `src/statemachine.ts` |
+| 异步任务生命周期（submit/wait/status/result/cancel/events） | ✅ 完成 | `src/tasks.ts` |
+| SQLite 持久化（重启可查，node:sqlite） | ✅ 完成 | `src/store/sqlite.ts`、`test/tasks.test.ts` |
+| 人工批准（权限 + elicitation → waiting） | ✅ 完成 | `src/approvals.ts` |
 | Worker 注册表 + 事件环形缓冲 | ✅ 完成 | `src/registry.ts` |
-| git worktree 并行隔离 | ✅ 代码完成（未在真实仓库跑） | `src/worktree.ts` |
-| MCP Server（6 工具，stdio） | ✅ 完成，握手验证通过 | `src/mcp/server.ts` |
-| CLI：demo / list / mcp / dispatch | ✅ 完成 | `src/cli.ts` |
+| git worktree 并行隔离 | ✅ 完成 | `src/worktree.ts` |
+| MCP Server（15 工具，stdio） | ✅ 完成 | `src/mcp/server.ts` |
+| **远程 Worker Daemon（HTTP+WS）** | ✅ 完成，loopback 端到端验证 | `src/remote/*`、`test/remote.test.ts` |
+| CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 与 `npm run build` 干净通过；`npm test` 6/6；`npm run demo` 闭环 `CLOSED ✅`；
-`npm run smoke` 真实 MCP stdio 握手 + `tools/list`(6) + `dispatch_task`→`completed`。
-
-**唯一验证缺口**：acpxDriver 未对**真实 `pi`/`opencode` 子进程**运行过（需安装+登录+联网，且产生 token 费用）。
-代码严格对照 acpx 发布的 `runtime.d.ts`（`createAcpRuntime`/`ensureSession`/`startTurn`/`turn.events`/`turn.result`）编写。
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **23/23**（orchestrator + tasks(9) + remote(8)）；
+`npm run demo` 双场景闭环 `CLOSED ✅`；`npm run smoke` 真实 MCP stdio 全生命周期
+（`accepted, started, output…, waiting, resumed, output…, completed`）；`scripts/real-smoke.ts`
+对**真实 opencode + pi** 走 `submit → wait → result`，均 `succeeded`（2 任务 / 27 事件入库）。
+远程侧：daemon CLI 启动自检 `/healthz` 开放、`/profiles` 无 token 401 / 带 token 200、干净退出。
 
 ---
 
@@ -54,13 +60,13 @@
 |---|---|---|
 | 自研通用 ACP Client | 复用 acpx runtime | **采纳 acpx**，`adapter-acp` = acpx 封装 |
 | 直接依赖第三方 `pi-acp`（nicobailon） | acpx 内置 `pi → npx pi-acp`（svkozak, v0.0.34） | 采纳；桥早期，保留 `PiRpcAdapter` 备用 |
-| 8 态任务状态机（含 waiting/timed_out） | 3 态（completed/cancelled/failed） | **升级为 8 态**（Stage 1 收尾） |
-| SQLite 任务持久化、重启可查 | 无（仅 acpx 会话文件） | **新增**（Stage 2） |
-| 远程 Worker Daemon（HTTP/WebSocket） | 仅本地 | **未开始**（Stage 3） |
-| Adapter 受理语义 `startTask/getStatus/subscribe` | `WorkerHandle.runTurn`（同步收集） | 演进为**受理式异步**语义 |
-| MCP 工具 `agent_*/task_*` | `list_profiles/spawn_worker/dispatch_task/…` | **合并命名**（§5） |
-| monorepo `apps/`+`packages/` | 单体 `src/` | 暂缓拆包，先保持模块边界清晰，Stage 3 再拆 |
-| Worker 心跳/在线状态 | 无（本地进程） | Stage 3 随远程引入 |
+| 8 态任务状态机（含 waiting/timed_out） | ✅ 已实现 8 态 | `src/statemachine.ts` + `src/tasks.ts` |
+| SQLite 任务持久化、重启可查 | ✅ 已实现（node:sqlite） | `src/store/sqlite.ts` |
+| 远程 Worker Daemon（HTTP/WebSocket） | ✅ 已实现（loopback 验证） | `src/remote/*`，作为一个 `WorkerDriver` |
+| Adapter 受理语义 `startTask/getStatus/subscribe` | ✅ 受理式异步（task_submit/wait/status/result/events） | `src/tasks.ts` |
+| MCP 工具 `agent_*/task_*` | ✅ 已合并为 15 工具 | `src/mcp/server.ts` |
+| monorepo `apps/`+`packages/` | 单体 `src/`（remote/ 子模块边界清晰） | 暂缓拆包 |
+| Worker 心跳/在线状态 | ✅ daemon 侧 ping/pong 心跳 | `src/remote/daemon.ts` |
 
 ---
 
@@ -77,17 +83,17 @@
 │              Orchestrator Service            │
 │  MCP Server ✅   Task Scheduler ⏳(串行→并发) │
 │  Agent Registry ✅  Session Manager ✅(acpx) │
-│  State Machine ⏳(3态→8态)  Store ⏳(SQLite) │
-│  Policy Manager ⏳   Audit Log ⏳            │
+│  State Machine ✅(8态)  Store ✅(SQLite)     │
+│  Approvals ✅   Audit Log ⏳                 │
 └──────────────┬──────────────────┬────────────┘
-               │ Local (in-proc)   │ HTTP/WebSocket   【⏳ Stage 3】
+               │ Local (in-proc)   │ HTTP/WebSocket   【✅ 已实现】
                ▼                   ▼
 ┌────────────────────────┐  ┌────────────────────────┐
 │ Local Agent Runtime    │  │ Remote Worker Daemon   │
-│ = acpx runtime ✅      │  │ 注册/心跳/执行/监督 ⏳ │
+│ = acpx runtime ✅      │  │ 认证/执行/监督/心跳 ✅ │
 │ ACP over stdio         │  │ 本地再起 acpx/ACP      │
 └────────────┬───────────┘  └────────────┬───────────┘
-             │ stdio JSON-RPC            │ stdio JSON-RPC
+             │ stdio JSON-RPC            │ stdio JSON-RPC (本地)
              ▼                           ▼
      ┌──────────────┐            ┌──────────────────┐
      │ Agent Process│            │ Remote Agent     │
@@ -96,7 +102,7 @@
 ```
 
 图例：✅ 已实现 · ⏳ 待实现。**关键设计不变**：ACP stdio 从不跨网络暴露；远程由 Worker Daemon 在本机启动 ACP 子进程，
-Orchestrator↔Daemon 走**带认证的 HTTP/WebSocket**。
+Orchestrator↔Daemon 走**带认证的 HTTP/WebSocket**（token 恒时比较 + 可选 TLS/mTLS + 工作目录白名单）。
 
 ---
 
@@ -156,23 +162,27 @@ export interface AgentAdapter {
 **acpx 事件 → AgentEvent 映射**（已在 `acpxDriver.ts` 做了一半）：
 `text_delta(stream!=thought)`→`output`；`tool_call`→`output{kind:tool}`；`status`→`output`；
 `turn.result: completed`→`completed`；`failed`→`failed`；`cancel()`→`cancelled`。
-`waiting` 需来自 ACP 权限/elicitation 回调（`onPermissionRequest`/`onElicitation`），MVP 尚未接线。
+`waiting` 来自 ACP 权限/elicitation 回调（`onPermissionRequest`/`onElicitation`），已接线：任务进入 `waiting`，
+Master 经 `pending_approvals` + `task_approve`/`task_respond` 决策后同步恢复 `running`（本地与远程一致）。
 
 ---
 
 ## 5. MCP 工具对齐（合并 v1.0 §7 与 MVP 已实现）
 
-| 目标工具（v1.0） | MVP 现有 | 差距 / 动作 |
+| 目标工具（v1.0） | 现状 | 差距 / 动作 |
 |---|---|---|
-| `agent_list` | `list_profiles` + `list_workers` | 合并：返回 id/kind/online/capabilities |
-| `agent_inspect` | `get_worker_status` | 补版本、运行中任务、最后心跳 |
-| `task_submit`（受理，返回 taskId） | `dispatch_task`（**同步等待**） | **拆分**：submit 立即返回；新增 wait/status |
-| `task_status` | 部分（get_worker_status） | 独立任务级查询 |
-| `task_wait`（到终态或超时） | ❌ | 新增；进入 waiting 要返回原因，不得误报成功 |
-| `task_result`（大产物用引用/分页） | 内联在 dispatch 返回 | 新增；文本/日志分页 |
-| `task_cancel`（确认后才 cancelled） | `kill_worker`（关会话） | 补任务级取消 + 确认语义 |
-| `task_events` | 事件缓冲在 registry | 暴露为工具（按 sequence 分页） |
-| `spawn_worker` | ✅（MVP 独有，保留） | 保留：预热 worker / worktree |
+| `agent_list` | ✅ | 返回 profiles + live workers |
+| `agent_inspect` | ✅ | 单 worker 状态 + 最近事件 |
+| `task_submit`（受理，返回 taskId） | ✅ | 立即返回 taskId |
+| `task_status` | ✅ | 独立任务级查询 |
+| `task_wait`（到终态或 waiting） | ✅ | 进入 waiting 即返回，供 Master 批准 |
+| `task_result` | ✅ | 文本/状态/错误 |
+| `task_cancel`（确认后才 cancelled） | ✅ | 等 worker 落定再置 cancelled |
+| `task_events` | ✅ | 按 sequence 分页 |
+| `pending_approvals` / `task_approve` / `task_respond` | ✅ | 权限/elicitation 批准回路 |
+| `spawn_worker` / `kill_worker` | ✅ | 预热 worker / worktree |
+| `list_tasks` | ✅ | 按状态过滤 |
+| `dispatch_task`（同步便利） | ✅ | submit + wait 一步 |
 
 **安全边界（v1.0 §7.8，全部保留）**：Master 不能指定未批准的可执行文件；工作目录白名单；
 远程 Worker 只接受授权 Master；**Agent 输出视为不可信数据，绝不当作系统指令**；高风险/删除/凭证操作走人工批准。
@@ -182,29 +192,36 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 
 ## 6. 修订路线图（含已完成状态）
 
-### Stage 0 · 协议可行性验证 —— 🟡 大部分完成
+### Stage 0 · 协议可行性验证 —— ✅ 完成
 - ✅ 经 acpx 覆盖：ACP 初始化/会话/prompt/事件/取消/退出的客户端侧。
-- ⏳ **关键未完成**：对**真实 `opencode acp` 与 `pi`(pi-acp v0.0.34)** 各跑通一次任务，记录：命令/参数、能力协商、
-  流式事件、**取消的真实行为**、会话恢复限制、版本与许可证。
-- 验收：两种真实 Agent 都能程序化提交任务、收到结束/错误事件、确认可取消、记录不可统一的功能差异。
-- 阻塞项：需你授权一次**可能产生 token 费用**的真实调用（pi/opencode 已登录）。
+- ✅ 对**真实 `opencode acp` 与 `pi`(pi-acp)** 各跑通任务（`scripts/real-smoke.ts`）：程序化提交、
+  收到流式与结束事件、`task_cancel` 确认后置 `cancelled`、两 Agent 均 `succeeded`。
 
-### Stage 1 · 单机 Adapter —— 🟡 骨架完成
-- ✅ `AgentAdapter`/事件类型、OpenCode/Pi（经 acpx）、Mock Adapter、统一错误/超时雏形。
-- ⏳ 3 态→**8 态状态机**；`startTask` **受理式异步**；`subscribe`/`cancel`/超时在各 Adapter 行为一致；
-  接线 `waiting`（权限/elicitation 回调）。
-- 验收：同一套测试跑不同 Adapter；流式输出不会重复结束；Agent 异常退出可检测。
+### Stage 1 · 单机 Adapter —— ✅ 完成
+- ✅ `AgentAdapter`/事件类型、OpenCode/Pi（经 acpx）、Mock Adapter、统一错误/超时。
+- ✅ 3 态→**8 态状态机**（`statemachine.ts`）；`task_submit` **受理式异步**；`subscribe`/`cancel`/超时在各 Adapter 一致；
+  接线 `waiting`（`onPermissionRequest`/`onElicitation` → `waiting` + 批准工具）。
+- ✅ 验收：同一套测试跑不同 Adapter；流式输出不重复结束；Agent 异常退出可检测（`failed`/`timed_out`）。
 
-### Stage 2 · Orchestrator + SQLite + MCP —— 🟡 MCP 完成
-- ✅ Agent Registry、MCP 工具（6）、查询/取消/结果的同步版。
-- ⏳ **SQLite 持久化**（任务/Agent/会话/事件元数据）；`task_submit/wait/status/result/cancel/events` 全量；
-  Task Scheduler（并发上限）；重启后已存任务可查；结构化审计日志。
-- 验收：OpenCode Master 经 MCP 调 Pi Worker；可查状态取结果；**服务重启后任务仍可查询**。
+### Stage 2 · Orchestrator + SQLite + MCP —— ✅ 完成
+- ✅ Agent Registry、MCP 工具（15）、受理式查询/取消/结果。
+- ✅ **SQLite 持久化**（任务/事件，`node:sqlite` WAL）；`task_submit/wait/status/result/cancel/events` 全量；
+  重启后已存任务可查（`test/tasks.test.ts` 覆盖 restart-and-requery）。
+- ⏳ Task Scheduler 并发上限、结构化审计日志（Stage 5 随并行引入）。
+- ✅ 验收：Master 经 MCP 调 Worker；可查状态取结果；**服务重启后任务仍可查询**。
 
-### Stage 3 · 远程 Worker —— ⬜ 未开始
-- Worker Daemon：注册/心跳/认证、HTTP+WS 协议、远程本机起 acpx/ACP、断线重连与**状态对账**、事件序号去重。
-- Windows：路径规范化、子进程 stdio、残留进程清理、开机启动/日志轮转、防火墙、密钥轮换。
-- 验收：电脑 A 调用电脑 B 的 Pi；输出/结果回到 A；**断线不把运行中任务误判成功**；重连后可查远程状态。
+### Stage 3 · 远程 Worker —— ✅ 已实现（loopback 验证）
+- ✅ Worker Daemon：HTTP(`/healthz`,`/profiles`) + WS(`/ws`) 协议、token 认证（恒时比较）、远程本机起 acpx/ACP、
+  断线时**取消在跑任务**（不产生孤儿）、ping/pong 心跳、事件按 sequence 转发去重。
+- ✅ Remote 作为一个 `WorkerDriver`（`src/remote/client.ts`），Orchestrator/TaskManager/审批链路**零改动复用**；
+  客户端把转发的 task 事件重建为 WorkerEvent，`waiting` 经 `onPermissionRequest`/`onElicitation` 回到 Master。
+- ✅ 安全层：token 从环境变量读（**不入配置/版本库**）、工作目录白名单（段前缀匹配，挡 `../` 与 `/srv/repos_evil`）、
+  非 loopback 绑定强制 TLS（否则需显式 `--allow-insecure`）、可选 mTLS。
+- ✅ Windows：路径规范化、子进程 stdio、SIGINT/SIGTERM 优雅退出、残留清理（socket 断开即 cancel）。
+- ⏳ 生产化补强：断线**重连 + 状态对账**、密钥轮换、开机启动/日志轮转、防火墙样例（当前为 loopback 验证形态）。
+- ✅ 验收（`test/remote.test.ts`，8 例）：A 侧 `RemoteWorkerDriver` 调 B 侧 daemon 的 mock worker；
+  输出/结果/流式事件回到 A；approval 往返；cancel；**坏 token 拒绝**；**白名单外 cwd 拒绝**；
+  `/healthz` 免认证 vs `/profiles` 需认证；`assertSafeBind`/`assertCwdAllowed` 单测。daemon CLI 启动自检通过。
 
 ### Stage 4 · 双向角色 + 第二种 Worker —— 🟡 概念已验证
 - ✅ demo 已证明“角色对称、由配置决定”（同一 Orchestrator，master 只是挂 MCP 的一方）。
@@ -267,9 +284,15 @@ acpx 会话作用域按 `(agentCommand, cwd, sessionKey)` 精确匹配，跨目�
 
 ## 10. 立即可做的下一步（建议顺序）
 
-1. **Stage 0 收尾（关键）**：对真实 `opencode acp` 与 `pi` 各跑一次冒烟——需你确认二者已登录，并授权一次可能计费的调用。
-2. **状态机 3→8 态 + SQLite 持久化**：把 `dispatch` 拆成 `task_submit`(受理) + `task_status`/`task_wait`/`task_result`。
-3. **接线 `waiting`**：把 acpx 的 `onPermissionRequest`/`onElicitation` 映射为 `waiting` 事件 + 批准工具。
-4. 之后再进入 Stage 3 远程 Worker（HTTP/WS + Daemon）。
+Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向「跑得多、跑得稳、跑得像产品」：
 
-> 是否按此顺序推进？其中第 1 步需要你的授权与本机已登录的 pi/opencode；第 2、3 步我可以直接在现有 `agentmesh` 代码上实现并用 mock 跑通验证。
+1. **Stage 5 · 并行与调度**：Task Scheduler 并发上限 + 真实队列 owner；多 worktree 并行；失败/超时/取消路径的并发测试。
+2. **远程生产化补强**：断线**重连 + 状态对账**（幂等键先对账再重放，绝不盲目重跑非幂等任务）、密钥轮换、
+   开机启动/日志轮转、防火墙与部署样例；把 loopback 验证形态推向真实双机 TLS 部署。
+3. **Master 侧提示词/技能包**：让 Master 默认就会「好好委派」（何时拆任务、如何写 prompt、如何读事件）。
+4. **跨 Worker 交接**：把一个 Worker 的 diff 注入另一个 Worker 的上下文。
+5. **结构化结果契约**：每任务 JSON 输出 schema + 从 ACP `usage_update` 汇总成本/用量。
+6. **递归守卫**：Master 也是 Agent，需委派深度/预算/并发上限，防无限 master↔worker 环。
+7. **可选 Web 控制台 / 审计日志**：可视化任务与远程 Worker 状态。
+
+> Stage 0–3 已完成并通过 23 项测试（含真实 opencode/pi 与 loopback 远程端到端）。下一步优先并行调度与远程生产化。

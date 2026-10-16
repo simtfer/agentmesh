@@ -1,6 +1,7 @@
 import type { WorkerDriver, WorkerProfile, MeshConfig } from "../types.js";
 import { AcpxWorkerDriver } from "./acpxDriver.js";
 import { MockWorkerDriver } from "./mockDriver.js";
+import { RemoteWorkerDriver } from "../remote/client.js";
 
 export interface DriverSet {
   forProfile(profile: WorkerProfile): WorkerDriver;
@@ -9,8 +10,9 @@ export interface DriverSet {
 
 /**
  * Build the drivers implied by a config. The acpx driver (and thus the ACP
- * runtime) is created lazily on first real use, so mock-only runs never pay for
- * it. Custom `command` overrides are folded into the acpx agent registry.
+ * runtime) and the remote driver are created lazily on first real use, so
+ * mock-only runs never pay for them. Custom `command` overrides are folded into
+ * the acpx agent registry.
  */
 export function createDrivers(config: MeshConfig, baseCwd: string): DriverSet {
   const overrides: Record<string, string | string[]> = {};
@@ -26,6 +28,7 @@ export function createDrivers(config: MeshConfig, baseCwd: string): DriverSet {
 
   const mock = new MockWorkerDriver();
   let acpx: AcpxWorkerDriver | undefined;
+  let remote: RemoteWorkerDriver | undefined;
 
   const getAcpx = (): AcpxWorkerDriver => {
     if (!acpx) {
@@ -39,12 +42,20 @@ export function createDrivers(config: MeshConfig, baseCwd: string): DriverSet {
     return acpx;
   };
 
+  const getRemote = (): RemoteWorkerDriver => {
+    if (!remote) remote = new RemoteWorkerDriver();
+    return remote;
+  };
+
   return {
     forProfile(profile) {
-      return profile.driver === "mock" ? mock : getAcpx();
+      if (profile.driver === "mock") return mock;
+      if (profile.driver === "remote") return getRemote();
+      return getAcpx();
     },
     async dispose() {
       if (acpx) await acpx.dispose();
+      if (remote) await remote.dispose();
     },
   };
 }

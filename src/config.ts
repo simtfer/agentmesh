@@ -11,9 +11,19 @@ const MockBehavior = z.object({
   requireApproval: z.boolean().optional(),
 });
 
+const RemoteSettings = z.object({
+  endpoint: z.string().min(1),
+  tokenEnv: z.string().optional(),
+  remoteProfile: z.string().optional(),
+  ca: z.string().optional(),
+  cert: z.string().optional(),
+  key: z.string().optional(),
+  connectTimeoutMs: z.number().int().positive().optional(),
+});
+
 const Profile = z.object({
   name: z.string().min(1),
-  driver: z.enum(["acpx", "mock"]),
+  driver: z.enum(["acpx", "mock", "remote"]),
   agent: z.string().optional(),
   command: z.union([z.string(), z.array(z.string())]).optional(),
   model: z.string().optional(),
@@ -22,7 +32,23 @@ const Profile = z.object({
   permissionMode: z.string().optional(),
   worktree: z.boolean().optional(),
   mock: MockBehavior.optional(),
+  remote: RemoteSettings.optional(),
   description: z.string().optional(),
+});
+
+const DaemonSettings = z.object({
+  host: z.string().optional(),
+  port: z.number().int().min(0).max(65535).optional(),
+  tokenEnv: z.string().optional(),
+  allowCwd: z.array(z.string()).optional(),
+  tls: z
+    .object({
+      cert: z.string().optional(),
+      key: z.string().optional(),
+      ca: z.string().optional(),
+    })
+    .optional(),
+  exposeProfiles: z.array(z.string()).optional(),
 });
 
 const ConfigSchema = z.object({
@@ -35,6 +61,7 @@ const ConfigSchema = z.object({
     })
     .optional(),
   workdir: z.string().optional(),
+  daemon: DaemonSettings.optional(),
 });
 
 export function parseConfig(raw: unknown): MeshConfig {
@@ -46,6 +73,9 @@ export function parseConfig(raw: unknown): MeshConfig {
     if (p.driver === "acpx" && !p.agent && !p.command) {
       // fall back to the profile name as the acpx agent name
       p.agent = p.name;
+    }
+    if (p.driver === "remote" && !p.remote?.endpoint) {
+      throw new Error(`remote profile "${p.name}" requires remote.endpoint`);
     }
   }
   return parsed as MeshConfig;

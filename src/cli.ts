@@ -4,6 +4,7 @@ import path from "node:path";
 import { loadConfig, parseConfig } from "./config.js";
 import { Orchestrator } from "./orchestrator.js";
 import { runMcpServer } from "./mcp/server.js";
+import { WorkerDaemon } from "./remote/daemon.js";
 import type { MeshConfig, TaskEvent, PermissionDecision } from "./types.js";
 
 interface Args {
@@ -19,6 +20,13 @@ interface Args {
   approvalId?: string;
   decision?: string;
   timeout?: number;
+  host?: string;
+  port?: number;
+  tokenEnv?: string;
+  tlsCert?: string;
+  tlsKey?: string;
+  tlsCa?: string;
+  allowInsecure?: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -37,7 +45,14 @@ function parseArgs(argv: string[]): Args {
       case "--approval-id": out.approvalId = next(); break;
       case "--decision": out.decision = next(); break;
       case "--timeout": out.timeout = Number(next()); break;
+      case "--host": out.host = next(); break;
+      case "--port": out.port = Number(next()); break;
+      case "--token-env": out.tokenEnv = next(); break;
+      case "--tls-cert": out.tlsCert = next(); break;
+      case "--tls-key": out.tlsKey = next(); break;
+      case "--tls-ca": out.tlsCa = next(); break;
       case "--worktree": out.worktree = true; break;
+      case "--allow-insecure": out.allowInsecure = true; break;
       default:
         if (a.startsWith("--")) { const [k, v] = a.slice(2).split("="); (out as unknown as Record<string, unknown>)[k!] = v ?? true; }
         else out._.push(a);
@@ -79,8 +94,15 @@ Usage:
   agentmesh wait   --task-id T [--timeout ms] [--config f]
   agentmesh approve --approval-id A --decision allow_once [--config f]
 
+  # remote worker daemon (run on the worker host; ACP stdio never crosses the wire)
+  agentmesh daemon [--config f] [--host h] [--port p]
+                   [--token-env VAR] [--tls-cert c --tls-key k [--tls-ca ca]]
+                   [--allow-insecure]
+    token is read from the env var named by --token-env / daemon.tokenEnv (never
+    from config). Non-loopback binds require TLS unless --allow-insecure.
+
 Roles are config-driven: any MCP-capable agent (opencode, pi, ...) can be the
-master; workers are driven over ACP via acpx.
+master; workers are driven over ACP via acpx, locally or on a remote daemon.
 `;
 
 const traceLine = (id: string, ev: TaskEvent) => {
@@ -198,6 +220,47 @@ async function cmdMcp(args: Args): Promise<void> {
   await runMcpServer(orch);
 }
 
+async function cmdDaemon(args: Args): Promise<void> {
+  const cfg = await resolveConfig(args);
+  const orch = new Orchestrator(cfg, { baseCwd: process.cwd() });
+  const daemon = new WorkerDaemon({
+    config: cfg,
+    orchestrator: orch,
+    host: args.host ?? cfg.daemon?.host,
+    port: args.port ?? cfg.daemon?.port,
+    tokenEnv: args.tokenEnv ?? cfg.daemon?.tokenEnv,
+    allowCwd: cfg.daemon?.allowCwd,
+    tls:
+      args.tlsCert && args.tlsKey
+        ? { cert: args.tlsCert, key: args.tlsKey, ca: args.tlsCa }
+        : cfg.daemon?.tls,
+    allowInsecure: args.allowInsecure,
+  });
+
+  const info = await daemon.start();
+  const scheme = info.url.startsWith("https") ? "https" : "http";
+  process.stderr.write(
+    `[agentmesh] worker daemon listening on ${info.url} (${scheme}, profiles: ${cfg.profiles
+      .filter((p) => p.driver !== "remote")
+      .map((p) => p.name)
+      .join(", ") || "none"})\n`,
+  );
+  if (scheme === "http" && !args.allowInsecure) {
+    process.stderr.write(
+      `[agentmesh] note: plain HTTP — bind is loopback-only. Use --tls-cert/--tls-key for remote hosts.\n`,
+    );
+  }
+
+  const shutdown = async (sig: string) => {
+    process.stderr.write(`[agentmesh] ${sig} — shutting down daemon\n`);
+    await daemon.stop().catch(() => {});
+    await orch.shutdown().catch(() => {});
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   switch (args._[0]) {
@@ -207,6 +270,7 @@ async function main(): Promise<void> {
     case "submit": return cmdSubmit(args);
     case "tasks": return cmdTasks(args);
     case "mcp": return cmdMcp(args);
+    case "daemon": return cmdDaemon(args);
     case undefined: case "help": case "--help":
       process.stdout.write(HELP); return;
     default:
