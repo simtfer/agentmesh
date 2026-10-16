@@ -218,10 +218,15 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 - ✅ 安全层：token 从环境变量读（**不入配置/版本库**）、工作目录白名单（段前缀匹配，挡 `../` 与 `/srv/repos_evil`）、
   非 loopback 绑定强制 TLS（否则需显式 `--allow-insecure`）、可选 mTLS。
 - ✅ Windows：路径规范化、子进程 stdio、SIGINT/SIGTERM 优雅退出、残留清理（socket 断开即 cancel）。
-- ⏳ 生产化补强：断线**重连 + 状态对账**、密钥轮换、开机启动/日志轮转、防火墙样例（当前为 loopback 验证形态）。
-- ✅ 验收（`test/remote.test.ts`，8 例）：A 侧 `RemoteWorkerDriver` 调 B 侧 daemon 的 mock worker；
+- ✅ **状态对账**：协议新增 `query`/`query_result`；客户端 `queryRemoteTask(remote, taskId)` 一次性重连查询
+  权威持久化记录（`RemoteWorkerDriver.queryTask` 同）。断线时在跑任务被 daemon 取消，重连查询得到权威
+  `cancelled` 而非误判 `succeeded`；未知 id 返回 `undefined`。
+- ⏳ 生产化补强：断线**自动重连并续订事件流**（当前为主动查询式对账，非推送续流）、密钥轮换、
+  开机启动/日志轮转、防火墙样例（当前为 loopback 验证形态）。
+- ✅ 验收（`test/remote.test.ts`，11 例）：A 侧 `RemoteWorkerDriver` 调 B 侧 daemon 的 mock worker；
   输出/结果/流式事件回到 A；approval 往返；cancel；**坏 token 拒绝**；**白名单外 cwd 拒绝**；
-  `/healthz` 免认证 vs `/profiles` 需认证；`assertSafeBind`/`assertCwdAllowed` 单测。daemon CLI 启动自检通过。
+  `/healthz` 免认证 vs `/profiles` 需认证；**完成后重连对账**、**未知 id→undefined**、**断线在跑→cancelled 不误判成功**；
+  `assertSafeBind`/`assertCwdAllowed` 单测。daemon CLI 启动自检通过。
 
 ### Stage 4 · 双向角色 + 第二种 Worker —— 🟡 概念已验证
 - ✅ demo 已证明“角色对称、由配置决定”（同一 Orchestrator，master 只是挂 MCP 的一方）。
@@ -287,8 +292,9 @@ acpx 会话作用域按 `(agentCommand, cwd, sessionKey)` 精确匹配，跨目�
 Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向「跑得多、跑得稳、跑得像产品」：
 
 1. **Stage 5 · 并行与调度**：Task Scheduler 并发上限 + 真实队列 owner；多 worktree 并行；失败/超时/取消路径的并发测试。
-2. **远程生产化补强**：断线**重连 + 状态对账**（幂等键先对账再重放，绝不盲目重跑非幂等任务）、密钥轮换、
-   开机启动/日志轮转、防火墙与部署样例；把 loopback 验证形态推向真实双机 TLS 部署。
+2. **远程生产化补强**：状态对账已落地（`query` 主动查询式）；下一步是断线**自动重连并续订事件流**（推送式续流，
+   幂等键先对账再重放，绝不盲目重跑非幂等任务）、密钥轮换、开机启动/日志轮转、防火墙与部署样例；
+   把 loopback 验证形态推向真实双机 TLS 部署。
 3. **Master 侧提示词/技能包**：让 Master 默认就会「好好委派」（何时拆任务、如何写 prompt、如何读事件）。
 4. **跨 Worker 交接**：把一个 Worker 的 diff 注入另一个 Worker 的上下文。
 5. **结构化结果契约**：每任务 JSON 输出 schema + 从 ACP `usage_update` 汇总成本/用量。

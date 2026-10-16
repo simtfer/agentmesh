@@ -9,10 +9,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { WebSocket as WS } from "ws";
 import { parseConfig } from "../src/config.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { WorkerDaemon } from "../src/remote/daemon.js";
+import { queryRemoteTask } from "../src/remote/client.js";
 import { assertCwdAllowed, assertSafeBind, SecurityError } from "../src/remote/security.js";
+import type { RemoteSettings, TaskRecord } from "../src/types.js";
+import { TERMINAL_TASK_STATUSES } from "../src/types.js";
 
 const TOKEN_ENV = "AGENTMESH_TEST_TOKEN";
 const TOKEN = "s3cret-test-token";
@@ -179,6 +183,108 @@ test("/healthz is reachable without a token", async () => {
       headers: { authorization: `Bearer ${TOKEN}` },
     });
     assert.equal(auth.status, 200);
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------- reconnect / reconciliation ------------------- */
+
+/** Poll a daemon until a task reaches a terminal state (or the budget runs out). */
+async function reconcile(
+  remote: RemoteSettings,
+  taskId: string,
+  timeoutMs = 3000,
+): Promise<TaskRecord | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  let rec: TaskRecord | undefined;
+  while (Date.now() < deadline) {
+    rec = await queryRemoteTask(remote, taskId);
+    if (rec && TERMINAL_TASK_STATUSES.has(rec.status)) return rec;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return rec;
+}
+
+test("query reconciles a completed task to its authoritative record", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  const orch = clientOrch(harness.url, dir);
+  try {
+    const res = await orch.dispatch({ profile: "r-fast", task: "analyze the remote module" });
+    assert.equal(res.status, "completed");
+
+    // The daemon ran exactly one local task; read its id from the daemon side.
+    const remoteTasks = harness.dOrch.listTasks();
+    assert.equal(remoteTasks.length, 1);
+    const remoteTaskId = remoteTasks[0]!.taskId;
+
+    // A brand-new connection (as after a reconnect) can fetch the real record.
+    const rec = await queryRemoteTask({ endpoint: harness.url, tokenEnv: TOKEN_ENV }, remoteTaskId);
+    assert.ok(rec, "expected an authoritative record");
+    assert.equal(rec!.status, "succeeded");
+    assert.match(rec!.text ?? "", /fast/);
+  } finally {
+    await orch.shutdown();
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("query for an unknown task resolves undefined (not an error)", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  try {
+    const rec = await queryRemoteTask(
+      { endpoint: harness.url, tokenEnv: TOKEN_ENV },
+      "task-does-not-exist",
+    );
+    assert.equal(rec, undefined);
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a dropped connection reconciles to cancelled, never a false success", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  const remote: RemoteSettings = { endpoint: harness.url, tokenEnv: TOKEN_ENV };
+  try {
+    // Open a raw turn socket, submit a slow task, then yank the connection to
+    // simulate network loss mid-run (no graceful close handshake).
+    const wsUrl = `${harness.url.replace(/^http/, "ws")}/ws`;
+    const ws = new WS(wsUrl, { headers: { authorization: `Bearer ${TOKEN}` } });
+    await new Promise<void>((res, rej) => {
+      ws.once("open", () => res());
+      ws.once("error", rej);
+    });
+    const submitted = new Promise<string>((res) => {
+      ws.on("message", (d) => {
+        const m = JSON.parse(d.toString()) as { type: string; taskId?: string };
+        if (m.type === "submitted" && m.taskId) res(m.taskId);
+      });
+    });
+    ws.send(
+      JSON.stringify({
+        type: "submit",
+        submitId: "s-drop",
+        profile: "slow",
+        prompt: "long remote work",
+        cwd: dir,
+        timeoutMs: 30000,
+      }),
+    );
+    const taskId = await submitted;
+    ws.terminate(); // abrupt drop
+
+    // Reconcile over a fresh connection: the daemon must have cancelled the
+    // orphaned task, so we read an authoritative non-success terminal state.
+    const rec = await reconcile(remote, taskId);
+    assert.ok(rec, "expected an authoritative record after reconnect");
+    assert.notEqual(rec!.status, "succeeded", "a dropped running task must not read as success");
+    assert.equal(rec!.status, "cancelled");
   } finally {
     await harness.stop();
     rmSync(dir, { recursive: true, force: true });

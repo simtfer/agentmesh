@@ -52,11 +52,31 @@ export interface CancelMsg {
   taskId: string;
 }
 
+/**
+ * Ask the daemon for the authoritative persisted state of a task. Used to
+ * reconcile after a dropped connection or a daemon restart: the master reads the
+ * real TaskRecord instead of guessing (and never mistakes an unfinished task for
+ * a success). Works for tasks submitted on any prior connection because the
+ * daemon's Orchestrator persists to SQLite.
+ */
+export interface QueryMsg {
+  type: "query";
+  /** client-chosen correlation id, echoed back in `query_result` */
+  queryId: string;
+  taskId: string;
+}
+
 export interface PingMsg {
   type: "ping";
 }
 
-export type ClientMsg = SubmitMsg | ApproveMsg | RespondMsg | CancelMsg | PingMsg;
+export type ClientMsg =
+  | SubmitMsg
+  | ApproveMsg
+  | RespondMsg
+  | CancelMsg
+  | QueryMsg
+  | PingMsg;
 
 /* ----------------------------- server → client ---------------------------- */
 
@@ -83,6 +103,17 @@ export interface ResultMsg {
   record: import("../types.js").TaskRecord;
 }
 
+/**
+ * Reply to a `query`. `found` is false when the daemon has no such task (bad id,
+ * or a store that predates it); otherwise `record` is the authoritative state.
+ */
+export interface QueryResultMsg {
+  type: "query_result";
+  queryId: string;
+  found: boolean;
+  record?: import("../types.js").TaskRecord;
+}
+
 export interface ErrorMsg {
   type: "error";
   submitId?: string;
@@ -107,6 +138,7 @@ export type ServerMsg =
   | SubmittedMsg
   | TaskEventMsg
   | ResultMsg
+  | QueryResultMsg
   | ErrorMsg
   | PongMsg;
 
@@ -143,6 +175,9 @@ export function parseClientMsg(raw: string): ClientMsg | undefined {
     case "cancel":
       if (typeof v.taskId !== "string") return undefined;
       return v as unknown as CancelMsg;
+    case "query":
+      if (typeof v.queryId !== "string" || typeof v.taskId !== "string") return undefined;
+      return v as unknown as QueryMsg;
     case "ping":
       return { type: "ping" };
     default:

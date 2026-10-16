@@ -233,6 +233,18 @@ export class WorkerDaemon {
         }
         return;
       }
+      case "query": {
+        // Authoritative read from the persistent store; works for tasks from any
+        // prior connection so a reconnecting master can reconcile, never guess.
+        const rec = this.opts.orchestrator.taskResult(msg.taskId);
+        this.send(
+          state,
+          rec
+            ? { type: "query_result", queryId: msg.queryId, found: true, record: rec }
+            : { type: "query_result", queryId: msg.queryId, found: false },
+        );
+        return;
+      }
       default:
         return;
     }

@@ -59,7 +59,7 @@ Requires Node.js ≥ 22.13. Real workers additionally require the upstream CLI
 
 ```bash
 npm run demo     # Scene A: sync delegate-and-wait; Scene B: submit→waiting→approve→succeeded
-npm test         # 23 tests: state machine, persistence, timeout, cancel, approvals, remote daemon
+npm test         # 26 tests: state machine, persistence, timeout, cancel, approvals, remote daemon + reconciliation
 npm run smoke    # drives the real MCP server over stdio through the full task lifecycle
 ```
 
@@ -282,6 +282,26 @@ Then the master drives it exactly like a local worker — `task_submit { profile
 "big-gpu-impl" }`, `task_wait`, `task_approve` when a remote permission request
 arrives. Remote events are streamed back and persisted locally.
 
+### Reconnect & reconciliation
+
+If a connection drops mid-run, the master must not guess the outcome. The daemon
+persists every task to its local store, so a client can re-ask for the
+authoritative record with a one-shot query — no live turn socket required:
+
+```ts
+import { queryRemoteTask } from "agentmesh";
+
+const rec = await queryRemoteTask(
+  { endpoint: "https://gpu.example.com:8790", tokenEnv: "AGENTMESH_REMOTE_TOKEN" },
+  taskId,
+);
+// rec is the real TaskRecord, or undefined if the daemon has no such task.
+```
+
+Because the daemon cancels orphaned tasks when a socket closes, a task that was
+running at drop time reconciles to `cancelled` — never a false `succeeded`.
+`RemoteWorkerDriver.queryTask(remote, taskId)` exposes the same call.
+
 ### Security model
 
 - **Token required.** The daemon refuses to start if `tokenEnv` is unset or the
@@ -304,8 +324,10 @@ arrives. Remote events are streamed back and persisted locally.
 `test/remote.test.ts` boots an ephemeral loopback daemon against mocks and drives
 a real `RemoteWorkerDriver` client through it — dispatch + streamed events,
 approval round-trip, cancel, bad-token rejection, cwd-whitelist refusal, the
-`/healthz` vs `/profiles` auth split, and unit coverage of `assertSafeBind` /
-`assertCwdAllowed`. 8 remote tests, no network, no API cost.
+`/healthz` vs `/profiles` auth split, reconnect reconciliation (completed-task
+query, unknown-id → `undefined`, and a dropped mid-run connection reconciling to
+`cancelled` not `succeeded`), and unit coverage of `assertSafeBind` /
+`assertCwdAllowed`. 11 remote tests, no network, no API cost.
 
 ## Architecture
 
@@ -344,15 +366,17 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **23/23** pass:
+- `npm test` — **26/26** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
   - `test/tasks.test.ts` (9) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
     idempotency de-dup, SQLite restart-and-requery, store column-merge safety.
-  - `test/remote.test.ts` (8) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
+  - `test/remote.test.ts` (11) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
     streamed events, approval round-trip, cancel, bad-token rejection,
-    cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, and unit guards
-    for `assertSafeBind` / `assertCwdAllowed`.
+    cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, reconnect
+    reconciliation (completed-task query, unknown-id → `undefined`, dropped
+    mid-run → `cancelled` not `succeeded`), and unit guards for `assertSafeBind` /
+    `assertCwdAllowed`.
 - `npm run demo` — Scene A (sync dispatch to two workers) and Scene B
   (submit → waiting → approve → succeeded) both close.
 - `npm run smoke` — real MCP stdio server through the full lifecycle; event

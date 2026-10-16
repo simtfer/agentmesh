@@ -21,6 +21,7 @@ import type {
   RunTurnOptions,
   PermissionRequest,
   ElicitationRequest,
+  RemoteSettings,
   TaskEvent,
   TaskRecord,
 } from "../types.js";
@@ -318,7 +319,92 @@ export class RemoteWorkerDriver implements WorkerDriver {
     return new RemoteWorkerHandle(o.id, profile.name, o.cwd, profile);
   }
 
+  /**
+   * Reconcile a task's authoritative state from the daemon. Opens a short-lived
+   * connection, queries, and closes — independent of any live turn. Use it after
+   * a dropped connection or a daemon restart to read the real outcome instead of
+   * assuming success. Resolves `undefined` when the daemon has no such task.
+   */
+  queryTask(remote: RemoteSettings, taskId: string): Promise<TaskRecord | undefined> {
+    return queryRemoteTask(remote, taskId);
+  }
+
   async dispose(): Promise<void> {
     /* no shared resources */
   }
+}
+
+/**
+ * One-shot reconciliation query against a daemon. Connects, asks for the
+ * persisted TaskRecord, closes. Rejects on transport/auth errors and on a
+ * missing/empty token; resolves `undefined` when the task is unknown to the
+ * daemon (so callers can distinguish "not found" from "could not ask").
+ */
+export function queryRemoteTask(
+  remote: RemoteSettings,
+  taskId: string,
+): Promise<TaskRecord | undefined> {
+  if (!remote?.endpoint) throw new Error("queryRemoteTask: remote.endpoint is required");
+  const token = resolveToken(remote.tokenEnv);
+  if (!token) {
+    return Promise.reject(
+      new Error(`queryRemoteTask: token env var "${remote.tokenEnv ?? ""}" is not set`),
+    );
+  }
+
+  const url = toWsUrl(remote.endpoint);
+  const queryId = randomUUID();
+
+  return new Promise<TaskRecord | undefined>((resolve, reject) => {
+    let settled = false;
+    const ws = new WSClient(url, {
+      headers: { authorization: `Bearer ${token}` },
+      maxPayload: MAX_PAYLOAD_BYTES,
+      handshakeTimeout: remote.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+      ...(remote.ca ? { ca: remote.ca } : {}),
+      ...(remote.cert ? { cert: remote.cert } : {}),
+      ...(remote.key ? { key: remote.key } : {}),
+    });
+
+    const done = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      try {
+        if (ws.readyState === WSClient.OPEN || ws.readyState === WSClient.CONNECTING) ws.close();
+      } catch {
+        /* ignore */
+      }
+      fn();
+    };
+
+    ws.on("open", () => {
+      ws.send(encode({ type: "query", queryId, taskId } satisfies ClientMsg));
+    });
+
+    ws.on("message", (data) => {
+      let msg: unknown;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+      if (!isRecord(msg) || typeof msg.type !== "string") return;
+      if (msg.type === "query_result" && msg.queryId === queryId) {
+        const found = msg.found === true;
+        const record = found ? (msg.record as TaskRecord) : undefined;
+        done(() => resolve(record));
+        return;
+      }
+      if (msg.type === "error") {
+        done(() => reject(new Error(`${String(msg.message)}${msg.code ? ` (${msg.code})` : ""}`)));
+      }
+    });
+
+    ws.on("error", (err: Error & { code?: string }) => {
+      done(() => reject(new Error(`query connection error: ${err.message}${err.code ? ` (${err.code})` : ""}`)));
+    });
+    ws.on("close", () => {
+      done(() => reject(new Error("query: daemon closed the connection before answering")));
+    });
+  });
 }
