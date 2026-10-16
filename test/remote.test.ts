@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { WebSocket as WS } from "ws";
@@ -16,6 +16,7 @@ import { Orchestrator } from "../src/orchestrator.js";
 import { WorkerDaemon } from "../src/remote/daemon.js";
 import { queryRemoteTask, attachRemoteTask, RemoteWorkerDriver } from "../src/remote/client.js";
 import { assertCwdAllowed, assertSafeBind, SecurityError } from "../src/remote/security.js";
+import { FileAuditLog, NoopAuditLog, type AuditLog } from "../src/remote/audit.js";
 import type { RemoteSettings, TaskRecord } from "../src/types.js";
 import { TERMINAL_TASK_STATUSES } from "../src/types.js";
 
@@ -44,7 +45,7 @@ interface Harness {
 
 async function startDaemon(
   allowCwd: string[],
-  opts: { orphanGraceMs?: number; tokenEnv?: string } = {},
+  opts: { orphanGraceMs?: number; tokenEnv?: string; audit?: AuditLog } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-remote-"));
   const dOrch = new Orchestrator(daemonConfig, { baseCwd: dir, persist: false });
@@ -58,6 +59,9 @@ async function startDaemon(
     ...(opts.tokenEnv ? { tokenEnv: opts.tokenEnv } : { token: TOKEN }),
     allowCwd,
     orphanGraceMs: opts.orphanGraceMs,
+    // Default to a no-op sink so the suite never litters an audit file on disk;
+    // the dedicated audit test injects a real FileAuditLog.
+    audit: opts.audit ?? new NoopAuditLog(),
   });
   const info = await daemon.start();
   return {
@@ -301,6 +305,78 @@ test("reloadTokens() rotates credentials with no restart and refuses an empty se
     rmSync(dir, { recursive: true, force: true });
     delete process.env[ROT_ENV];
   }
+});
+
+/* ----------------------------- structured audit log --------------------- */
+
+test("daemon writes a structured audit trail and never the token in cleartext", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const outside = mkdtempSync(path.join(tmpdir(), "agentmesh-outside-"));
+  const auditFile = path.join(dir, "audit.ndjson");
+  const audit = new FileAuditLog(auditFile, "daemon-audit-test");
+  const harness = await startDaemon([dir], { audit });
+  try {
+    // 1. A good dispatch: auth_ok (ws) + connection_open + submit_ok.
+    const orch = clientOrch(harness.url, dir);
+    const res = await orch.dispatch({ profile: "r-fast", task: "audited run" });
+    assert.equal(res.status, "completed");
+    await orch.shutdown();
+
+    // 2. A bad token at the HTTP surface: auth_fail with a fingerprint, not the value.
+    process.env.AGENTMESH_AUDIT_BAD = "totally-wrong-token";
+    assert.equal(await profilesStatus(harness.url, "totally-wrong-token"), 401);
+
+    // 3. A working-directory escape: submit_rejected(cwd_not_whitelisted).
+    const badOrch = clientOrch(harness.url, outside);
+    const badRes = await badOrch.dispatch({ profile: "r-fast", task: "escape" });
+    assert.equal(badRes.status, "failed");
+    await badOrch.shutdown();
+  } finally {
+    // stop() records daemon_stop and flushes/closes the audit stream.
+    await harness.stop();
+  }
+
+  const raw = readFileSync(auditFile, "utf8");
+  const records = raw
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as { event: string; [k: string]: unknown });
+  const events = new Set(records.map((r) => r.event));
+
+  // Control-plane decisions are all present and correlated to the daemon.
+  for (const expected of [
+    "daemon_start",
+    "auth_ok",
+    "connection_open",
+    "submit_ok",
+    "auth_fail",
+    "submit_rejected",
+    "daemon_stop",
+  ]) {
+    assert.ok(events.has(expected), `audit log missing ${expected}`);
+  }
+  assert.ok(records.every((r) => r.daemonId === "daemon-audit-test" && typeof r.ts === "string"));
+
+  // The cwd escape was recorded with the offending path and reason.
+  const rejected = records.find(
+    (r) => r.event === "submit_rejected" && r.reason === "cwd_not_whitelisted",
+  );
+  assert.ok(rejected, "cwd refusal should be audited");
+
+  // SECURITY: no secret ever reaches the log — neither the real token nor the
+  // probe token, in cleartext. Fingerprints (hashed) are fine; values are not.
+  assert.ok(!raw.includes(TOKEN), "audit log must not contain the real token");
+  assert.ok(!raw.includes("totally-wrong-token"), "audit log must not contain the probe token");
+  // The auth_fail record carries a non-reversible fingerprint instead.
+  const fail = records.find((r) => r.event === "auth_fail") as { tokenFp?: string } | undefined;
+  assert.ok(
+    fail && typeof fail.tokenFp === "string" && fail.tokenFp.length === 12,
+    "auth_fail should log a 12-hex fingerprint",
+  );
+
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
+  delete process.env.AGENTMESH_AUDIT_BAD;
 });
 
 /* ------------------------- reconnect / reconciliation ------------------- */

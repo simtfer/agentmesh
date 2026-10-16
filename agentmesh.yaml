@@ -96,3 +96,7 @@ profiles:
 #   exposeProfiles: [opencode, pi]      # default: every non-remote profile
 #   orphanGraceMs: 30000                # keep a dropped task alive 30s so a client
 #                                       # can `attach` and resume it (0 = cancel now)
+#   auditPath: /var/log/agentmesh/daemon-audit.ndjson   # append-only NDJSON trail of
+#                                       # auth/submit/approve/cancel/reload decisions;
+#                                       # secrets are logged only as a hash fingerprint.
+#                                       # default: <workdir>/daemon-audit.ndjson; "" disables

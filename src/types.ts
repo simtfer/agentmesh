@@ -171,6 +171,13 @@ export interface DaemonSettings {
    * immediately (no orphans).
    */
   orphanGraceMs?: number;
+  /**
+   * Path to an append-only NDJSON audit log of security-relevant control-plane
+   * events (auth decisions, submits, approvals, cancels, reloads). Secrets are
+   * never written — only a redacted fingerprint. Defaults to
+   * `<workdir>/daemon-audit.ndjson`; set empty string to disable.
+   */
+  auditPath?: string;
 }
 
 export interface MeshConfig {

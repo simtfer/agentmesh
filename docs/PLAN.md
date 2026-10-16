@@ -232,13 +232,18 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 - ✅ **密钥轮换**：`tokenEnv` 可逗号分隔多个环境变量名，每个变量的值也可逗号分隔多个 token，daemon 同时接受新旧密钥；
   `anyTokenEqual` 恒时逐一比较（不短路，不泄露命中位置/数量）；`reloadTokens()` 从环境重读实现零停机热轮换，
   CLI 监听 `SIGHUP` 触发，轮换到空集会被拒绝以免 daemon 变无认证或自锁。密钥值仅存环境，配置只写变量名。
+- ✅ **结构化审计日志**：`src/remote/audit.ts` 追加 NDJSON 控制平面审计（`daemon.auditPath`，默认 `<workdir>/daemon-audit.ndjson`，
+  置空串关闭）。记录 auth 成败（含 peer）、连接开合、submit 及白名单/profile 裁决、approve/respond/cancel、attach、
+  orphan、token reload、daemon 启停。**密钥绝不落盘**——仅记 12 位十六进制不可逆指纹；不可信的 task/agent 文本一律不记。
+  缓冲异步写，坏 token 洪泛不会阻塞事件循环；写盘错误吞掉不影响请求路径。
 - ⏳ 生产化补强：开机启动/日志轮转、防火墙与真实双机 TLS 部署样例（当前为 loopback 验证形态）。
-- ✅ 验收（`test/remote.test.ts`，17 例）：A 侧 `RemoteWorkerDriver` 调 B 侧 daemon 的 mock worker；
+- ✅ 验收（`test/remote.test.ts`，18 例）：A 侧 `RemoteWorkerDriver` 调 B 侧 daemon 的 mock worker；
   输出/结果/流式事件回到 A；approval 往返；cancel；**坏 token 拒绝**；**白名单外 cwd 拒绝**；
   `/healthz` 免认证 vs `/profiles` 需认证；**完成后重连对账**、**未知 id→undefined**、**断线在跑→cancelled 不误判成功**；
   **attach 在宽限窗内重放到 succeeded（序列严格递增）**、**afterSequence 只重放更新事件**、**attach 未知任务拒绝**、
   **runTurn 掉线透明重连后仍 completed**；**多 token 并存（HTTP+WS 升级均接受、未签发 token 拒绝）**、
-  **reloadTokens() 热轮换生效且拒绝空集**；`assertSafeBind`/`assertCwdAllowed` 单测。daemon CLI 启动自检通过。
+  **reloadTokens() 热轮换生效且拒绝空集**；**审计 NDJSON 记录 auth/submit/裁决且 token 明文绝不出现**；
+  `assertSafeBind`/`assertCwdAllowed` 单测。daemon CLI 启动自检通过。
 
 ### Stage 4 · 双向角色 + 第二种 Worker —— 🟡 概念已验证
 - ✅ demo 已证明“角色对称、由配置决定”（同一 Orchestrator，master 只是挂 MCP 的一方）。

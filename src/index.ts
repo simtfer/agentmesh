@@ -19,6 +19,13 @@ export type { AttachOptions } from "./remote/client.js";
 export { WorkerDaemon } from "./remote/daemon.js";
 export type { WorkerDaemonOptions } from "./remote/daemon.js";
 export {
+  FileAuditLog,
+  NoopAuditLog,
+  openAuditLog,
+  tokenFingerprint,
+} from "./remote/audit.js";
+export type { AuditLog, AuditRecord, AuditEvent } from "./remote/audit.js";
+export {
   resolveToken,
   resolveTokens,
   tokensEqual,

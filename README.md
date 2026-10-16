@@ -59,7 +59,7 @@ Requires Node.js ≥ 22.13. Real workers additionally require the upstream CLI
 
 ```bash
 npm run demo     # Scene A: sync delegate-and-wait; Scene B: submit→waiting→approve→succeeded
-npm test         # 32 tests: state machine, persistence, timeout, cancel, approvals, remote daemon + resume + key rotation
+npm test         # 33 tests: state machine, persistence, timeout, cancel, approvals, remote daemon + resume + rotation + audit
 npm run smoke    # drives the real MCP server over stdio through the full task lifecycle
 ```
 
@@ -369,6 +369,14 @@ profiles:
   task it was running for that connection — unless an `orphanGraceMs` window is
   configured, during which the task stays alive so a client can `attach` and
   resume it. Either way a dropped task is never silently reported as success.
+- **Structured audit trail.** Every control-plane decision — auth success/failure
+  (with peer address), connection open/close, submit and its whitelist/profile
+  verdicts, approvals, cancels, attaches, orphan handling, and credential
+  reloads — is appended as NDJSON to `daemon.auditPath` (default
+  `<workdir>/daemon-audit.ndjson`). Secrets are never written: a token is reduced
+  to a 12-hex non-reversible fingerprint, and untrusted task/agent text is not
+  logged at all. Writes are buffered so a flood of bad-token attempts can't block
+  the event loop. Set `auditPath: ""` to disable.
 
 ### Remote tests
 
@@ -382,8 +390,10 @@ dropped-but-grace task to success, `afterSequence` replays only newer events,
 unknown-task attach rejects, and `runTurn` transparently re-attaches after a
 mid-run drop when `resume: true`), zero-downtime key rotation (multiple valid
 tokens accepted at once over both HTTP and the WS upgrade, and `reloadTokens()`
-rotating live while refusing an empty set), and unit coverage of `assertSafeBind`
-/ `assertCwdAllowed`. 17 remote tests, no network, no API cost.
+rotating live while refusing an empty set), a structured audit trail (records
+auth/submit/refusal decisions and asserts no token ever appears in cleartext),
+and unit coverage of `assertSafeBind` / `assertCwdAllowed`. 18 remote tests, no
+network, no API cost.
 
 ## Architecture
 
@@ -422,20 +432,21 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **32/32** pass:
+- `npm test` — **33/33** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
   - `test/tasks.test.ts` (9) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
     idempotency de-dup, SQLite restart-and-requery, store column-merge safety.
-  - `test/remote.test.ts` (17) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
+  - `test/remote.test.ts` (18) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
     streamed events, approval round-trip, cancel, bad-token rejection,
     cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, reconnect
     reconciliation (completed-task query, unknown-id → `undefined`, dropped
     mid-run → `cancelled` not `succeeded`), push-based resumption (`attach`
     replays to success, `afterSequence` boundary, unknown-task reject, transparent
     `runTurn` re-attach), zero-downtime key rotation (multi-token accept over
-    HTTP + WS, live `reloadTokens()`, empty-set refusal), and unit guards for
-    `assertSafeBind` / `assertCwdAllowed`.
+    HTTP + WS, live `reloadTokens()`, empty-set refusal), a structured NDJSON
+    audit trail (decisions recorded, token never in cleartext), and unit guards
+    for `assertSafeBind` / `assertCwdAllowed`.
 - `npm run demo` — Scene A (sync dispatch to two workers) and Scene B
   (submit → waiting → approve → succeeded) both close.
 - `npm run smoke` — real MCP stdio server through the full lifecycle; event

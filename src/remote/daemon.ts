@@ -10,6 +10,7 @@
  */
 import http from "node:http";
 import https from "node:https";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import type { AddressInfo } from "node:net";
@@ -35,6 +36,7 @@ import {
   loadTls,
   resolveTokens,
 } from "./security.js";
+import { openAuditLog, tokenFingerprint, type AuditLog } from "./audit.js";
 
 export interface WorkerDaemonOptions {
   config: MeshConfig;
@@ -61,6 +63,8 @@ export interface WorkerDaemonOptions {
    * immediately (no orphans). Set > 0 to enable push-based resumption.
    */
   orphanGraceMs?: number;
+  /** inject a custom audit sink (tests); defaults to the configured file log */
+  audit?: AuditLog;
 }
 
 const TERMINAL_EVENT_TYPES = new Set(["completed", "failed", "cancelled", "timed_out"]);
@@ -70,6 +74,10 @@ interface SocketState {
   alive: boolean;
   tasks: Set<string>;
   closed: boolean;
+  /** short connection id, correlates audit records for one socket's lifetime */
+  connId: string;
+  /** peer address captured at upgrade time (audit only) */
+  peer?: string;
 }
 
 export class WorkerDaemon {
@@ -78,6 +86,7 @@ export class WorkerDaemon {
   private sockets = new Set<SocketState>();
   private heartbeat?: NodeJS.Timeout;
   private tokens: string[];
+  private audit: AuditLog;
   private host: string;
   private port: number;
   private allowCwd: string[] | undefined;
@@ -99,6 +108,13 @@ export class WorkerDaemon {
     this.orphanGraceMs = opts.orphanGraceMs ?? opts.config.daemon?.orphanGraceMs ?? 0;
     this.tokens = this.resolveTokens();
     this.exposedProfiles = this.computeExposedProfiles();
+    this.audit =
+      opts.audit ??
+      openAuditLog(
+        this.daemonId,
+        opts.config.daemon?.auditPath,
+        path.join(opts.orchestrator.workdir, "daemon-audit.ndjson"),
+      );
 
     const tls = loadTls(opts.tls ?? opts.config.daemon?.tls);
     // Fail-safe: never bind a reachable interface in cleartext without opt-in.
@@ -149,12 +165,16 @@ export class WorkerDaemon {
   reloadTokens(): number {
     const next = this.resolveTokens();
     if (next.length === 0) {
+      this.audit.record("token_reload_rejected", { reason: "empty_set" });
       throw new SecurityError(
         "refusing to rotate to an empty token set; daemon would become unauthenticated",
         "no_token",
       );
     }
     this.tokens = next;
+    // Count only — never the values or their fingerprints (a rotated-out secret
+    // should stop being correlatable from this point).
+    this.audit.record("token_reload", { accepted: this.tokens.length });
     return this.tokens.length;
   }
 
@@ -167,10 +187,18 @@ export class WorkerDaemon {
       this.json(res, 200, { ok: true, daemonId: this.daemonId, protocol: PROTOCOL_VERSION });
       return;
     }
+    const peer = req.socket.remoteAddress;
     if (!this.authorized(req)) {
+      this.audit.record("auth_fail", {
+        surface: "http",
+        path: url.pathname,
+        peer,
+        tokenFp: tokenFingerprint(bearerFromHeader(req.headers.authorization)),
+      });
       this.json(res, 401, { error: "unauthorized" });
       return;
     }
+    this.audit.record("auth_ok", { surface: "http", path: url.pathname, peer });
     if (url.pathname === PROFILES_PATH) {
       this.json(res, 200, { daemonId: this.daemonId, profiles: this.exposedProfiles });
       return;
@@ -193,6 +221,7 @@ export class WorkerDaemon {
 
   private onUpgrade = (req: http.IncomingMessage, socket: import("node:stream").Duplex, head: Buffer): void => {
     const url = new URL(req.url ?? "/", "http://internal");
+    const peer = (socket as import("node:net").Socket).remoteAddress;
     if (url.pathname !== WS_PATH) {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       socket.destroy();
@@ -204,18 +233,36 @@ export class WorkerDaemon {
     const headerToken = bearerFromHeader(req.headers.authorization);
     const queryToken = url.searchParams.get("token") ?? undefined;
     if (!anyTokenEqual(headerToken, this.tokens) && !anyTokenEqual(queryToken, this.tokens)) {
+      this.audit.record("auth_fail", {
+        surface: "ws",
+        peer,
+        tokenFp: tokenFingerprint(headerToken ?? queryToken),
+      });
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
       return;
     }
-    this.wss.handleUpgrade(req, socket, head, (ws) => this.onConnection(ws));
+    this.audit.record("auth_ok", {
+      surface: "ws",
+      peer,
+      tokenFp: tokenFingerprint(headerToken ?? queryToken),
+    });
+    this.wss.handleUpgrade(req, socket, head, (ws) => this.onConnection(ws, peer));
   };
 
   /* ---------------------------- connection ------------------------------ */
 
-  private onConnection(ws: WebSocket): void {
-    const state: SocketState = { ws, alive: true, tasks: new Set(), closed: false };
+  private onConnection(ws: WebSocket, peer?: string): void {
+    const state: SocketState = {
+      ws,
+      alive: true,
+      tasks: new Set(),
+      closed: false,
+      connId: randomUUID().slice(0, 8),
+      peer,
+    };
     this.sockets.add(state);
+    this.audit.record("connection_open", { connId: state.connId, peer });
 
     this.send(state, {
       type: "welcome",
@@ -237,6 +284,11 @@ export class WorkerDaemon {
     if (state.closed) return;
     state.closed = true;
     this.sockets.delete(state);
+    this.audit.record("connection_close", {
+      connId: state.connId,
+      peer: state.peer,
+      openTasks: state.tasks.size,
+    });
     // Do not leave orphaned work running for a disconnected caller. Tasks that
     // already reached a terminal state are left as-is. With a grace window, a
     // still-running task is kept alive briefly so the client can re-attach and
@@ -262,12 +314,14 @@ export class WorkerDaemon {
   private scheduleOrphanCancel(taskId: string): void {
     const existing = this.orphanTimers.get(taskId);
     if (existing) clearTimeout(existing);
+    this.audit.record("orphan_scheduled", { taskId, graceMs: this.orphanGraceMs });
     const timer = setTimeout(() => {
       this.orphanTimers.delete(taskId);
       // Still orphaned (no owner re-attached) and not terminal → cancel.
       if (this.taskOwner.has(taskId)) return;
       const rec = this.opts.orchestrator.taskStatus(taskId);
       if (rec && !TERMINAL_TASK_STATUSES.has(rec.status)) {
+        this.audit.record("orphan_cancelled", { taskId });
         void this.opts.orchestrator.cancelTask(taskId).catch(() => {});
       }
     }, this.orphanGraceMs);
@@ -278,6 +332,7 @@ export class WorkerDaemon {
   private onMessage(state: SocketState, raw: string): void {
     const msg = parseClientMsg(raw);
     if (!msg) {
+      this.audit.record("submit_rejected", { connId: state.connId, reason: "malformed_message" });
       this.send(state, { type: "error", message: "malformed_message", code: "bad_request" });
       return;
     }
@@ -289,9 +344,19 @@ export class WorkerDaemon {
         this.handleSubmit(state, msg);
         return;
       case "approve":
+        this.audit.record("approve", {
+          connId: state.connId,
+          approvalId: msg.approvalId,
+          decision: msg.decision,
+        });
         this.opts.orchestrator.approveTask(msg.approvalId, msg.decision as never);
         return;
       case "respond":
+        this.audit.record("respond", {
+          connId: state.connId,
+          approvalId: msg.approvalId,
+          action: msg.action,
+        });
         this.opts.orchestrator.respondTask(msg.approvalId, {
           action: msg.action as never,
           content: msg.content ?? null,
@@ -299,6 +364,11 @@ export class WorkerDaemon {
         return;
       case "cancel": {
         const rec = this.opts.orchestrator.taskStatus(msg.taskId);
+        this.audit.record("cancel", {
+          connId: state.connId,
+          taskId: msg.taskId,
+          terminal: rec ? TERMINAL_TASK_STATUSES.has(rec.status) : undefined,
+        });
         if (rec && !TERMINAL_TASK_STATUSES.has(rec.status)) {
           void this.opts.orchestrator.cancelTask(msg.taskId).catch(() => {});
         }
@@ -328,6 +398,11 @@ export class WorkerDaemon {
     const orch = this.opts.orchestrator;
     const profile = msg.profile;
     if (!this.exposedProfiles.includes(profile)) {
+      this.audit.record("submit_rejected", {
+        connId: state.connId,
+        reason: "profile_not_allowed",
+        profile,
+      });
       this.send(state, {
         type: "error",
         submitId: msg.submitId,
@@ -343,6 +418,14 @@ export class WorkerDaemon {
       const requested = msg.cwd ?? orch.baseCwd;
       cwd = assertCwdAllowed(requested, this.allowCwd);
     } catch (e) {
+      // The prompt is untrusted master content and is never logged; the
+      // requested cwd is recorded because a whitelist escape is the signal here.
+      this.audit.record("submit_rejected", {
+        connId: state.connId,
+        reason: "cwd_not_whitelisted",
+        profile,
+        requestedCwd: msg.cwd ?? orch.baseCwd,
+      });
       this.send(state, {
         type: "error",
         submitId: msg.submitId,
@@ -374,6 +457,12 @@ export class WorkerDaemon {
         },
       );
     } catch (e) {
+      this.audit.record("submit_rejected", {
+        connId: state.connId,
+        reason: "submit_failed",
+        profile,
+        cwd,
+      });
       this.send(state, {
         type: "error",
         submitId: msg.submitId,
@@ -385,6 +474,12 @@ export class WorkerDaemon {
 
     state.tasks.add(record.taskId);
     this.taskOwner.set(record.taskId, state);
+    this.audit.record("submit_ok", {
+      connId: state.connId,
+      taskId: record.taskId,
+      profile,
+      cwd,
+    });
     this.send(state, { type: "submitted", submitId: msg.submitId, taskId: record.taskId });
   }
 
@@ -399,6 +494,11 @@ export class WorkerDaemon {
     const orch = this.opts.orchestrator;
     const rec = orch.taskStatus(msg.taskId);
     if (!rec) {
+      this.audit.record("attach_rejected", {
+        connId: state.connId,
+        taskId: msg.taskId,
+        reason: "task_not_found",
+      });
       this.send(state, {
         type: "error",
         taskId: msg.taskId,
@@ -423,6 +523,13 @@ export class WorkerDaemon {
     this.taskOwner.set(msg.taskId, state);
     state.tasks.add(msg.taskId);
 
+    this.audit.record("attach_ok", {
+      connId: state.connId,
+      taskId: msg.taskId,
+      afterSequence: after,
+      replayed: replay.length,
+      status: rec.status,
+    });
     this.send(state, {
       type: "attached",
       attachId: msg.attachId,
@@ -499,6 +606,13 @@ export class WorkerDaemon {
     if (this.heartbeat.unref) this.heartbeat.unref();
 
     const scheme = this.opts.config.daemon?.tls || this.opts.tls ? "https" : "http";
+    this.audit.record("daemon_start", {
+      host: this.host,
+      port: this.port,
+      tls: scheme === "https",
+      profiles: this.exposedProfiles,
+      acceptedTokens: this.tokens.length,
+    });
     return { host: this.host, port: this.port, url: `${scheme}://${this.host}:${this.port}` };
   }
 
@@ -510,5 +624,7 @@ export class WorkerDaemon {
     for (const state of [...this.sockets]) this.onClose(state);
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    this.audit.record("daemon_stop", {});
+    await this.audit.close().catch(() => {});
   }
 }

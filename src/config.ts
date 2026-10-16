@@ -53,6 +53,7 @@ const DaemonSettings = z.object({
     .optional(),
   exposeProfiles: z.array(z.string()).optional(),
   orphanGraceMs: z.number().int().nonnegative().optional(),
+  auditPath: z.string().optional(),
 });
 
 const ConfigSchema = z.object({
