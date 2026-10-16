@@ -19,6 +19,9 @@ const RemoteSettings = z.object({
   cert: z.string().optional(),
   key: z.string().optional(),
   connectTimeoutMs: z.number().int().positive().optional(),
+  resume: z.boolean().optional(),
+  reconnectAttempts: z.number().int().nonnegative().optional(),
+  reconnectDelayMs: z.number().int().nonnegative().optional(),
 });
 
 const Profile = z.object({

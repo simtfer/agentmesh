@@ -226,13 +226,15 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
   移交 owner 续订实时事件→终态发 result」，无 await 故重放快照与实时流之间无缝无重。客户端
   `attachRemoteTask(remote, taskId, {afterSequence,onEvent,onPermissionRequest,onElicitation,signal})`
   在宽限窗内恢复在跑任务而非重跑；signal 中止只脱离不取消。
-- ⏳ 生产化补强：runTurn 内**透明自动重连**（当前 attach 为显式原语，非掉线自动续流）、密钥轮换、
-  开机启动/日志轮转、防火墙样例（当前为 loopback 验证形态）。
-- ✅ 验收（`test/remote.test.ts`，14 例）：A 侧 `RemoteWorkerDriver` 调 B 侧 daemon 的 mock worker；
+- ✅ **透明自动重连**：`remote.resume` 开启时 `runTurn` 掉线自动按 `reconnectAttempts`/`reconnectDelayMs`
+  重连并 `attach(afterSequence=lastSeq)` 续流，陈旧 socket 事件用 `stale()` 守卫忽略、task_event 按 sequence 去重，
+  Master 无感知；未拿到 taskId（submit 前失败，如坏 token）不重连、直接失败，避免非幂等重放。
+- ⏳ 生产化补强：密钥轮换、开机启动/日志轮转、防火墙与真实双机 TLS 部署样例（当前为 loopback 验证形态）。
+- ✅ 验收（`test/remote.test.ts`，15 例）：A 侧 `RemoteWorkerDriver` 调 B 侧 daemon 的 mock worker；
   输出/结果/流式事件回到 A；approval 往返；cancel；**坏 token 拒绝**；**白名单外 cwd 拒绝**；
   `/healthz` 免认证 vs `/profiles` 需认证；**完成后重连对账**、**未知 id→undefined**、**断线在跑→cancelled 不误判成功**；
-  **attach 在宽限窗内重放到 succeeded（序列严格递增）**、**afterSequence 只重放更新事件**、**attach 未知任务拒绝**；
-  `assertSafeBind`/`assertCwdAllowed` 单测。daemon CLI 启动自检通过。
+  **attach 在宽限窗内重放到 succeeded（序列严格递增）**、**afterSequence 只重放更新事件**、**attach 未知任务拒绝**、
+  **runTurn 掉线透明重连后仍 completed**；`assertSafeBind`/`assertCwdAllowed` 单测。daemon CLI 启动自检通过。
 
 ### Stage 4 · 双向角色 + 第二种 Worker —— 🟡 概念已验证
 - ✅ demo 已证明“角色对称、由配置决定”（同一 Orchestrator，master 只是挂 MCP 的一方）。

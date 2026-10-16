@@ -59,7 +59,7 @@ Requires Node.js ≥ 22.13. Real workers additionally require the upstream CLI
 
 ```bash
 npm run demo     # Scene A: sync delegate-and-wait; Scene B: submit→waiting→approve→succeeded
-npm test         # 29 tests: state machine, persistence, timeout, cancel, approvals, remote daemon + resume
+npm test         # 30 tests: state machine, persistence, timeout, cancel, approvals, remote daemon + resume
 npm run smoke    # drives the real MCP server over stdio through the full task lifecycle
 ```
 
@@ -327,6 +327,24 @@ With `orphanGraceMs: 0` (the default) a drop cancels the task immediately and
 brief disconnect and `attachRemoteTask` picks its stream back up. Aborting an
 attach detaches without cancelling the remote task.
 
+Resumption can also be **transparent**: set `resume: true` on a remote profile and
+`runTurn` itself re-attaches on a mid-run drop (bounded by `reconnectAttempts` /
+`reconnectDelayMs`), dedupes replayed events by sequence, and resolves normally —
+the master never sees the blip. Pair it with a daemon `orphanGraceMs` window.
+
+```yaml
+profiles:
+  - name: big-gpu-impl
+    driver: remote
+    remote:
+      endpoint: https://gpu.example.com:8790
+      tokenEnv: AGENTMESH_REMOTE_TOKEN
+      remoteProfile: opencode
+      resume: true              # auto re-attach if the socket drops mid-turn
+      reconnectAttempts: 3
+      reconnectDelayMs: 500
+```
+
 ### Security model
 
 - **Token required.** The daemon refuses to start if `tokenEnv` is unset or the
@@ -355,8 +373,9 @@ approval round-trip, cancel, bad-token rejection, cwd-whitelist refusal, the
 query, unknown-id → `undefined`, and a dropped mid-run connection reconciling to
 `cancelled` not `succeeded`), push-based resumption (`attach` replays a
 dropped-but-grace task to success, `afterSequence` replays only newer events,
-unknown-task attach rejects), and unit coverage of `assertSafeBind` /
-`assertCwdAllowed`. 14 remote tests, no network, no API cost.
+unknown-task attach rejects, and `runTurn` transparently re-attaches after a
+mid-run drop when `resume: true`), and unit coverage of `assertSafeBind` /
+`assertCwdAllowed`. 15 remote tests, no network, no API cost.
 
 ## Architecture
 
@@ -395,18 +414,18 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **29/29** pass:
+- `npm test` — **30/30** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
   - `test/tasks.test.ts` (9) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
     idempotency de-dup, SQLite restart-and-requery, store column-merge safety.
-  - `test/remote.test.ts` (14) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
+  - `test/remote.test.ts` (15) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
     streamed events, approval round-trip, cancel, bad-token rejection,
     cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, reconnect
     reconciliation (completed-task query, unknown-id → `undefined`, dropped
     mid-run → `cancelled` not `succeeded`), push-based resumption (`attach`
-    replays to success, `afterSequence` boundary, unknown-task reject), and unit
-    guards for `assertSafeBind` / `assertCwdAllowed`.
+    replays to success, `afterSequence` boundary, unknown-task reject, transparent
+    `runTurn` re-attach), and unit guards for `assertSafeBind` / `assertCwdAllowed`.
 - `npm run demo` — Scene A (sync dispatch to two workers) and Scene B
   (submit → waiting → approve → succeeded) both close.
 - `npm run smoke` — real MCP stdio server through the full lifecycle; event

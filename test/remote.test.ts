@@ -14,7 +14,7 @@ import { WebSocket as WS } from "ws";
 import { parseConfig } from "../src/config.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { WorkerDaemon } from "../src/remote/daemon.js";
-import { queryRemoteTask, attachRemoteTask } from "../src/remote/client.js";
+import { queryRemoteTask, attachRemoteTask, RemoteWorkerDriver } from "../src/remote/client.js";
 import { assertCwdAllowed, assertSafeBind, SecurityError } from "../src/remote/security.js";
 import type { RemoteSettings, TaskRecord } from "../src/types.js";
 import { TERMINAL_TASK_STATUSES } from "../src/types.js";
@@ -397,6 +397,55 @@ test("attach to an unknown task rejects", async () => {
       attachRemoteTask({ endpoint: harness.url, tokenEnv: TOKEN_ENV }, "task-does-not-exist"),
       /no such task|task_not_found/i,
     );
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runTurn transparently re-attaches after a mid-run drop (resume on)", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir], { orphanGraceMs: 5000 });
+  try {
+    const profile = parseConfig({
+      profiles: [
+        {
+          name: "r-resumable",
+          driver: "remote",
+          remote: {
+            endpoint: harness.url,
+            tokenEnv: TOKEN_ENV,
+            remoteProfile: "resumable",
+            resume: true,
+            reconnectDelayMs: 80,
+            reconnectAttempts: 3,
+          },
+        },
+      ],
+    }).profiles[0]!;
+
+    const driver = new RemoteWorkerDriver();
+    const handle = await driver.createWorker(profile, { id: "w-resume", cwd: dir });
+
+    const notes: string[] = [];
+    const turn = handle.runTurn("resume me transparently", {
+      onEvent: (e) => {
+        if (e.text) notes.push(e.text);
+      },
+    });
+
+    // Let the socket open and the task start, then yank it mid-run.
+    await new Promise((r) => setTimeout(r, 150));
+    (handle as unknown as { activeWs?: WS }).activeWs?.terminate();
+
+    const res = await turn;
+    assert.equal(res.status, "completed", "turn should survive the drop via re-attach");
+    assert.match(res.text, /resumable/);
+    assert.ok(
+      notes.some((t) => /re-attaching/i.test(t)),
+      `expected a re-attach notice, got: ${notes.join(" | ")}`,
+    );
+    await handle.close();
   } finally {
     await harness.stop();
     rmSync(dir, { recursive: true, force: true });

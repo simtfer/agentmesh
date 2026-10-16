@@ -68,6 +68,9 @@ profiles:
   #     endpoint: https://gpu.example.com:8790   # wss:// is derived automatically
   #     tokenEnv: AGENTMESH_REMOTE_TOKEN          # VALUE read from env, never here
   #     remoteProfile: opencode                   # which daemon-side profile to run
+  #     resume: true                              # auto re-attach if the socket drops
+  #     reconnectAttempts: 3                      # (needs daemon orphanGraceMs > 0)
+  #     reconnectDelayMs: 500
   #     # ca: ./certs/daemon-ca.pem               # trust a self-signed daemon cert
   #     # cert: ./certs/client.pem                # optional mTLS client cert
   #     # key:  ./certs/client-key.pem

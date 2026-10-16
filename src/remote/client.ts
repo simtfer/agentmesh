@@ -109,17 +109,17 @@ class RemoteWorkerHandle implements WorkerHandle {
     const remoteProfile = remote.remoteProfile ?? this.wp.name;
     const submitId = randomUUID();
 
+    const resume = remote.resume ?? false;
+    const maxAttempts = remote.reconnectAttempts ?? 3;
+    const reconnectDelay = remote.reconnectDelayMs ?? 500;
+
     return new Promise<TurnResult>((resolve, reject) => {
       let settled = false;
-      const ws = new WSClient(url, {
-        headers: { authorization: `Bearer ${token}` },
-        maxPayload: MAX_PAYLOAD_BYTES,
-        handshakeTimeout: remote.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
-        ...(remote.ca ? { ca: remote.ca } : {}),
-        ...(remote.cert ? { cert: remote.cert } : {}),
-        ...(remote.key ? { key: remote.key } : {}),
-      });
-      this.activeWs = ws;
+      let lastSeq = 0; // highest task-event sequence seen, for attach replay
+      let attempts = 0;
+      let scheduling = false;
+      let reconnectTimer: NodeJS.Timeout | undefined;
+      let ws!: WSClient;
 
       const finish = (r: TurnResult) => {
         if (settled) return;
@@ -134,18 +134,21 @@ class RemoteWorkerHandle implements WorkerHandle {
         reject(new Error(code ? `${message} (${code})` : message));
       };
       const cleanup = () => {
+        if (reconnectTimer) clearTimeout(reconnectTimer);
         this.activeWs = undefined;
         this.activeTaskId = undefined;
         if (opts?.signal) opts.signal.removeEventListener("abort", onAbort);
         try {
-          if (ws.readyState === WSClient.OPEN || ws.readyState === WSClient.CONNECTING) ws.close();
+          if (ws && (ws.readyState === WSClient.OPEN || ws.readyState === WSClient.CONNECTING)) {
+            ws.close();
+          }
         } catch {
           /* ignore */
         }
       };
 
       const send = (m: ClientMsg) => {
-        if (ws.readyState === WSClient.OPEN) ws.send(encode(m));
+        if (ws && ws.readyState === WSClient.OPEN) ws.send(encode(m));
       };
 
       const onAbort = () => {
@@ -154,51 +157,102 @@ class RemoteWorkerHandle implements WorkerHandle {
         emit({ type: "status", text: "cancelled by master", data: { remote: true } });
         finish({ status: "cancelled", text: out, events });
       };
-      if (opts?.signal) {
-        if (opts.signal.aborted) {
-          // let the socket open then cancel; simplest is to fail fast as cancelled
-          ws.once("open", () => onAbort());
-        } else {
-          opts.signal.addEventListener("abort", onAbort, { once: true });
-        }
+      if (opts?.signal && !opts.signal.aborted) {
+        opts.signal.addEventListener("abort", onAbort, { once: true });
       }
 
-      ws.on("open", () => {
-        send({
-          type: "submit",
-          submitId,
-          profile: remoteProfile,
-          prompt: text,
-          cwd: this.cwd,
-          ...(opts?.signal ? {} : {}),
-        });
-      });
-
-      ws.on("message", (data) => {
-        let msg: unknown;
-        try {
-          msg = JSON.parse(data.toString());
-        } catch {
+      // A dropped socket: re-attach when resume is enabled and we already know the
+      // remote taskId; otherwise fail. Never loops on a pre-submit failure (no id).
+      const onDisconnect = (message: string, code?: string) => {
+        if (settled || scheduling) return;
+        if (resume && this.activeTaskId && attempts < maxAttempts) {
+          scheduling = true;
+          attempts += 1;
+          emit({
+            type: "status",
+            text: `connection lost; re-attaching (attempt ${attempts}/${maxAttempts})`,
+            data: { remote: true, resume: true },
+          });
+          reconnectTimer = setTimeout(() => {
+            scheduling = false;
+            connect(true);
+          }, reconnectDelay);
+          if (reconnectTimer.unref) reconnectTimer.unref();
           return;
         }
-        if (!isRecord(msg) || typeof msg.type !== "string") return;
-        this.onServerMsg(msg as unknown as ServerMsg, {
-          emit,
-          send,
-          finish,
-          fail,
-          opts,
-          appendText: (s) => (out += s),
-          setTaskId: (id) => (this.activeTaskId = id),
-        });
-      });
+        fail(message, code);
+      };
 
-      ws.on("error", (err: Error & { code?: string }) => {
-        fail(`remote daemon connection error: ${err.message}`, err.code);
-      });
-      ws.on("close", () => {
-        if (!settled) fail("remote daemon closed the connection before a result", "closed");
-      });
+      const connect = (isAttach: boolean) => {
+        const sock = new WSClient(url, {
+          headers: { authorization: `Bearer ${token}` },
+          maxPayload: MAX_PAYLOAD_BYTES,
+          handshakeTimeout: remote.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+          ...(remote.ca ? { ca: remote.ca } : {}),
+          ...(remote.cert ? { cert: remote.cert } : {}),
+          ...(remote.key ? { key: remote.key } : {}),
+        });
+        ws = sock;
+        this.activeWs = sock;
+        // Ignore events from a socket we've already replaced (post-reconnect).
+        const stale = () => ws !== sock;
+
+        sock.on("open", () => {
+          if (stale()) return;
+          if (opts?.signal?.aborted) {
+            onAbort();
+            return;
+          }
+          if (isAttach && this.activeTaskId) {
+            send({
+              type: "attach",
+              attachId: randomUUID(),
+              taskId: this.activeTaskId,
+              afterSequence: lastSeq,
+            });
+          } else {
+            send({ type: "submit", submitId, profile: remoteProfile, prompt: text, cwd: this.cwd });
+          }
+        });
+
+        sock.on("message", (data) => {
+          if (stale()) return;
+          let msg: unknown;
+          try {
+            msg = JSON.parse(data.toString());
+          } catch {
+            return;
+          }
+          if (!isRecord(msg) || typeof msg.type !== "string") return;
+          if (msg.type === "task_event") {
+            const ev = (msg as { event?: TaskEvent }).event;
+            if (ev && typeof ev.sequence === "number") {
+              if (ev.sequence <= lastSeq) return; // dedupe replay overlap
+              lastSeq = ev.sequence;
+            }
+          }
+          this.onServerMsg(msg as unknown as ServerMsg, {
+            emit,
+            send,
+            finish,
+            fail,
+            opts,
+            appendText: (s) => (out += s),
+            setTaskId: (id) => (this.activeTaskId = id),
+          });
+        });
+
+        sock.on("error", (err: Error & { code?: string }) => {
+          if (stale()) return;
+          onDisconnect(`remote daemon connection error: ${err.message}`, err.code);
+        });
+        sock.on("close", () => {
+          if (stale()) return;
+          onDisconnect("remote daemon closed the connection before a result", "closed");
+        });
+      };
+
+      connect(false);
     });
   }
 

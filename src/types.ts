@@ -121,6 +121,16 @@ export interface RemoteSettings {
   key?: string;
   /** Connect/handshake timeout in ms (default 15000). */
   connectTimeoutMs?: number;
+  /**
+   * Transparently re-attach if the turn socket drops mid-run instead of failing.
+   * Requires the daemon to run with an `orphanGraceMs` window so the task stays
+   * alive across the reconnect. Default false.
+   */
+  resume?: boolean;
+  /** Max reconnect attempts when `resume` is on (default 3). */
+  reconnectAttempts?: number;
+  /** Delay before each reconnect attempt in ms (default 500). */
+  reconnectDelayMs?: number;
 }
 
 export interface WorkerProfile {
