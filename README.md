@@ -17,6 +17,26 @@ anything else, with the same code.
                                                                                       └──────────────┘
 ```
 
+## Contents
+
+- [Why this shape](#why-this-shape)
+- [Status](#status)
+- [Install](#install)
+- [Try it (no API keys, no cost)](#try-it-no-api-keys-no-cost)
+- [Configuration](#configuration)
+- [Task lifecycle and the 8-state machine](#task-lifecycle-and-the-8-state-machine)
+- [MCP tools exposed to the master](#mcp-tools-exposed-to-the-master)
+- [Master skill (self-hosted)](#master-skill-self-hosted)
+- [Cross-worker handoff (Phase 1)](#cross-worker-handoff-phase-1)
+- [Attach a real master](#attach-a-real-master)
+- [CLI](#cli)
+- [Remote Worker Daemon (cross-machine workers)](#remote-worker-daemon-cross-machine-workers)
+- [Safety and limits](#safety-and-limits)
+- [Architecture](#architecture)
+- [Verification](#verification)
+- [Roadmap](#roadmap)
+- [License](#license)
+
 ## Why this shape
 
 Two protocols do the heavy lifting, so we don't reinvent either:
@@ -40,10 +60,12 @@ between them.
 
 Working and verified end-to-end: an **8-state persistent task machine** (SQLite),
 **async task lifecycle** (`task_submit` / `task_wait` / `task_result` / …), a
-**human-in-the-loop approval flow** for worker permission/elicitation requests,
-and a **remote Worker Daemon** for cross-machine workers over an authenticated,
-TLS-capable channel — driven against **real local OpenCode and Pi agents** as well
-as deterministic mocks. See [Verification](#verification).
+**human-in-the-loop approval flow** for worker permission/elicitation requests, a
+**bounded FIFO scheduler** for parallel fan-out, **cross-worker handoff**, a
+self-hosted **master delegation skill**, and a **remote Worker Daemon** for
+cross-machine workers over an authenticated, TLS-capable channel — driven against
+**real local OpenCode and Pi agents** as well as deterministic mocks. See
+[Verification](#verification).
 
 ## Install
 
@@ -59,7 +81,7 @@ Requires Node.js ≥ 22.13. Real workers additionally require the upstream CLI
 
 ```bash
 npm run demo     # Scene A: sync delegate-and-wait; Scene B: submit→waiting→approve→succeeded
-npm test         # 36 tests: state machine, persistence, timeout, cancel, approvals, recursion guard, remote daemon + resume + rotation + audit
+npm test         # full offline suite (mocks; no network, no API cost) — see Verification for the breakdown
 npm run smoke    # drives the real MCP server over stdio through the full task lifecycle
 ```
 
@@ -72,9 +94,10 @@ To exercise the **real** agents on this machine (trivial prompt, minimal cost):
 npx tsx scripts/real-smoke.ts   # opencode + pi through submit → wait → result
 ```
 
-## Configuration — `agentmesh.yaml`
+## Configuration
 
-Everything under `profiles` describes **workers** the master can spawn.
+Everything under `profiles` in `agentmesh.yaml` describes **workers** the master
+can spawn.
 
 ```yaml
 workdir: .agentmesh          # worktrees + acpx session state
@@ -106,8 +129,11 @@ profiles:
 
 `agent` can be any acpx built-in name (`pi`, `opencode`, `codex`, `claude`,
 `gemini`, `cursor`, `qwen`, `qoder`, …) or a custom key paired with `command`.
+The optional `limits:` block (delegation depth, concurrency, queue, output and
+handoff byte caps) is documented inline in `agentmesh.yaml` and under
+[Safety and limits](#safety-and-limits).
 
-## Task lifecycle & the 8-state machine
+## Task lifecycle and the 8-state machine
 
 Every delegation is a **task** that moves through a persistent state machine:
 
@@ -307,146 +333,38 @@ just another `driver: remote` profile, so dispatch, approvals, events and
 persistence behave identically to a local worker.
 
 ```
-master (machine A)                                  worker daemon (machine B)
-┌───────────────────┐   WSS + Bearer token   ┌──────────────────────────────────┐
-│ driver: remote     │ ─────────────────────▶ │ agentmesh daemon                 │
-│  profile ──────────┼── submit/approve/… ───▶│  • HTTP /healthz, /profiles      │
-│ RemoteWorkerDriver │ ◀───────────────────── │  • WS /ws  (typed task events)   │
-└───────────────────┘   task events, result   │  • local Orchestrator + acpx     │──▶ ACP stdio (LOCAL ONLY)
-                                              └──────────────────────────────────┘
+master (machine A)                              worker daemon (machine B)
+  driver: remote    ── WSS + Bearer token ──▶   agentmesh daemon
+  RemoteWorkerDriver ◀── typed task events ──    HTTP /healthz,/profiles · WS /ws
+                                                 local Orchestrator + acpx ──▶ ACP stdio (LOCAL ONLY)
 ```
 
-### Start the daemon (machine B)
+Start it on machine B (`agentmesh daemon --token-env … --tls-cert … --tls-key …`)
+and point a `driver: remote` profile at it on machine A. The short version of the
+guarantees: tokens come from the environment (never config or version control),
+non-loopback binds require TLS, `daemon.allowCwd` whitelists where remote tasks
+may run, a dropped connection reconciles to `cancelled` (never a false
+`succeeded`), still-running tasks can be resumed instead of re-run, and every
+control-plane decision is written to an NDJSON audit log with secrets reduced to
+a non-reversible fingerprint.
 
-```bash
-export AGENTMESH_DAEMON_TOKEN="$(openssl rand -hex 32)"   # value never goes in config
-npx tsx src/cli.ts daemon \
-  --config agentmesh.yaml \
-  --host 0.0.0.0 --port 8790 \
-  --token-env AGENTMESH_DAEMON_TOKEN \
-  --tls-cert ./certs/daemon.pem --tls-key ./certs/daemon-key.pem
-```
+**Full guide** — daemon flags, the `driver: remote` profile, reconnect &
+reconciliation (`queryRemoteTask`, `attachRemoteTask`, transparent `resume`), the
+complete remote security model, key rotation, and the remote test coverage:
+**[docs/remote.md](docs/remote.md)**.
 
-Flags: `--host` `--port` `--token-env` `--tls-cert` `--tls-key` `--tls-ca`
-(enables mTLS) `--allow-insecure` (explicit opt-out of the TLS requirement for
-non-loopback binds). The same keys can live under a `daemon:` block in
-`agentmesh.yaml`. Two probes are available:
+## Safety and limits
 
-- `GET /healthz` — **unauthenticated** `{ ok, daemonId, protocol }` liveness.
-- `GET /profiles` — **authenticated**; lists the profiles the daemon exposes.
+These guards apply to every deployment, local or remote. (Remote-specific
+security — token auth, zero-downtime key rotation, cwd whitelist, TLS, and the
+audit trail — lives in [docs/remote.md](docs/remote.md#security-model).)
 
-### Point a master at it (machine A)
-
-```yaml
-profiles:
-  - name: big-gpu-impl
-    driver: remote
-    remote:
-      endpoint: https://gpu.example.com:8790   # wss:// derived automatically
-      tokenEnv: AGENTMESH_REMOTE_TOKEN          # value read from env, never stored
-      remoteProfile: opencode                   # which daemon-side profile to run
-      # ca: ./certs/daemon-ca.pem               # trust a self-signed daemon cert
-```
-
-Then the master drives it exactly like a local worker — `task_submit { profile:
-"big-gpu-impl" }`, `task_wait`, `task_approve` when a remote permission request
-arrives. Remote events are streamed back and persisted locally.
-
-### Reconnect & reconciliation
-
-If a connection drops mid-run, the master must not guess the outcome. The daemon
-persists every task to its local store, so a client can re-ask for the
-authoritative record with a one-shot query — no live turn socket required:
-
-```ts
-import { queryRemoteTask } from "agentmesh";
-
-const rec = await queryRemoteTask(
-  { endpoint: "https://gpu.example.com:8790", tokenEnv: "AGENTMESH_REMOTE_TOKEN" },
-  taskId,
-);
-// rec is the real TaskRecord, or undefined if the daemon has no such task.
-```
-
-Because the daemon cancels orphaned tasks when a socket closes, a task that was
-running at drop time reconciles to `cancelled` — never a false `succeeded`.
-`RemoteWorkerDriver.queryTask(remote, taskId)` exposes the same call.
-
-For a **still-running** task you'd rather resume than re-run, start the daemon
-with an orphan grace window (`orphanGraceMs`) and re-attach: the daemon replays
-every persisted event after a sequence boundary, then streams live events to
-completion — no re-submission, no duplicated work.
-
-```ts
-import { attachRemoteTask } from "agentmesh";
-
-const rec = await attachRemoteTask(
-  { endpoint: "https://gpu.example.com:8790", tokenEnv: "AGENTMESH_REMOTE_TOKEN" },
-  taskId,
-  {
-    afterSequence: lastSeq,               // resume where we left off (0 = full replay)
-    onEvent: (ev) => render(ev),          // replayed + live events, deduped by sequence
-    onPermissionRequest: async (req) => decide(req), // approvals still round-trip
-  },
-);
-// rec is the authoritative terminal TaskRecord.
-```
-
-With `orphanGraceMs: 0` (the default) a drop cancels the task immediately and
-`queryRemoteTask` reads back `cancelled`; with a grace window the task survives a
-brief disconnect and `attachRemoteTask` picks its stream back up. Aborting an
-attach detaches without cancelling the remote task.
-
-Resumption can also be **transparent**: set `resume: true` on a remote profile and
-`runTurn` itself re-attaches on a mid-run drop (bounded by `reconnectAttempts` /
-`reconnectDelayMs`), dedupes replayed events by sequence, and resolves normally —
-the master never sees the blip. Pair it with a daemon `orphanGraceMs` window.
-
-```yaml
-profiles:
-  - name: big-gpu-impl
-    driver: remote
-    remote:
-      endpoint: https://gpu.example.com:8790
-      tokenEnv: AGENTMESH_REMOTE_TOKEN
-      remoteProfile: opencode
-      resume: true              # auto re-attach if the socket drops mid-turn
-      reconnectAttempts: 3
-      reconnectDelayMs: 500
-```
-
-### Security model
-
-- **Token required.** The daemon refuses to start if `tokenEnv` is unset or the
-  variable is empty; every upgrade/request is checked with a constant-time
-  comparison (`timingSafeEqual`). Tokens are read from the environment — never
-  written to config or committed to version control.
-- **Zero-downtime key rotation.** `tokenEnv` may name several comma-separated
-  environment variables, and each variable may hold several comma-separated
-  tokens, so the daemon can accept an old and a new secret at once. Send `SIGHUP`
-  (or call `daemon.reloadTokens()`) to re-read them without restarting — add the
-  new secret, migrate clients, then drop the old one. Reload refuses an empty set
-  so the daemon can never silently become unauthenticated or lock itself out.
-- **Workdir whitelist.** `daemon.allowCwd` restricts where a remote task may run;
-  a `cwd` outside it (including `../` traversal and sibling-prefix tricks like
-  `/srv/repos_evil`) is rejected before any worker starts.
-- **TLS for anything non-loopback.** `assertSafeBind` refuses to bind a
-  non-loopback host without TLS unless you pass `--allow-insecure`. Loopback
-  `http://` is allowed for local dev/tests.
-- **ACP stdio stays local.** The daemon runs ACP in-process on machine B; only
-  typed task events cross the wire. There is no raw stdio passthrough.
-- **No orphans.** If the WebSocket drops, the daemon cancels any non-terminal
-  task it was running for that connection — unless an `orphanGraceMs` window is
-  configured, during which the task stays alive so a client can `attach` and
-  resume it. Either way a dropped task is never silently reported as success.
-- **Structured audit trail.** Every control-plane decision — auth success/failure
-  (with peer address), connection open/close, submit and its whitelist/profile
-  verdicts, approvals, cancels, attaches, orphan handling, and credential
-  reloads — is appended as NDJSON to `daemon.auditPath` (default
-  `<workdir>/daemon-audit.ndjson`). Secrets are never written: a token is reduced
-  to a 12-hex non-reversible fingerprint, and untrusted task/agent text is not
-  logged at all. Writes are buffered so a flood of bad-token attempts can't block
-  the event loop. Set `auditPath: ""` to disable.
+- **Worker output is untrusted data.** Everything a worker returns — result text,
+  permission requests, elicitation prompts, and any handoff artifact — is treated
+  as data to act on, never as instructions to obey. Handoff injections are wrapped
+  in a `trusted=NO` envelope for exactly this reason. Run untrusted work at
+  `permissionMode: approve-reads`/`deny-all` and require human approval for
+  irreversible operations.
 - **Recursion guard.** A master is itself an agent, so a delegation chain (or a
   master↔worker loop) could recurse forever. `limits.maxDelegationDepth` (default
   8) caps it: agentmesh reads its own level from `$AGENTMESH_DELEGATION_DEPTH`
@@ -478,23 +396,6 @@ profiles:
   caps, and the live queue order so a master can read back-pressure before
   fanning out.
 
-### Remote tests
-
-`test/remote.test.ts` boots an ephemeral loopback daemon against mocks and drives
-a real `RemoteWorkerDriver` client through it — dispatch + streamed events,
-approval round-trip, cancel, bad-token rejection, cwd-whitelist refusal, the
-`/healthz` vs `/profiles` auth split, reconnect reconciliation (completed-task
-query, unknown-id → `undefined`, and a dropped mid-run connection reconciling to
-`cancelled` not `succeeded`), push-based resumption (`attach` replays a
-dropped-but-grace task to success, `afterSequence` replays only newer events,
-unknown-task attach rejects, and `runTurn` transparently re-attaches after a
-mid-run drop when `resume: true`), zero-downtime key rotation (multiple valid
-tokens accepted at once over both HTTP and the WS upgrade, and `reloadTokens()`
-rotating live while refusing an empty set), a structured audit trail (records
-auth/submit/refusal decisions and asserts no token ever appears in cleartext),
-and unit coverage of `assertSafeBind` / `assertCwdAllowed`. 18 remote tests, no
-network, no API cost.
-
 ## Architecture
 
 ```
@@ -505,7 +406,7 @@ src/
   worktree.ts          git-worktree isolation for parallel workers
   registry.ts          worker lifecycle + bounded event log
   approvals.ts         ApprovalBroker: bridges permission/elicitation to the master
-  tasks.ts             TaskManager: async 8-state lifecycle, timeout/cancel, approvals
+  tasks.ts             TaskManager: async 8-state lifecycle, timeout/cancel, approvals, handoff
   store/
     memory.ts          in-memory TaskStore (tests, persist:false)
     sqlite.ts          durable TaskStore on node:sqlite (default)
@@ -525,6 +426,9 @@ src/
 skills/
   agentmesh-master/    the master delegation playbook (SKILL.md + SKILL.zh.md),
                        served over MCP as the master_playbook tool + resources
+docs/
+  remote.md            the full Remote Worker Daemon guide
+  PLAN.md              design notes + roadmap
 ```
 
 **Role symmetry:** nothing in the code says "opencode is master". The master is
@@ -563,7 +467,8 @@ Checked on this machine (Node v26, Windows):
     `runTurn` re-attach), zero-downtime key rotation (multi-token accept over
     HTTP + WS, live `reloadTokens()`, empty-set refusal), a structured NDJSON
     audit trail (decisions recorded, token never in cleartext), and unit guards
-    for `assertSafeBind` / `assertCwdAllowed`.
+    for `assertSafeBind` / `assertCwdAllowed`. See
+    [docs/remote.md](docs/remote.md#remote-tests).
   - `test/skill.test.ts` (4) — the self-hosted master skill: the package-root
     resolver finds `skills/agentmesh-master/`, both languages load from disk, and
     an in-memory MCP client confirms the server serves the playbook via the
