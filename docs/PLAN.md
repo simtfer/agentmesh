@@ -333,7 +333,11 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
 2. **远程生产化补强**：状态对账（`query`）、推送式续订（`attach` + orphan 宽限）、透明自动重连（`resume`）、
    **零停机密钥轮换**（多 token + `SIGHUP`/`reloadTokens()`）、**结构化审计日志**（NDJSON，密钥仅记指纹）均已落地。
    ⏳ 余下：开机启动/日志轮转、防火墙与部署样例；把 loopback 验证形态推向真实双机 TLS 部署。
-3. **Master 侧提示词/技能包**：让 Master 默认就会「好好委派」（何时拆任务、如何写 prompt、如何读事件）。
+3. ~~**Master 侧提示词/技能包**~~ ✅ 已落地：委派手册随仓库分发（`skills/agentmesh-master/SKILL.md` + `SKILL.zh.md`），
+   由 MCP server 自托管——`master_playbook` 工具（通用可调，`lang` 选 en/zh）+ 两个可浏览 resource
+   （`agentmesh://skills/master/en|zh`）；运行时从包根解析，源码与 dist 构建皆可用。内容涵盖五条铁律、委派闭环、
+   意图→工具速查、子任务 prompt 要素、反模式与安全红线，让 Master 默认就会「好好委派」。
+   ⏳ 进阶：MCP prompts 通道、按 profile/任务类型细分的技能片段。
 4. **跨 Worker 交接**：把一个 Worker 的 diff 注入另一个 Worker 的上下文。
 5. **结构化结果契约**：每任务 JSON 输出 schema + 从 ACP `usage_update` 汇总成本/用量。
 6. ~~**递归守卫**~~ ✅ 已落地：`limits.maxDelegationDepth`（默认 8）+ `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播，
@@ -341,5 +345,5 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    ~~最大并发 / 单任务输出大小上限~~ ✅ 亦已落地（见 §7）。
 7. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
 
-> Stage 0–3 已完成并通过 44 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限与 Stage 5 有界 FIFO 调度）。
-> 下一步优先并行调度（真实队列 owner）与远程真实双机部署。
+> Stage 0–3 已完成并通过 48 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界 FIFO 调度与自托管 master 技能）。
+> 下一步优先远程真实双机 TLS 部署与 Stage 5 进阶调度（队列 TTL、加权公平、DAG 依赖）。

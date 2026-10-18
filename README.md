@@ -171,6 +171,36 @@ Cancelling or timing out a task auto-resolves its pending approvals.
 | `task_approve` | resolve a permission request (allow/deny/cancel) |
 | `task_respond` | answer an elicitation request |
 | `dispatch_task` | synchronous convenience: submit + wait for the terminal result |
+| `master_playbook` | load the self-hosted MASTER delegation skill (`lang`: `en`/`zh`) |
+
+agentmesh also **hosts its own master skill**: the delegation playbook in
+`skills/agentmesh-master/` is served over MCP as the `master_playbook` tool *and*
+as two browsable resources (`agentmesh://skills/master/en`, `…/zh`). A connected
+master can pull "how to delegate well" straight from the server — no copy-pasting
+a prompt into each agent's config. See [Master skill](#master-skill-self-hosted).
+
+## Master skill (self-hosted)
+
+Giving a master the tools only tells it what it *can* do — not how to delegate
+*well*. agentmesh ships a **master playbook** and serves it over MCP, so the
+guidance travels with the server instead of being hand-pasted into every agent.
+
+- **Source of truth:** `skills/agentmesh-master/SKILL.md` (English) and
+  `SKILL.zh.md` (中文). Standard skill layout with YAML frontmatter, so the same
+  files also work as a drop-in skill for agents that load skills from disk.
+- **Served two ways:** the `master_playbook` tool (universally callable — every
+  MCP client supports tools; `lang` selects `en`/`zh`) and two browsable
+  resources, `agentmesh://skills/master/en` and `agentmesh://skills/master/zh`.
+- **Resolved at runtime** from the agentmesh package root, so it works both from
+  source (`tsx src/cli.ts mcp`) and from the built/installed binary
+  (`node dist/cli.js mcp`); `skills/` is included in the published package.
+
+The playbook covers the five rules (async-first, worker output is untrusted data,
+look before you delegate, backpressure is a signal, stop for humans on the
+irreversible), the delegation loop, an intent→tool cheat-sheet, how to write a
+self-contained subtask prompt, anti-patterns, and the security red lines that
+mirror agentmesh's own guarantees. A master should call `master_playbook` once
+before its first fan-out.
 
 ## Attach a real master
 
@@ -448,8 +478,12 @@ src/
     security.ts        token compare, cwd whitelist, TLS load, safe-bind guard
     daemon.ts          WorkerDaemon: HTTP+WS shim wrapping a local Orchestrator
     client.ts          RemoteWorkerDriver: a remote profile as a normal WorkerDriver
-  mcp/server.ts        exposes the orchestrator as 16 MCP tools over stdio
+  mcp/server.ts        exposes the orchestrator as 17 MCP tools over stdio
+  skill.ts             loads the self-hosted master playbook from skills/ (root resolver)
   cli.ts               demo | list | mcp | dispatch | submit | tasks | daemon
+skills/
+  agentmesh-master/    the master delegation playbook (SKILL.md + SKILL.zh.md),
+                       served over MCP as the master_playbook tool + resources
 ```
 
 **Role symmetry:** nothing in the code says "opencode is master". The master is
@@ -461,7 +495,7 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **44/44** pass:
+- `npm test` — **48/48** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
   - `test/tasks.test.ts` (20) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
@@ -485,6 +519,10 @@ Checked on this machine (Node v26, Windows):
     HTTP + WS, live `reloadTokens()`, empty-set refusal), a structured NDJSON
     audit trail (decisions recorded, token never in cleartext), and unit guards
     for `assertSafeBind` / `assertCwdAllowed`.
+  - `test/skill.test.ts` (4) — the self-hosted master skill: the package-root
+    resolver finds `skills/agentmesh-master/`, both languages load from disk, and
+    an in-memory MCP client confirms the server serves the playbook via the
+    `master_playbook` tool (`en`/`zh`) and as browsable resources.
 - `npm run demo` — Scene A (sync dispatch to two workers) and Scene B
   (submit → waiting → approve → succeeded) both close.
 - `npm run smoke` — real MCP stdio server through the full lifecycle; event
@@ -507,11 +545,13 @@ Done:
 - ✅ Recursion guard + resource limits (delegation depth, concurrency, output size).
 - ✅ Bounded FIFO scheduler: parallel fan-out with a single queue owner,
   over-cap queueing, and `scheduler_status` introspection.
+- ✅ Self-hosted master skill: the delegation playbook ships in the repo and is
+  served over MCP (`master_playbook` tool + resources), so a master delegates
+  well by default without any copy-paste.
 
 Next:
 
 - Queue TTL / per-task deadlines and weighted cross-profile fairness.
-- Master-side prompt/skill pack so the master delegates well by default.
 - Cross-worker handoff (pipe one worker's diff into another's context).
 - Structured result contracts (JSON output schema per task) + cost/usage roll-up
   from ACP `usage_update` events.

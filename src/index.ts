@@ -8,6 +8,8 @@ export { AcpxWorkerDriver } from "./drivers/acpxDriver.js";
 export { MockWorkerDriver } from "./drivers/mockDriver.js";
 export { createWorktree, removeWorktree, isGitRepo } from "./worktree.js";
 export { createMcpServer, runMcpServer } from "./mcp/server.js";
+export { readSkill, skillPath, skillResourceUri, findPackageRoot, SKILL_LANGS } from "./skill.js";
+export type { SkillLang, SkillLoadResult } from "./skill.js";
 export { TaskManager } from "./tasks.js";
 export type { WorkerProvider, TaskManagerOptions } from "./tasks.js";
 export { ApprovalBroker } from "./approvals.js";
