@@ -148,6 +148,13 @@ export interface WorkerProfile {
   permissionMode?: string;
   /** run each spawn in an isolated git worktree of the base repo */
   worktree?: boolean;
+  /**
+   * Scheduler weight for this profile's queued tasks (default 1). All weights at
+   * 1 keep the classic strict-FIFO queue; any other weight opts the scheduler
+   * into weighted fair queueing, where a profile with weight 3 gets roughly three
+   * times as many dispatch slots as a weight-1 profile under contention.
+   */
+  weight?: number;
   mock?: MockBehavior;
   /** present when driver === "remote" */
   remote?: RemoteSettings;
@@ -219,6 +226,13 @@ export interface MeshConfig {
      * tasks settle; only a full queue refuses (`queue_full`).
      */
     maxQueuedTasks?: number;
+    /**
+     * Queue TTL: how long a task may sit *queued* before it expires and settles
+     * `timed_out` (error `queue_ttl_exceeded`) without ever spawning a worker.
+     * 0/omitted = no TTL. `maxQueuedTasks` bounds *how many* wait; this bounds
+     * *how long* one may wait, so a deep backlog cannot strand work forever.
+     */
+    queueTtlMs?: number;
     /**
      * Cross-worker handoff (Phase 1). Cap on the upstream artifact bytes injected
      * into a successor task's prompt. Larger artifacts are truncated on a UTF-8
@@ -326,6 +340,12 @@ export interface TaskRecord {
   sessionId?: string;
   idempotencyKey?: string;
   timeoutMs: number;
+  /**
+   * Absolute epoch-ms deadline for the whole task (queue wait + execution).
+   * Absent = no deadline. Reaching it settles the task `timed_out` with error
+   * `deadline_exceeded`, whether it was still queued or already running.
+   */
+  deadlineAt?: number;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
@@ -347,6 +367,14 @@ export interface TaskSubmitInput {
   cwd?: string;
   worktree?: boolean;
   timeoutMs?: number;
+  /**
+   * Budget in ms from submit that must cover queue wait *and* execution. When it
+   * runs out the task settles `timed_out` (`deadline_exceeded`) — or never starts
+   * at all if it is still queued.
+   */
+  deadlineMs?: number;
+  /** Absolute epoch-ms deadline; the earlier of this and `deadlineMs` wins. */
+  deadlineAt?: number;
   idempotencyKey?: string;
   metadata?: Record<string, unknown>;
   /** Cross-worker handoff (Phase 1): inject a predecessor's result as untrusted context. */

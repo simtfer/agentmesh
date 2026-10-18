@@ -22,10 +22,11 @@
 
 3. **路线图前移**：Stage 0（协议可行性）已被 acpx + 真实 pi/opencode 冒烟覆盖，Stage 1（单机 Adapter）、
    Stage 2（8 态状态机 + SQLite + 受理式 MCP）、Stage 3（远程 Worker Daemon）均已**实现并验证**。
-   **Stage 5 并行调度**已落地核心：有界 FIFO 队列 + 单一 queue owner（`limits.maxQueuedTasks` 开启排队，
-   `scheduler_status` 可观测），叠加此前的并发/输出/递归上限。余下重点是 **远程生产化补强**
-   （开机启动、日志轮转、防火墙、真实双机 TLS 部署样例）与 **Stage 5 的进阶调度**（队列 TTL/截止时间、
-   跨 profile 加权公平、DAG 依赖、重试、预算）。
+   **Stage 5 并行调度**已落地核心：有界队列 + 单一 queue owner（`limits.maxQueuedTasks` 开启排队，
+   `scheduler_status` 可观测），队列 TTL 与截止时间（`limits.queueTtlMs`、`task_submit{deadlineMs|deadlineAt}`）、
+   跨 profile 加权公平（profile `weight`，WFQ finish tag）亦已实现并测试；叠加此前的并发/输出/递归上限。
+   余下重点是 **远程生产化补强**（开机启动、日志轮转、防火墙、真实双机 TLS 部署样例）与
+   **Stage 5 的进阶调度**（DAG 依赖、重试、预算）。
 
 ---
 
@@ -258,9 +259,18 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
   （默认 0 = 超限即拒 `concurrency_limit_exceeded`，向后兼容）>0 时开启真正排队——超限 submit 进 FIFO 队列，
   随在跑任务结算由单一 queue owner（`pump()`）自动出队；队列也满才拒（`queue_full`）。排队任务不占 worker，
   可即时取消（不等 cancel 宽限）。`scheduler_status` MCP 工具暴露 running/queued 计数、上限与队列顺序。
-- ✅ 独立 git worktree（代码已备）；失败/超时/取消路径均有测试（`test/tasks.test.ts` 的调度四例：
-  排队并 FIFO 出队、队满拒绝、取消排队任务即时结算、并发扇出受 `maxConcurrentTasks` 约束）。
-- ⏳ DAG 依赖、可配置重试、跨 profile 加权公平、队列 TTL/截止时间、人工审批预算、可选 Web 控制台。
+- ✅ **队列 TTL + 每任务截止时间**：`limits.queueTtlMs` 限制排队最长等待，到期出队并结算 `timed_out`
+  （`queue_ttl_exceeded`），**不 spawn worker**；`task_submit{deadlineMs|deadlineAt}` 覆盖「排队 + 执行」全程，
+  命中即 `timed_out`（`deadline_exceeded`）——无论在排队还是在跑；submit 时已过期的 deadline 直接拒绝。
+  运行期定时器取 `min(timeoutMs, 截止剩余)`，两种预算叠加而非互斥。
+- ✅ **跨 profile 加权公平**：profile `weight`（默认 1 = 严格 FIFO，保持向后兼容）。任一处设非 1 权重即启用
+  WFQ finish tag（`tag = max(pass[profile], virtualTime) + 1/weight`），高权重 profile 在争用时按比例拿到更多
+  出队名额；虚拟时间按**服务量**推进，后到任务无法用陈旧 tag 插队。权重只影响排队顺序，不突破并发上限。
+  `scheduler_status` 现额外暴露 `fairness`、`queueTtlMs` 与每项的 `weight` / `waitedMs` / `expiresInMs`。
+- ✅ 独立 git worktree（代码已备）；失败/超时/取消路径均有测试（`test/tasks.test.ts` 的调度用例：
+  排队并 FIFO 出队、队满拒绝、取消排队任务即时结算、并发扇出受 `maxConcurrentTasks` 约束、队列 TTL 过期、
+  排队/运行两种 deadline 命中、默认权重保序 + `weight: 3` 抢占前 4 个名额中的 3 个）。
+- ⏳ DAG 依赖、可配置重试、人工审批预算、可选 Web 控制台。
 - 验收：多任务并发；同一工作目录不被多个写任务无保护同时改；失败/超时/取消路径均有测试。
 
 ---
@@ -327,10 +337,12 @@ acpx 会话作用域按 `(agentCommand, cwd, sessionKey)` 精确匹配，跨目�
 
 Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向「跑得多、跑得稳、跑得像产品」：
 
-1. ~~**Stage 5 · 并行与调度**~~ ✅ 核心已落地：有界 FIFO 队列 + 单一 queue owner（`limits.maxQueuedTasks`
+1. ~~**Stage 5 · 并行与调度**~~ ✅ 核心已落地：有界队列 + 单一 queue owner（`limits.maxQueuedTasks`
    >0 开启排队，`pump()` 随槽位释放自动出队；`scheduler_status` 可观测），叠加已有的 `maxConcurrentTasks` /
-   `maxOutputBytes` / 递归深度上限；多 worktree 并行代码已备；失败/超时/取消路径均有并发测试（`test/tasks.test.ts`）。
-   ⏳ 进阶：队列 TTL/截止时间、跨 profile 加权公平、DAG 依赖、可配置重试、预算上限。
+   `maxOutputBytes` / 递归深度上限；队列 TTL（`queueTtlMs`）、每任务截止时间（`deadlineMs`/`deadlineAt`）、
+   跨 profile 加权公平（`weight` + WFQ finish tag）亦已落地并测试；多 worktree 并行代码已备；失败/超时/取消路径
+   均有并发测试（`test/tasks.test.ts`）。
+   ⏳ 进阶：DAG 依赖、可配置重试、预算上限。
 2. **远程生产化补强**：状态对账（`query`）、推送式续订（`attach` + orphan 宽限）、透明自动重连（`resume`）、
    **零停机密钥轮换**（多 token + `SIGHUP`/`reloadTokens()`）、**结构化审计日志**（NDJSON，密钥仅记指纹）均已落地。
    ⏳ 余下：开机启动/日志轮转、防火墙与部署样例；把 loopback 验证形态推向真实双机 TLS 部署。
@@ -352,5 +364,5 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    ~~最大并发 / 单任务输出大小上限~~ ✅ 亦已落地（见 §7）。
 7. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
 
-> Stage 0–3 已完成并通过 54 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界 FIFO 调度、自托管 master 技能与跨 Worker 交接 Phase 1）。
-> 下一步优先远程真实双机 TLS 部署与 Stage 5 进阶调度（队列 TTL、加权公平、DAG 依赖）。
+> Stage 0–3 已完成并通过 60 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、自托管 master 技能与跨 Worker 交接 Phase 1）。
+> 下一步优先远程真实双机 TLS 部署与 Stage 5 进阶调度（DAG 依赖、重试、预算）。

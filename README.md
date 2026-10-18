@@ -61,7 +61,8 @@ between them.
 Working and verified end-to-end: an **8-state persistent task machine** (SQLite),
 **async task lifecycle** (`task_submit` / `task_wait` / `task_result` / …), a
 **human-in-the-loop approval flow** for worker permission/elicitation requests, a
-**bounded FIFO scheduler** for parallel fan-out, **cross-worker handoff**, a
+**bounded, weighted-fair scheduler** (queue TTLs, per-task deadlines, opt-in
+profile weights) for parallel fan-out, **cross-worker handoff**, a
 self-hosted **master delegation skill**, and a **remote Worker Daemon** for
 cross-machine workers over an authenticated, TLS-capable channel — driven against
 **real local OpenCode and Pi agents** as well as deterministic mocks. See
@@ -143,6 +144,7 @@ queued ─▶ starting ─▶ running ─▶ succeeded
                  waiting│  │ (approve / respond)
                         ▼  │
                        (loops back to running)
+   queued (no slot, TTL/deadline hit) ─▶ timed_out         (terminal)
    running/waiting ─▶ failed | cancelled | timed_out   (terminal)
 ```
 
@@ -185,14 +187,14 @@ Cancelling or timing out a task auto-resolves its pending approvals.
 | `agent_inspect` | one worker's status + recent event log |
 | `spawn_worker` | start a worker (optionally in a git worktree) |
 | `kill_worker` | close a worker and clean its worktree |
-| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call); optional `handoff` chains onto a finished task |
+| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call); `deadlineMs`/`deadlineAt` bound queue wait + execution; optional `handoff` chains onto a finished task |
 | `task_status` | current status of a task |
 | `task_wait` | block until terminal **or** `waiting` (needs approval) |
 | `task_result` | final text / status / error of a task |
 | `task_events` | persisted event log after a sequence number |
 | `task_cancel` | request cancellation (settles once the worker confirms) |
 | `list_tasks` | list tasks, optionally filtered by status |
-| `scheduler_status` | running vs queued counts, configured caps, live FIFO queue order |
+| `scheduler_status` | running vs queued counts, configured caps (`maxQueuedTasks`, `queueTtlMs`), the queue in dispatch order, and per-entry weight / wait / time-to-expiry |
 | `pending_approvals` | approval/elicitation requests blocking a `waiting` task |
 | `task_approve` | resolve a permission request (allow/deny/cancel) |
 | `task_respond` | answer an elicitation request |
@@ -382,19 +384,37 @@ audit trail — lives in [docs/remote.md](docs/remote.md#security-model).)
   silent. `limits.maxHandoffBytes` (default 256 KiB) caps how much of a
   predecessor's result a cross-worker handoff may inject into a successor prompt,
   using the same UTF-8-safe clip.
-- **Bounded FIFO scheduler.** What happens to a submit that arrives while every
+- **Bounded, fair scheduler.** What happens to a submit that arrives while every
   slot is busy is governed by `limits.maxQueuedTasks`. Left at `0` (the default),
   the submit is refused immediately with `concurrency_limit_exceeded` *without
   spawning a worker* — pure back-pressure, so a fan-out burst can't exhaust the
   host. Set it `>0` to turn on real scheduling: over-cap submits park in a bounded
-  FIFO queue and drain automatically as running tasks settle, and only a submit
-  that finds the queue full too is refused (`queue_full`). A single queue owner
+  queue and drain automatically as running tasks settle, and only a submit that
+  finds the queue full too is refused (`queue_full`). A single queue owner
   (`pump()`) advances the queue whenever a slot frees, so admission stays race-free
   under a same-tick burst. A queued task holds no worker and can be cancelled — it
   settles at once instead of waiting out the cancel grace period. The
   `scheduler_status` MCP tool exposes running vs queued counts, the configured
-  caps, and the live queue order so a master can read back-pressure before
+  caps, and the queue in dispatch order so a master can read back-pressure before
   fanning out.
+- **Queued work has a shelf life.** `limits.queueTtlMs` caps how long a task may
+  *wait*: on expiry it leaves the queue and settles `timed_out` with
+  `queue_ttl_exceeded`, never having spawned a worker. A per-task deadline is
+  stronger — `task_submit { deadlineMs }` (budget from submit) or `{ deadlineAt }`
+  (absolute epoch ms) covers queue wait **and** execution, so a slow backlog can't
+  quietly blow a wall-clock commitment: the task settles `timed_out` with
+  `deadline_exceeded` whether it was still queued or already running, and a
+  deadline already past at submit time is refused outright. The run timer fires at
+  the *smaller* of the task's `timeoutMs` and the deadline remainder, so the two
+  budgets compose instead of fighting.
+- **Weighted fair queueing.** With the default profile weight of `1` the queue is
+  strict FIFO (submit order == dispatch order). Give a profile a `weight` and the
+  scheduler switches to weighted fair queueing with finish tags
+  (`tag = max(pass[profile], virtualTime) + 1/weight`): a `weight: 3` profile gets
+  roughly three dispatch slots per one of a `weight: 1` profile under contention,
+  while virtual time advances on *service*, so a late arrival cannot jump a
+  backlog on a stale tag. Weights only reorder *waiting* work — they never let
+  more than `maxConcurrentTasks` run.
 
 ## Architecture
 
@@ -440,11 +460,12 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **54/54** pass:
+- `npm test` — **60/60** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
-  - `test/tasks.test.ts` (26) — happy path, worker failure, `timeout → timed_out`,
+  - `test/tasks.test.ts` (32) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
-    idempotency de-dup, SQLite restart-and-requery, store column-merge safety, the
+    idempotency de-dup, SQLite restart-and-requery, store column-merge safety, an
+    old-schema DB forward-migrated with the `deadlineAt` column, the
     recursion guard (depth-stamped success within the cap, refusal at the cap with
     no worker spawned, and an inherited env depth tripping the cap), the
     resource limits (a submit past `maxConcurrentTasks` refused with no worker,
@@ -453,7 +474,13 @@ Checked on this machine (Node v26, Windows):
     Stage 5 scheduler (over-cap submits queue then drain FIFO as slots free, a
     full queue refuses with `queue_full`, cancelling a queued task settles
     immediately without the grace wait, and a fan-out runs concurrently bounded by
-    `maxConcurrentTasks`), and Phase 1 cross-worker handoff (the predecessor's
+    `maxConcurrentTasks`), queue TTL and deadlines (a queued task expires
+    `queue_ttl_exceeded` without ever spawning a worker, a queued task's
+    `deadlineMs` expires `deadline_exceeded`, a running turn is bounded by its
+    deadline rather than its much larger `timeoutMs`, and an already-past deadline
+    is refused at submit), weighted fairness (default weights keep submit order
+    exactly; a `weight: 3` profile takes 3 of the first 4 dispatch slots), and
+    Phase 1 cross-worker handoff (the predecessor's
     result reaches the successor's prompt, a no-handoff control never sees it, the
     injected block is wrapped untrusted while the stored prompt stays original, a
     non-succeeded / unknown source is refused with no worker spawned, and the
@@ -495,6 +522,8 @@ Done:
 - ✅ Recursion guard + resource limits (delegation depth, concurrency, output size).
 - ✅ Bounded FIFO scheduler: parallel fan-out with a single queue owner,
   over-cap queueing, and `scheduler_status` introspection.
+- ✅ Queue TTL + per-task deadlines (`deadlineMs` / `deadlineAt`, covering queue
+  wait + execution) and weighted cross-profile fairness (opt-in via `weight`).
 - ✅ Self-hosted master skill: the delegation playbook ships in the repo and is
   served over MCP (`master_playbook` tool + resources), so a master delegates
   well by default without any copy-paste.
@@ -504,7 +533,6 @@ Done:
 
 Next:
 
-- Queue TTL / per-task deadlines and weighted cross-profile fairness.
 - Cross-worker handoff Phase 2/3 (`inject: "diff"` artifact sidecar + redaction,
   `base: "predecessor"` worktree branched from the predecessor's end state).
 - Structured result contracts (JSON output schema per task) + cost/usage roll-up

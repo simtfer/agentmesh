@@ -64,7 +64,9 @@ agent_list ─▶ plan/decompose ─▶ scheduler_status ─▶ task_submit (×N
    expected output shape, and the working directory / worktree need.
 3. **Check capacity.** `scheduler_status` → if `running` is already at
    `maxConcurrentTasks` and the queue is filling, submit a smaller batch now and
-   the rest after some settle.
+   the rest after some settle. Queued work can expire: pass `deadlineMs` when a
+   subtask must be done by a wall-clock time — it covers queue wait **and** run,
+   and the task settles `timed_out`/`deadline_exceeded` instead of hanging.
 4. **Fan out (async).** One `task_submit` per subtask. Pass an `idempotencyKey`
    for anything you might retry, so a re-submit de-dupes instead of double-running
    a non-idempotent worker. Use `worktree: true` for parallel *write* tasks so

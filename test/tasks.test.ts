@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -629,6 +630,182 @@ test("handoff artifact is capped to maxBytes and flagged truncated", async () =>
     await orch.shutdown();
   }
 });
+
+test("an old-schema SQLite DB is forward-migrated with the deadlineAt column", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-mig-"));
+  try {
+    const dbPath = path.join(dir, "old.sqlite");
+    // A `tasks` table exactly as v0.1 created it — no deadlineAt column.
+    const db = new DatabaseSync(dbPath);
+    db.exec(`CREATE TABLE tasks (
+      taskId TEXT PRIMARY KEY, profile TEXT NOT NULL, workerId TEXT, prompt TEXT NOT NULL,
+      workingDirectory TEXT NOT NULL, status TEXT NOT NULL, sessionId TEXT, idempotencyKey TEXT,
+      timeoutMs INTEGER NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+      startedAt INTEGER, finishedAt INTEGER, text TEXT, stopReason TEXT, waitingReason TEXT,
+      errorCode TEXT, errorMessage TEXT, errorRetryable INTEGER, metadata TEXT)`);
+    db.exec(`INSERT INTO tasks (taskId, profile, prompt, workingDirectory, status, timeoutMs, createdAt, updatedAt)
+      VALUES ('old-1','p','x','/tmp','succeeded',1000,1,2)`);
+    db.close();
+
+    const store = new SqliteTaskStore(dbPath);
+    try {
+      const rec = store.getTask("old-1");
+      assert.equal(rec?.status, "succeeded");
+      assert.equal(rec?.deadlineAt, undefined, "rows written before the migration have no deadline");
+      store.updateTask("old-1", { deadlineAt: 123456 });
+      assert.equal(store.getTask("old-1")?.deadlineAt, 123456);
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* --------- Stage 5.1: queue TTL, per-task deadlines, weighted fairness -------- */
+
+const boundedOrch = (
+  limits: { maxConcurrentTasks?: number; maxQueuedTasks?: number; queueTtlMs?: number },
+  profiles: Array<Record<string, unknown>>,
+) =>
+  new Orchestrator(parseConfig({ workdir: ".agentmesh-test", limits, profiles }), {
+    baseCwd: process.cwd(),
+    persist: false,
+  });
+
+test("a queued task expires at the queue TTL without ever spawning a worker", async () => {
+  const orch = boundedOrch({ maxConcurrentTasks: 1, maxQueuedTasks: 4, queueTtlMs: 60 }, [
+    { name: "hold", driver: "mock", mock: hold },
+  ]);
+  try {
+    const a = orch.submitTask({ profile: "hold", prompt: "a" });
+    const b = orch.submitTask({ profile: "hold", prompt: "b" });
+    assert.equal(a.status, "starting");
+    assert.equal(b.status, "queued");
+
+    const s = orch.schedulerStatus();
+    assert.equal(s.queueTtlMs, 60);
+    assert.equal(s.fairness, "fifo", "default weights keep strict FIFO");
+    assert.equal(s.queuedTasks[0]?.taskId, b.taskId);
+
+    const rb = await orch.waitTask(b.taskId, 4000);
+    assert.equal(rb?.status, "timed_out");
+    assert.equal(rb?.error?.code, "queue_ttl_exceeded");
+    assert.equal(rb?.workerId, undefined, "an expired queue entry never spawns a worker");
+    assert.ok(!orch.taskEvents(b.taskId).some((e) => e.type === "started"));
+    assert.equal(orch.schedulerStatus().queued, 0, "it must leave the queue");
+
+    const ra = await orch.waitTask(a.taskId, 8000);
+    assert.equal(ra?.status, "succeeded", "the running task is unaffected");
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("a per-task deadline expires a task that never got a slot", async () => {
+  const orch = boundedOrch({ maxConcurrentTasks: 1, maxQueuedTasks: 4 }, [
+    { name: "hold", driver: "mock", mock: hold },
+  ]);
+  try {
+    const a = orch.submitTask({ profile: "hold", prompt: "a" });
+    const b = orch.submitTask({ profile: "hold", prompt: "b", deadlineMs: 60 });
+    assert.equal(b.status, "queued");
+    assert.ok((b.deadlineAt ?? 0) > b.createdAt, "the deadline is persisted on the record");
+
+    const rb = await orch.waitTask(b.taskId, 4000);
+    assert.equal(rb?.status, "timed_out");
+    assert.equal(rb?.error?.code, "deadline_exceeded");
+    assert.equal(rb?.workerId, undefined);
+
+    await orch.waitTask(a.taskId, 8000);
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("a per-task deadline bounds a running turn and reports deadline_exceeded", async () => {
+  const orch = boundedOrch({ maxConcurrentTasks: 0, maxQueuedTasks: 0 }, [
+    { name: "hold", driver: "mock", mock: hold },
+  ]);
+  try {
+    const t0 = Date.now();
+    // timeoutMs is far larger than the deadline: the deadline must be what fires.
+    const sub = orch.submitTask({
+      profile: "hold",
+      prompt: "slow work",
+      timeoutMs: 30000,
+      deadlineMs: 80,
+    });
+    const rec = await orch.waitTask(sub.taskId, 5000);
+    const elapsed = Date.now() - t0;
+
+    assert.equal(rec?.status, "timed_out");
+    assert.equal(rec?.error?.code, "deadline_exceeded", "the deadline, not the timeout, fired");
+    assert.ok(elapsed < 2000, `deadline should fire early, took ${elapsed}ms`);
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("a submit whose deadline already passed is refused outright", async () => {
+  const orch = boundedOrch({ maxConcurrentTasks: 0, maxQueuedTasks: 4 }, [
+    { name: "hold", driver: "mock", mock: hold },
+  ]);
+  try {
+    const s = orch.submitTask({ profile: "hold", prompt: "too late", deadlineAt: Date.now() - 1000 });
+    assert.equal(s.status, "failed");
+    assert.equal(s.error?.code, "deadline_exceeded");
+    assert.equal(s.workerId, undefined);
+    assert.equal(orch.schedulerStatus().queued, 0);
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("configured profile weights reorder the queue by weighted fair share", async () => {
+  const limits = { maxConcurrentTasks: 1, maxQueuedTasks: 20 };
+  const plain = boundedOrch(limits, [
+    { name: "heavy", driver: "mock", mock: hold },
+    { name: "light", driver: "mock", mock: hold },
+  ]);
+  const weighted = boundedOrch(limits, [
+    { name: "heavy", driver: "mock", weight: 3, mock: hold },
+    { name: "light", driver: "mock", mock: hold },
+  ]);
+  // Same submit pattern for both: one task takes the only slot, then an even mix
+  // of heavy/light work waits behind it.
+  const fill = (orch: Orchestrator) => {
+    orch.submitTask({ profile: "heavy", prompt: "h1" }); // starts, not queued
+    return {
+      l1: orch.submitTask({ profile: "light", prompt: "l1" }),
+      h2: orch.submitTask({ profile: "heavy", prompt: "h2" }),
+      l2: orch.submitTask({ profile: "light", prompt: "l2" }),
+      h3: orch.submitTask({ profile: "heavy", prompt: "h3" }),
+      l3: orch.submitTask({ profile: "light", prompt: "l3" }),
+      h4: orch.submitTask({ profile: "heavy", prompt: "h4" }),
+      l4: orch.submitTask({ profile: "light", prompt: "l4" }),
+    };
+  };
+  try {
+    const p = fill(plain);
+    const ps = plain.schedulerStatus();
+    assert.equal(ps.fairness, "fifo");
+    assert.deepEqual(ps.queuedTaskIds, [p.l1, p.h2, p.l2, p.h3, p.l3, p.h4, p.l4].map((t) => t.taskId));
+
+    const w = fill(weighted);
+    const ws = weighted.schedulerStatus();
+    assert.equal(ws.fairness, "weighted");
+    // Weight 3 accumulates finish tags three times as slowly, so the heavy
+    // profile takes 3 of the first 4 dispatch slots instead of alternating.
+    assert.deepEqual(ws.queuedTaskIds.slice(0, 4), [w.h2, w.h3, w.l1, w.h4].map((t) => t.taskId));
+    assert.equal(ws.queuedTasks[0]?.weight, 3);
+    assert.equal(ws.queuedTasks.find((q) => q.taskId === w.l1.taskId)?.weight, 1);
+  } finally {
+    await plain.shutdown();
+    await weighted.shutdown();
+  }
+});
+
 
 
 

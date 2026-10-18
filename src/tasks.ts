@@ -26,8 +26,13 @@ export interface WorkerProvider {
 interface LiveTask {
   controller: AbortController;
   workerId?: string;
+  /** run-phase timeout/deadline timer */
   timer?: NodeJS.Timeout;
+  /** queue-phase expiry timer (queue TTL and/or the task deadline) */
+  queueTimer?: NodeJS.Timeout;
   abortReason?: "timeout" | "cancel";
+  /** which budget fired when `abortReason === "timeout"` */
+  timeoutCode?: "task_timeout" | "deadline_exceeded";
   /** the original submit input, retained so a queued task can be started later */
   input: TaskSubmitInput;
   done: Promise<TaskRecord>;
@@ -36,6 +41,20 @@ interface LiveTask {
   waiting: Promise<TaskRecord>;
   resolveWaiting: (r: TaskRecord) => void;
   onEvent?: (ev: TaskEvent) => void;
+}
+
+/**
+ * One unit of waiting work. The queue is an array of these (not bare taskIds)
+ * because the scheduler needs a profile and a weighted finish tag per entry.
+ */
+interface QueueEntry {
+  taskId: string;
+  profile: string;
+  enqueuedAt: number;
+  /** monotonic enqueue order — the tie-break for equal finish tags */
+  seq: number;
+  /** weighted fair-queueing finish tag: lower is dispatched first */
+  tag: number;
 }
 
 export interface TaskManagerOptions {
@@ -73,6 +92,16 @@ export interface TaskManagerOptions {
    */
   maxQueuedTasks?: number;
   /**
+   * Queue TTL: how long a task may sit queued before it expires. 0/undefined =
+   * no TTL. Deadline-bounded tasks expire at their `deadlineAt` regardless.
+   */
+  queueTtlMs?: number;
+  /**
+   * Scheduler weight per profile (default 1). All weights at 1 keep strict FIFO;
+   * any other weight switches the queue to weighted fair scheduling.
+   */
+  profileWeight?: (profile: string) => number;
+  /**
    * Cross-worker handoff (Phase 1). `maxHandoffBytes` caps the upstream artifact
    * injected into a successor's prompt; larger artifacts are truncated on a
    * UTF-8 boundary and flagged in the task's `handoff` metadata. 0/undefined →
@@ -108,11 +137,12 @@ function capText(
 export class TaskManager {
   private live = new Map<string, LiveTask>();
   /**
-   * FIFO of taskIds admitted but not yet started, waiting for a free concurrency
-   * slot. This is the single source of truth for queue order; `pump()` drains it
-   * front-to-back so scheduling is fair (first submitted, first started).
+   * Tasks admitted but not yet started, waiting for a free concurrency slot.
+   * This is the single source of truth for queue order; `pump()` drains it and
+   * decides *which* entry goes next — strict FIFO by default, lowest finish tag
+   * when any profile carries a scheduling `weight`.
    */
-  private queue: string[] = [];
+  private queue: QueueEntry[] = [];
   /** taskIds that have been handed to `run()` and not yet settled. */
   private running = new Set<string>();
   private store: TaskStore;
@@ -125,7 +155,16 @@ export class TaskManager {
   private maxConcurrentTasks: number;
   private maxOutputBytes: number;
   private maxQueuedTasks: number;
+  private queueTtlMs: number;
   private maxHandoffBytes: number;
+  private profileWeight: (profile: string) => number;
+  /** true once a profile with a non-default weight joins the queue */
+  private weighted = false;
+  /** per-profile last finish tag (the WFQ backlog clock) */
+  private pass = new Map<string, number>();
+  /** virtual time: finish tag of the most recently dispatched queue entry */
+  private virtualTime = 0;
+  private enqueueSeq = 0;
 
   constructor(opts: TaskManagerOptions) {
     this.store = opts.store;
@@ -138,6 +177,8 @@ export class TaskManager {
     this.maxConcurrentTasks = Math.max(0, Math.trunc(opts.maxConcurrentTasks ?? 0));
     this.maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
     this.maxQueuedTasks = Math.max(0, Math.trunc(opts.maxQueuedTasks ?? 0));
+    this.queueTtlMs = Math.max(0, Math.trunc(opts.queueTtlMs ?? 0));
+    this.profileWeight = opts.profileWeight ?? (() => 1);
     this.maxHandoffBytes = Math.max(0, Math.trunc(opts.maxHandoffBytes ?? DEFAULT_MAX_HANDOFF_BYTES));
   }
 
@@ -170,6 +211,16 @@ export class TaskManager {
     const depth = Math.max(this.baseDelegationDepth, Number.isFinite(metaDepth) ? Math.trunc(metaDepth) : 0);
 
     const now = Date.now();
+    // Per-task deadline: an end-to-end budget covering queue wait *and* run. The
+    // earlier of a relative `deadlineMs` and an absolute `deadlineAt` wins, so a
+    // caller can pass either shape (or both, to clamp an inherited budget).
+    const relative = input.deadlineMs && input.deadlineMs > 0 ? now + input.deadlineMs : undefined;
+    const deadlineAt =
+      relative === undefined
+        ? input.deadlineAt
+        : input.deadlineAt === undefined
+          ? relative
+          : Math.min(relative, input.deadlineAt);
     const taskId = randomUUID();
     const rec: TaskRecord = {
       taskId,
@@ -178,6 +229,7 @@ export class TaskManager {
       workingDirectory: cwd,
       status: "queued",
       timeoutMs: input.timeoutMs ?? this.defaultTimeoutMs,
+      ...(deadlineAt !== undefined ? { deadlineAt } : {}),
       createdAt: now,
       updatedAt: now,
       workerId: input.workerId,
@@ -214,6 +266,16 @@ export class TaskManager {
       );
     }
 
+    // A deadline already blown at submit time (e.g. an inherited budget from a
+    // parent chain) can never run: fail fast instead of queueing a dead task.
+    if (deadlineAt !== undefined && deadlineAt <= now) {
+      return this.refuse(
+        taskId,
+        "deadline_exceeded",
+        `deadline ${new Date(deadlineAt).toISOString()} had already passed when the task was submitted`,
+      );
+    }
+
     // Cross-worker handoff admission (Phase 1). Validate the predecessor BEFORE
     // consuming a scheduler slot or spawning a worker, so a bad handoff fails
     // fast (queued → failed is a legal transition) exactly like the other guards.
@@ -247,13 +309,24 @@ export class TaskManager {
     if (slotFree) {
       this.start(taskId);
     } else if (this.maxQueuedTasks > 0 && this.queue.length < this.maxQueuedTasks) {
-      this.queue.push(taskId);
+      const entry = this.enqueue(taskId, profile);
+      const position = this.queuePosition(taskId);
       this.append(
         taskId,
         "queued",
-        `queued behind ${this.running.size} running task(s); position ${this.queue.length}/${this.maxQueuedTasks}`,
-        { kind: "status", queuePosition: this.queue.length, running: this.running.size },
+        `queued behind ${this.running.size} running task(s); position ${position}/${this.maxQueuedTasks}` +
+          (this.queueTtlMs > 0 ? `; ttl ${this.queueTtlMs}ms` : ``),
+        {
+          kind: "status",
+          queuePosition: position,
+          running: this.running.size,
+          ...(this.queueTtlMs > 0 ? { queueTtlMs: this.queueTtlMs } : {}),
+          ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+        },
       );
+      // Bound how long it may wait: queue TTL, its own deadline, or whichever
+      // comes first. A task that overstays settles `timed_out` without a worker.
+      this.armQueueExpiry(taskId, entry);
     } else {
       // No slot and no queue room. Fail fast WITHOUT spawning a worker so a
       // fan-out burst cannot exhaust the host.
@@ -277,11 +350,16 @@ export class TaskManager {
   /**
    * Hand a task to `run()` and count it against the concurrency cap. `running`
    * is updated synchronously so a burst of submits in the same tick sees an
-   * accurate in-flight count.
+   * accurate in-flight count. Any queue-expiry timer is disarmed here: once the
+   * task owns a slot, the run budget takes over.
    */
   private start(taskId: string): void {
     const live = this.live.get(taskId);
     if (!live) return;
+    if (live.queueTimer) {
+      clearTimeout(live.queueTimer);
+      live.queueTimer = undefined;
+    }
     this.running.add(taskId);
     // fire and forget; errors are captured into the task record
     void this.run(taskId, live.input).catch((err) => {
@@ -290,30 +368,146 @@ export class TaskManager {
   }
 
   /**
-   * The queue owner's drain loop: start queued tasks (FIFO) while a concurrency
-   * slot is free. Called after every settle so a freed slot is immediately
-   * offered to the longest-waiting task — that is the fairness guarantee.
+   * The queue owner's drain loop: start queued tasks while a concurrency slot is
+   * free. Called after every settle so a freed slot is immediately offered to the
+   * next eligible task. Which one is "next" is decided by `nextIndex()` — strict
+   * submit order when every weight is 1, lowest finish tag when weighted.
    */
   private pump(): void {
     while (
       this.queue.length > 0 &&
       (this.maxConcurrentTasks <= 0 || this.running.size < this.maxConcurrentTasks)
     ) {
-      const next = this.queue.shift()!;
-      const live = this.live.get(next);
-      const rec = this.store.getTask(next);
+      const i = this.nextIndex();
+      if (i < 0) return;
+      const entry = this.queue.splice(i, 1)[0]!;
+      // Advance virtual time on *service*, not arrival: a later submit cannot
+      // jump ahead of queued work by carrying a stale (small) finish tag.
+      this.virtualTime = entry.tag;
+      const live = this.live.get(entry.taskId);
+      const rec = this.store.getTask(entry.taskId);
       // Skip anything cancelled/refused while it sat in the queue.
       if (!live || !rec || isTerminal(rec.status)) continue;
-      this.start(next);
+      this.start(entry.taskId);
     }
   }
 
   /** Remove a task from the wait queue; true if it was queued (not started). */
   private dequeue(taskId: string): boolean {
-    const i = this.queue.indexOf(taskId);
+    const i = this.queue.findIndex((e) => e.taskId === taskId);
     if (i < 0) return false;
     this.queue.splice(i, 1);
     return true;
+  }
+
+  /**
+   * Admit a task to the queue with a weighted fair-queueing finish tag:
+   * `tag = max(pass[profile], virtualTime) + 1/weight`. Lower tags dispatch first,
+   * so a profile with weight 3 accumulates tags three times as slowly as a
+   * weight-1 profile — it gets three slots per one of theirs under contention.
+   * With the default weight of 1 the tag is ignored and order stays strict FIFO.
+   */
+  private enqueue(taskId: string, profile: string): QueueEntry {
+    const weight = this.weightOf(profile);
+    const start = Math.max(this.pass.get(profile) ?? 0, this.virtualTime);
+    const entry: QueueEntry = {
+      taskId,
+      profile,
+      enqueuedAt: Date.now(),
+      seq: ++this.enqueueSeq,
+      tag: start + 1 / weight,
+    };
+    this.pass.set(profile, entry.tag);
+    this.queue.push(entry);
+    // A configured weight is an explicit opt-in to weighted scheduling; leaving
+    // every weight at its default keeps the documented FIFO behaviour.
+    if (weight !== 1) this.weighted = true;
+    return entry;
+  }
+
+  private weightOf(profile: string): number {
+    const w = this.profileWeight(profile);
+    return Number.isFinite(w) && w > 0 ? w : 1;
+  }
+
+  /** Index of the next queue entry to dispatch (0 = FIFO head, or lowest tag). */
+  private nextIndex(): number {
+    if (this.queue.length === 0) return -1;
+    if (!this.weighted) return 0;
+    let best = 0;
+    for (let i = 1; i < this.queue.length; i++) {
+      const a = this.queue[i]!;
+      const b = this.queue[best]!;
+      if (a.tag < b.tag || (a.tag === b.tag && a.seq < b.seq)) best = i;
+    }
+    return best;
+  }
+
+  /** Queue entries in the order they will be dispatched. */
+  private dispatchOrder(): QueueEntry[] {
+    if (!this.weighted) return [...this.queue];
+    return [...this.queue].sort((a, b) => (a.tag === b.tag ? a.seq - b.seq : a.tag - b.tag));
+  }
+
+  /** 1-based position of a queued task in dispatch order (0 if not queued). */
+  private queuePosition(taskId: string): number {
+    return this.dispatchOrder().findIndex((e) => e.taskId === taskId) + 1;
+  }
+
+  /**
+   * Arm the queue-phase expiry timer: whichever of the queue TTL and the task's
+   * own deadline comes first. Fires at most once; `start()` disarms it if a slot
+   * frees first. `unref()` keeps an idle queue from holding the process open.
+   */
+  private armQueueExpiry(taskId: string, entry: QueueEntry): void {
+    const live = this.live.get(taskId);
+    if (!live) return;
+    const deadlineAt = this.store.getTask(taskId)?.deadlineAt;
+    const candidates: Array<{ at: number; code: "queue_ttl_exceeded" | "deadline_exceeded" }> = [];
+    if (this.queueTtlMs > 0) {
+      candidates.push({ at: entry.enqueuedAt + this.queueTtlMs, code: "queue_ttl_exceeded" });
+    }
+    if (deadlineAt !== undefined) candidates.push({ at: deadlineAt, code: "deadline_exceeded" });
+    if (candidates.length === 0) return;
+    candidates.sort((a, b) => a.at - b.at);
+    const { at, code } = candidates[0]!;
+    live.queueTimer = setTimeout(
+      () => this.expireQueued(taskId, code),
+      Math.max(0, at - Date.now()),
+    );
+    live.queueTimer.unref?.();
+  }
+
+  /**
+   * Settle a task that waited too long without ever starting. It holds no worker,
+   * so this is immediate: leave the queue first (so `pump()` cannot start it
+   * afterwards), record `timed_out` with the reason, and resolve any `wait()`.
+   */
+  private expireQueued(taskId: string, code: "queue_ttl_exceeded" | "deadline_exceeded"): void {
+    const live = this.live.get(taskId);
+    if (!live) return;
+    const rec = this.store.getTask(taskId);
+    if (!rec || rec.status !== "queued") return; // started (or settled) meanwhile
+    if (!this.dequeue(taskId)) return;
+    if (live.queueTimer) {
+      clearTimeout(live.queueTimer);
+      live.queueTimer = undefined;
+    }
+    const waitedMs = Date.now() - rec.createdAt;
+    this.setState(taskId, "timed_out", {
+      finishedAt: Date.now(),
+      error: {
+        code,
+        message:
+          code === "queue_ttl_exceeded"
+            ? `task waited ${waitedMs}ms in the queue, exceeding the ${this.queueTtlMs}ms queue TTL`
+            : `task reached its deadline after waiting ${waitedMs}ms in the queue`,
+        retryable: false,
+      },
+    });
+    const final = this.store.getTask(taskId)!;
+    live.resolveDone(final);
+    this.live.delete(taskId);
   }
 
   /** Snapshot of scheduler state for introspection (MCP `scheduler_status`). */
@@ -322,16 +516,44 @@ export class TaskManager {
     queued: number;
     maxConcurrentTasks: number;
     maxQueuedTasks: number;
+    queueTtlMs: number;
+    fairness: "fifo" | "weighted";
     runningTaskIds: string[];
+    /** taskIds in the order they will be dispatched */
     queuedTaskIds: string[];
+    queuedTasks: Array<{
+      taskId: string;
+      profile: string;
+      weight: number;
+      waitedMs: number;
+      /** ms until this entry expires from the queue (queue TTL or deadline) */
+      expiresInMs?: number;
+    }>;
   } {
+    const now = Date.now();
+    const order = this.dispatchOrder();
     return {
       running: this.running.size,
       queued: this.queue.length,
       maxConcurrentTasks: this.maxConcurrentTasks,
       maxQueuedTasks: this.maxQueuedTasks,
+      queueTtlMs: this.queueTtlMs,
+      fairness: this.weighted ? "weighted" : "fifo",
       runningTaskIds: [...this.running],
-      queuedTaskIds: [...this.queue],
+      queuedTaskIds: order.map((e) => e.taskId),
+      queuedTasks: order.map((e) => {
+        const deadlineAt = this.store.getTask(e.taskId)?.deadlineAt;
+        const bounds: number[] = [];
+        if (this.queueTtlMs > 0) bounds.push(e.enqueuedAt + this.queueTtlMs);
+        if (deadlineAt !== undefined) bounds.push(deadlineAt);
+        return {
+          taskId: e.taskId,
+          profile: e.profile,
+          weight: this.weightOf(e.profile),
+          waitedMs: now - e.enqueuedAt,
+          ...(bounds.length > 0 ? { expiresInMs: Math.max(0, Math.min(...bounds) - now) } : {}),
+        };
+      }),
     };
   }
 
@@ -395,6 +617,21 @@ export class TaskManager {
     const live = this.live.get(taskId);
     if (!live) return;
     try {
+      // A deadline can elapse while the task waits for a slot (or between the
+      // last pump and now). Never spawn a worker for a task that is already out
+      // of time: settle it here (queued → timed_out is legal).
+      const deadlineAt = this.store.getTask(taskId)?.deadlineAt;
+      if (deadlineAt !== undefined && deadlineAt <= Date.now()) {
+        this.setState(taskId, "timed_out", {
+          finishedAt: Date.now(),
+          error: {
+            code: "deadline_exceeded",
+            message: "task reached its deadline before it could start",
+            retryable: false,
+          },
+        });
+        return;
+      }
       this.setState(taskId, "starting");
 
       let workerId = input.workerId;
@@ -409,7 +646,16 @@ export class TaskManager {
       if (!wrec) throw new Error(`worker disappeared: ${workerId}`);
       this.store.updateTask(taskId, { workerId, sessionId: workerId });
 
-      live.timer = setTimeout(() => this.onTimeout(taskId), this.taskTimeout(taskId));
+      // The run budget is the task's own timeout, clamped by whatever is left of
+      // its deadline — so a deadline bounds queue wait + execution end to end.
+      const budget = this.taskTimeout(taskId);
+      const remaining =
+        deadlineAt === undefined ? Number.POSITIVE_INFINITY : deadlineAt - Date.now();
+      const timeoutCode = remaining <= budget ? "deadline_exceeded" : "task_timeout";
+      live.timer = setTimeout(
+        () => this.onTimeout(taskId, timeoutCode),
+        Math.max(1, Math.min(budget, remaining)),
+      );
       this.setState(taskId, "running", { startedAt: Date.now() });
 
       // Cross-worker handoff (Phase 1): the prompt actually sent to the worker may
@@ -428,7 +674,20 @@ export class TaskManager {
       if (live.timer) clearTimeout(live.timer);
 
       if (live.abortReason === "timeout") {
-        this.setState(taskId, "timed_out", { finishedAt: Date.now() });
+        const code = live.timeoutCode ?? "task_timeout";
+        this.setState(taskId, "timed_out", {
+          finishedAt: Date.now(),
+          error: {
+            code,
+            message:
+              code === "deadline_exceeded"
+                ? `task reached its deadline${
+                    deadlineAt !== undefined ? ` (${new Date(deadlineAt).toISOString()})` : ""
+                  }`
+                : `task exceeded its ${budget}ms timeout`,
+            retryable: false,
+          },
+        });
       } else if (live.abortReason === "cancel") {
         this.setState(taskId, "cancelled", { finishedAt: Date.now() });
       } else if (turn.status === "completed") {
@@ -554,10 +813,15 @@ export class TaskManager {
     this.append(taskId, "resumed", text, data);
   }
 
-  private onTimeout(taskId: string): void {
+  /**
+   * The run budget ran out. `code` records *which* budget fired, so the settled
+   * record distinguishes `task_timeout` from `deadline_exceeded`.
+   */
+  private onTimeout(taskId: string, code: "task_timeout" | "deadline_exceeded" = "task_timeout"): void {
     const live = this.live.get(taskId);
     if (!live) return;
     live.abortReason = "timeout";
+    live.timeoutCode = code;
     this.approvals.cancelTask(taskId);
     live.controller.abort();
     if (live.workerId) void this.provider.cancelWorkerTurn(live.workerId).catch(() => {});
@@ -617,6 +881,11 @@ export class TaskManager {
       // resolves `done`) will never fire, so settle it here instead of waiting out
       // the grace period. Dequeue first so `pump()` won't start it later.
       if (!this.running.has(taskId) && this.dequeue(taskId)) {
+        // Disarm the queue-expiry timer: this task is settled by the caller now.
+        if (live.queueTimer) {
+          clearTimeout(live.queueTimer);
+          live.queueTimer = undefined;
+        }
         this.setState(taskId, "cancelled", { finishedAt: Date.now() });
         const final = this.store.getTask(taskId)!;
         live.resolveDone(final);

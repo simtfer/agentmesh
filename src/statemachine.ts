@@ -6,7 +6,9 @@ import { TERMINAL_TASK_STATUSES } from "./types.js";
  * `waiting` is NOT terminal — it must resume to running or settle.
  */
 const TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  queued: ["starting", "cancelled", "failed"],
+  // queued → timed_out is legal: a task can expire in the queue (TTL or deadline)
+  // before it ever gets a slot, and it must still reach a terminal state.
+  queued: ["starting", "cancelled", "failed", "timed_out"],
   starting: ["running", "waiting", "failed", "cancelled", "timed_out"],
   running: ["waiting", "succeeded", "failed", "cancelled", "timed_out"],
   waiting: ["running", "succeeded", "failed", "cancelled", "timed_out"],

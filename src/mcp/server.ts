@@ -115,12 +115,25 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         cwd: z.string().optional(),
         worktree: z.boolean().optional(),
         timeoutMs: z.number().int().positive().optional(),
+        deadlineMs: z.number().int().positive().optional(),
+        deadlineAt: z.number().int().positive().optional(),
         idempotencyKey: z.string().optional(),
         handoff: handoffSchema.optional(),
       },
     },
-    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, idempotencyKey, handoff }) =>
-      orch.submitTask({ prompt, profile, workerId, cwd, worktree, timeoutMs, idempotencyKey, handoff }),
+    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, deadlineMs, deadlineAt, idempotencyKey, handoff }) =>
+      orch.submitTask({
+        prompt,
+        profile,
+        workerId,
+        cwd,
+        worktree,
+        timeoutMs,
+        deadlineMs,
+        deadlineAt,
+        idempotencyKey,
+        handoff,
+      }),
     ),
   );
 
@@ -277,11 +290,12 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         profile: z.string().optional(),
         cwd: z.string().optional(),
         worktree: z.boolean().optional(),
+        deadlineMs: z.number().int().positive().optional(),
         handoff: handoffSchema.optional(),
       },
     },
-    wrap(async ({ task, workerId, profile, cwd, worktree, handoff }) => {
-      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, handoff });
+    wrap(async ({ task, workerId, profile, cwd, worktree, deadlineMs, handoff }) => {
+      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, deadlineMs, handoff });
       return r;
     }),
   );

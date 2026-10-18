@@ -23,10 +23,19 @@ workdir: .agentmesh
 # What happens to a submit that arrives while all slots are busy depends on
 # maxQueuedTasks. Left at 0 (the default), the submit is refused immediately with
 # `concurrency_limit_exceeded` — back-pressure, no waiting. Set it >0 to enable
-# real scheduling: over-cap submits park in a bounded FIFO queue and drain
+# real scheduling: over-cap submits park in a bounded queue and drain
 # automatically as running tasks settle, and only a submit that finds the queue
 # full too is refused (`queue_full`). A queued task can still be cancelled and
 # settles at once, without holding a worker.
+#
+# The queue is strict FIFO by default. Two knobs refine it:
+#   • queueTtlMs — how long a task may WAIT before it expires (`timed_out` with
+#     `queue_ttl_exceeded`) instead of being stranded behind a deep backlog.
+#   • a profile's `weight` (see `profiles:` below) — 1 is neutral; any other
+#     value switches the queue to weighted fair scheduling, so a weight-3 profile
+#     gets ~3x the dispatch slots of a weight-1 one under contention.
+# A per-task deadline (`task_submit { deadlineMs | deadlineAt }`) overrides both:
+# it covers queue wait AND execution and settles `deadline_exceeded` when hit.
 #
 # maxHandoffBytes caps how much of a finished predecessor's result a cross-worker
 # handoff (`task_submit` / `dispatch_task` with a `handoff` field) may inject into
@@ -36,7 +45,8 @@ workdir: .agentmesh
 # limits:
 #   maxDelegationDepth: 8        # default 8; lower it for tighter environments
 #   maxConcurrentTasks: 0        # 0/omitted = unlimited in-flight tasks
-#   maxQueuedTasks: 0            # 0/omitted = refuse over-cap; >0 = bounded FIFO queue
+#   maxQueuedTasks: 0            # 0/omitted = refuse over-cap; >0 = bounded queue
+#   queueTtlMs: 0                # 0/omitted = a queued task may wait forever
 #   maxOutputBytes: 1048576      # default 1 MiB of persisted result text/task
 #   maxHandoffBytes: 262144      # default 256 KiB of predecessor result injected per handoff
 

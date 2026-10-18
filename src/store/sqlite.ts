@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   sessionId TEXT,
   idempotencyKey TEXT,
   timeoutMs INTEGER NOT NULL,
+  deadlineAt INTEGER,
   createdAt INTEGER NOT NULL,
   updatedAt INTEGER NOT NULL,
   startedAt INTEGER,
@@ -42,6 +43,11 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_idem ON tasks(idempotencyKey);
 `;
 
+/** Columns added after the first release; `CREATE TABLE IF NOT EXISTS` won't add them. */
+const ADDED_COLUMNS: Array<{ table: string; column: string; decl: string }> = [
+  { table: "tasks", column: "deadlineAt", decl: "INTEGER" },
+];
+
 type Row = Record<string, unknown>;
 
 function num(v: unknown): number | undefined {
@@ -66,6 +72,7 @@ function rowToTask(r: Row): TaskRecord {
   rec.workerId = str(r.workerId);
   rec.sessionId = str(r.sessionId);
   rec.idempotencyKey = str(r.idempotencyKey);
+  rec.deadlineAt = num(r.deadlineAt);
   rec.startedAt = num(r.startedAt);
   rec.finishedAt = num(r.finishedAt);
   rec.text = str(r.text);
@@ -111,21 +118,37 @@ export class SqliteTaskStore implements TaskStore {
   constructor(dbPath: string) {
     if (dbPath !== ":memory:") mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
     this.db = new DatabaseSync(dbPath);
+    // Two processes (or two test files) may open the same DB. Without a busy
+    // timeout, any write while the other holds the write lock — including the
+    // `journal_mode` switch, the schema DDL and the forward-migration below —
+    // fails immediately with "database is locked". It must therefore be set
+    // *before* the first locking statement, not after it.
+    this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec(SCHEMA);
+    // Forward-migrate DBs created by an earlier version: additive, idempotent.
+    for (const c of ADDED_COLUMNS) this.ensureColumn(c.table, c.column, c.decl);
+  }
+
+  private ensureColumn(table: string, column: string, decl: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+    if (cols.some((c) => String(c.name) === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
   }
 
   createTask(rec: TaskRecord): void {
     this.db
       .prepare(
         `INSERT INTO tasks (taskId, profile, workerId, prompt, workingDirectory, status,
-          sessionId, idempotencyKey, timeoutMs, createdAt, updatedAt, startedAt, finishedAt,
-          text, stopReason, waitingReason, errorCode, errorMessage, errorRetryable, metadata)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          sessionId, idempotencyKey, timeoutMs, deadlineAt, createdAt, updatedAt, startedAt,
+          finishedAt, text, stopReason, waitingReason, errorCode, errorMessage, errorRetryable,
+          metadata)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         rec.taskId, rec.profile, rec.workerId ?? null, rec.prompt, rec.workingDirectory, rec.status,
-        rec.sessionId ?? null, rec.idempotencyKey ?? null, rec.timeoutMs, rec.createdAt, rec.updatedAt,
+        rec.sessionId ?? null, rec.idempotencyKey ?? null, rec.timeoutMs, rec.deadlineAt ?? null,
+        rec.createdAt, rec.updatedAt,
         rec.startedAt ?? null, rec.finishedAt ?? null, rec.text ?? null, rec.stopReason ?? null,
         rec.waitingReason ?? null, rec.error?.code ?? null, rec.error?.message ?? null,
         rec.error ? (rec.error.retryable ? 1 : 0) : null,
@@ -140,13 +163,15 @@ export class SqliteTaskStore implements TaskStore {
     this.db
       .prepare(
         `UPDATE tasks SET profile=?, workerId=?, prompt=?, workingDirectory=?, status=?,
-          sessionId=?, idempotencyKey=?, timeoutMs=?, createdAt=?, updatedAt=?, startedAt=?, finishedAt=?,
-          text=?, stopReason=?, waitingReason=?, errorCode=?, errorMessage=?, errorRetryable=?, metadata=?
+          sessionId=?, idempotencyKey=?, timeoutMs=?, deadlineAt=?, createdAt=?, updatedAt=?,
+          startedAt=?, finishedAt=?, text=?, stopReason=?, waitingReason=?, errorCode=?,
+          errorMessage=?, errorRetryable=?, metadata=?
          WHERE taskId=?`,
       )
       .run(
         next.profile, next.workerId ?? null, next.prompt, next.workingDirectory, next.status,
-        next.sessionId ?? null, next.idempotencyKey ?? null, next.timeoutMs, next.createdAt, next.updatedAt,
+        next.sessionId ?? null, next.idempotencyKey ?? null, next.timeoutMs, next.deadlineAt ?? null,
+        next.createdAt, next.updatedAt,
         next.startedAt ?? null, next.finishedAt ?? null, next.text ?? null, next.stopReason ?? null,
         next.waitingReason ?? null, next.error?.code ?? null, next.error?.message ?? null,
         next.error ? (next.error.retryable ? 1 : 0) : null,

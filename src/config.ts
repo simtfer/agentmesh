@@ -34,6 +34,7 @@ const Profile = z.object({
   env: z.record(z.string()).optional(),
   permissionMode: z.string().optional(),
   worktree: z.boolean().optional(),
+  weight: z.number().positive().optional(),
   mock: MockBehavior.optional(),
   remote: RemoteSettings.optional(),
   description: z.string().optional(),
@@ -73,6 +74,7 @@ const ConfigSchema = z.object({
       maxConcurrentTasks: z.number().int().nonnegative().optional(),
       maxOutputBytes: z.number().int().nonnegative().optional(),
       maxQueuedTasks: z.number().int().nonnegative().optional(),
+      queueTtlMs: z.number().int().nonnegative().optional(),
       maxHandoffBytes: z.number().int().nonnegative().optional(),
     })
     .optional(),

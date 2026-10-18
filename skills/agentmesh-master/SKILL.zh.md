@@ -50,7 +50,9 @@ agent_list ─▶ 规划/拆解 ─▶ scheduler_status ─▶ task_submit（×N
 2. **拆解。** 把目标拆成*最小的一组可独立验证*的子任务。每个子任务的 prompt 必须自包含：
    worker 看不到你的对话。写清目标、约束、期望的输出形态，以及工作目录 / 是否需要 worktree。
 3. **看容量。** `scheduler_status` → 若 `running` 已到 `maxConcurrentTasks` 且队列在涨，
-   就先提交一小批，剩下的等有任务结算后再提。
+   就先提交一小批，剩下的等有任务结算后再提。排队的任务有寿命：子任务有硬时限时传
+   `deadlineMs`——它同时覆盖排队 **和** 执行，超时结算为 `timed_out`/`deadline_exceeded`，
+   不会无限期挂着。
 4. **扇出（异步）。** 每个子任务一个 `task_submit`。任何可能重试的任务都带
    `idempotencyKey`，这样重提会去重，而不是把一个非幂等 worker 跑两遍。并行的*写*任务用
    `worktree: true`，让 worker 之间绝不碰同一批文件。

@@ -44,6 +44,10 @@ export interface DispatchInput {
   cwd?: string;
   worktree?: boolean;
   timeoutMs?: number;
+  /** End-to-end budget (ms) covering queue wait + execution. */
+  deadlineMs?: number;
+  /** Absolute epoch-ms deadline; earlier wins over `deadlineMs`. */
+  deadlineAt?: number;
   /** Cross-worker handoff (Phase 1): inject a predecessor's result as untrusted context. */
   handoff?: HandoffSpec;
   /** live task-event stream (also persisted to the store) */
@@ -113,6 +117,13 @@ export class Orchestrator {
       maxConcurrentTasks: config.limits?.maxConcurrentTasks,
       maxOutputBytes: config.limits?.maxOutputBytes,
       maxQueuedTasks: config.limits?.maxQueuedTasks,
+      queueTtlMs: config.limits?.queueTtlMs,
+      // A profile's `weight` opts the queue into weighted fair scheduling; unknown
+      // profiles (a task referencing a missing name) fall back to the neutral 1.
+      profileWeight: (name) => {
+        const w = this.config.profiles.find((p) => p.name === name)?.weight;
+        return typeof w === "number" && Number.isFinite(w) && w > 0 ? w : 1;
+      },
       maxHandoffBytes: config.limits?.maxHandoffBytes,
     });
   }
@@ -243,13 +254,15 @@ export class Orchestrator {
         cwd: input.cwd,
         worktree: input.worktree,
         timeoutMs: input.timeoutMs,
+        deadlineMs: input.deadlineMs,
+        deadlineAt: input.deadlineAt,
         handoff: input.handoff,
       },
       { onEvent: input.onEvent },
     );
     // dispatch is the synchronous convenience: keep waiting through any `waiting`
     // (approval) states until the task is terminal or the budget is exhausted.
-    const deadline = Date.now() + (submitted.timeoutMs ?? 0) + 5000;
+    const deadline = Math.min(Date.now() + (submitted.timeoutMs ?? 0) + 5000, submitted.deadlineAt ?? Number.POSITIVE_INFINITY);
     let rec = await this.tasks.wait(submitted.taskId, Math.max(0, deadline - Date.now()));
     while (rec && rec.status === "waiting" && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 50));
