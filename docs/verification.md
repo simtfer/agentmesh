@@ -17,14 +17,14 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 108 tests, offline, ~25s
+npm test            # 119 tests, offline, ~26s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
 npm run real        # real local opencode + pi workers (needs both installed & authenticated)
 ```
 
-`npm test` runs the eight files below with `tsx --test`. Nothing is skipped, nothing
+`npm test` runs the nine files below with `tsx --test`. Nothing is skipped, nothing
 is marked `todo`, and no test asserts a mock's internal calls in place of
 observable behaviour — each one drives the public surface (Orchestrator, MCP
 tools, or the daemon's HTTP/WS endpoints) and checks the resulting task record.
@@ -176,6 +176,41 @@ observable without changing the prompt.
 - **Clamping.** `limits.maxRetryAttempts: 2` caps a `maxAttempts: 99` request.
 - **Persistence.** `dependsOn`, `blockedBy`, `attempt`, `maxAttempts` and `retryAt`
   survive a SQLite round trip and an update to an empty `blockedBy`.
+
+## `test/budget.test.ts` — 11 cases
+
+Two guards on what a fan-out costs *while it runs*: approval width and spend.
+
+- **Approval width.** With `limits.maxWaitingTasks: 1`, the first task parks on its
+  permission request; the second is **denied on the spot** — it never enters
+  `waiting`, no approval is queued for it, and the refusal is written to its
+  timeline as an `approval_budget` event. Answering the first still resumes it
+  normally. With no cap both park, which is the regression guard for the default.
+- **Token ceiling.** A task reporting 1000 tokens against `budget.maxTokens: 100`
+  settles `failed` / `budget_exceeded` / `retryable: false`, with
+  `metadata.budget = { exceeded: true, totalTokens: 1000 }` — the record says what
+  it actually spent, and the spend itself stays attached to the task.
+- **Within budget.** 10 tokens against a 100 ceiling succeeds and carries no
+  budget record at all.
+- **Cost ceiling.** Applies in its own currency (0.5 USD against a 0.2 USD cap
+  fails). Written in another currency it **does not apply**: the task succeeds and
+  the timeline carries exactly one `budget_currency_mismatch` event.
+- **One allowance per task, not per attempt.** A task with a 40-token ceiling that
+  spends 30 and fails its first attempt is stopped on the second: the recorded
+  total is 60, because the retry's spend was added to the first's rather than
+  measured alone.
+- **Overspending is never retried**, even with `retry.maxAttempts: 3`: the record
+  stays at attempt 1 with no `metadata.attempts`.
+- **Process ceilings.** After one 100-token task against
+  `limits.maxTotalTokens: 50`, the next submit is refused synchronously with
+  `budget_exhausted` and spawns no worker — while the task already accepted is
+  left to finish.
+- **Headroom is queryable.** `usage_summary().budget` starts at
+  `{ exhausted: false, spentTokens: 0 }`, then reports 100 / exhausted / the
+  reason string once the ceiling is crossed.
+- **Currency isolation.** 10 USD of spend against a 0.1 CNY process ceiling leaves
+  the budget open: `budget.spentCost` shows `[{ USD, 10 }]` and the next submit is
+  admitted.
 
 ## `test/remote.test.ts` — 18 cases
 

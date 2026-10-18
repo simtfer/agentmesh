@@ -100,6 +100,14 @@ const ConfigSchema = z.object({
       maxHandoffBytes: z.number().int().nonnegative().optional(),
       maxRetryAttempts: z.number().int().positive().optional(),
       maxDependencies: z.number().int().positive().optional(),
+      maxWaitingTasks: z.number().int().nonnegative().optional(),
+      maxTotalTokens: z.number().int().nonnegative().optional(),
+      maxTotalCost: z
+        .object({
+          amount: z.number().nonnegative(),
+          currency: z.string().optional(),
+        })
+        .optional(),
     })
     .optional(),
 });

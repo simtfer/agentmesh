@@ -37,6 +37,21 @@ const handoffSchema = z.object({
 });
 
 /**
+ * Per-task spend ceiling. Omitted = only wall-clock limits apply. Enforced on
+ * every usage report: a breach aborts the turn and settles the task
+ * `failed` (`budget_exceeded`), counted across all attempts and never retried.
+ */
+const budgetSchema = z.object({
+  maxTokens: z.number().int().positive().optional(),
+  maxCost: z
+    .object({
+      amount: z.number().nonnegative(),
+      currency: z.string().optional(),
+    })
+    .optional(),
+});
+
+/**
  * Automatic retry (Stage 5). Opt-in: omit it and a task settles on its first
  * failure. `maxAttempts` counts total runs including the first, and is clamped by
  * `limits.maxRetryAttempts`; admission refusals are never retried.
@@ -140,9 +155,10 @@ export function createMcpServer(orch: Orchestrator): McpServer {
             "Task IDs that must settle `succeeded` before this task starts. A dependency that fails fails this task (`dependency_failed`). Needs limits.maxQueuedTasks > 0.",
           ),
         retry: retrySchema.optional(),
+        budget: budgetSchema.optional(),
       },
     },
-    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, deadlineMs, deadlineAt, idempotencyKey, handoff, outputSchema, dependsOn, retry }) =>
+    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, deadlineMs, deadlineAt, idempotencyKey, handoff, outputSchema, dependsOn, retry, budget }) =>
       orch.submitTask({
         prompt,
         profile,
@@ -157,6 +173,7 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         outputSchema,
         dependsOn,
         retry,
+        budget,
       }),
     ),
   );
@@ -270,7 +287,7 @@ export function createMcpServer(orch: Orchestrator): McpServer {
     {
       title: "Token and cost roll-up",
       description:
-        "Roll up token usage and cost across tasks, optionally filtered by profile and start time. Only tasks whose worker reported usage are counted in `reporting`; costs are grouped by currency and never summed across currencies. Use it to see what a fan-out actually cost before launching another.",
+        "Roll up token usage and cost across tasks, optionally filtered by profile and start time. Only tasks whose worker reported usage are counted in `reporting`; costs are grouped by currency and never summed across currencies. The `budget` block reports headroom against `limits.maxTotalTokens` / `maxTotalCost` for this process, so check it before launching a batch rather than discovering `budget_exhausted` on the next submit.",
       inputSchema: {
         profile: z.string().optional(),
         since: z.number().int().positive().optional(),
@@ -338,10 +355,11 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         outputSchema: z.record(z.unknown()).optional(),
         dependsOn: z.array(z.string()).optional(),
         retry: retrySchema.optional(),
+        budget: budgetSchema.optional(),
       },
     },
-    wrap(async ({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry }) => {
-      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry });
+    wrap(async ({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry, budget }) => {
+      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry, budget });
       return r;
     }),
   );

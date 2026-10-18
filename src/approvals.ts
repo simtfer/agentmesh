@@ -56,6 +56,11 @@ export class ApprovalBroker {
     return this.pending.get(id)?.taskId;
   }
 
+  /** How many requests are currently blocking a task. */
+  size(): number {
+    return this.pending.size;
+  }
+
   listPending(taskId?: string): PendingApproval[] {
     return [...this.pending.values()]
       .filter((p) => (taskId ? p.taskId === taskId : true))

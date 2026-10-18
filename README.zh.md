@@ -171,7 +171,7 @@ worker 撞上高风险工具（ACP permission request）或需要补充输入（
 | `task_cancel` | 请求取消（worker 确认后才结算） |
 | `list_tasks` | 列出任务，可按状态过滤 |
 | `scheduler_status` | 运行/排队/依赖阻塞计数、已配置上限（`maxQueuedTasks`、`queueTtlMs`）、按派发顺序排列的队列，以及每项的权重 / 等待时长 / 距过期时间 |
-| `usage_summary` | 跨任务汇总 token/成本（可按 `profile`、`since` 过滤），成本按币种分组 |
+| `usage_summary` | 跨任务汇总 token/成本（可按 `profile`、`since` 过滤），成本按币种分组，并报告对进程级天花板的余量（`budget.exhausted`、`budget.spentTokens`、`maxTotalTokens`） |
 | `pending_approvals` | 阻塞某个 `waiting` 任务的审批/elicitation 请求 |
 | `task_approve` | 处理权限请求（允许/拒绝/取消） |
 | `task_respond` | 回答 elicitation 请求 |
@@ -344,15 +344,22 @@ master (machine A)                              worker daemon (machine B)
 - **依赖（`dependsOn`）。** 任务可以声明若干个必须结算为 `succeeded` 的前置任务。它被受理时即为 `queued` 并带一份 `blockedBy` 清单，**不进派发队列**（因此不占槽位、不干扰队列顺序），最后一个依赖成功的那一刻才入队。依赖以任何其他方式结束，都会让该任务以 `dependency_failed` 失败且**不启动 worker**，并且这一失败会沿链向下级联，所以断掉的 DAG 会整体塌陷而不是留下一串永远卡住的任务；取消时 `blockedBy` 同样会清理。被门控的任务计入 `maxQueuedTasks`（它就是「已受理但在等调度器」的工作），因此 `dependsOn` 要求 `maxQueuedTasks > 0`，否则以 `dependency_requires_queue` 拒收。队列 TTL 从任务*就绪*时开始计；每任务截止时间仍然覆盖全程等待。
 - **重试（`retry`）。** 逐任务选择性开启：`{ maxAttempts, delayMs, backoff, maxDelayMs, onlyRetryable }`。一个真正跑过的尝试失败或超时后不会直接结算，而是（按退避）重新入队，直到总次数用完——期间记录从不落到终态，所以 `task_wait` 会跨越所有尝试，依赖它的任务也继续等。受理阶段的拒绝（队满、超深度、交接不合法……）永不重试：它们根本没到过 worker。每次尝试都用新的 worker/AbortController，失败的尝试归档进 `metadata.attempts`（状态、错误、时间、花费、有上限的文本预览），token/成本**跨尝试累加**——因为每次尝试都真的花掉了。`limits.maxRetryAttempts`（默认 5）限制调用方能要到的上限。
 
+- **花费预算（`budget`）。** 墙钟预算约束的是*时间*，这个约束的是*钱*——而钱是截止时间抓不住的那类失控：一个 agent 可以两秒钟干完活，同时烧掉一大笔。`{ maxTokens, maxCost }` 在**每次用量上报时**检查，所以越界会在回合中途叫停，而不是事后才在 `usage_summary` 里看到。它统计**所有尝试**（重试不会得到新额度——钱已经花掉了），以 `budget_exceeded` 结算为 `failed`，且**永不重试**。成本上限只对同一币种的上报生效；币种不一致时只在任务时间线上记一次 `budget_currency_mismatch` 并忽略该上限——把 0.02 USD 和 0.02 CNY 相比是单位错误，不是限额。
+- **审批宽度（`limits.maxWaitingTasks`）。** 限制同时有多少个任务能挂在审批上。超过上限后，新的权限请求会**当场被拒**而不是挂起：worker 拿不到这个工具但继续干活，拒绝写在任务时间线上（`approval_budget` 事件）。一个扇出如果堆了一百个没人回答的问题，它不是在进行，而是在消耗并发槽。
+- **进程级天花板（`limits.maxTotalTokens`、`limits.maxTotalCost`）。** 运行中的累计量越过任一条后，新的提交以 `budget_exhausted` 拒收；**已受理的任务照常跑完**，因为取消它既找不回结果也退不了钱。`usage_summary` 会报告余量（`budget.exhausted`、`budget.spentTokens`），让 master 在发起下一批**之前**就能查，而不是等到被拒才发现。
+
 ```jsonc
 // B 只有在 A 和 C 都成功后才跑；A/C 之一挂掉，B 立刻失败。
 task_submit({ "prompt": "…", "profile": "pi", "dependsOn": ["<taskA>", "<taskC>"] })
 // 同一个任务，最多重试 3 次，退避 0.5s / 1s 后放弃。
 task_submit({ "prompt": "…", "profile": "pi",
               "retry": { "maxAttempts": 3, "delayMs": 500, "backoff": "exponential" } })
+// 这个任务一旦超过 5 万 token 或 0.2 美元就停。
+task_submit({ "prompt": "…", "profile": "pi",
+              "budget": { "maxTokens": 50000, "maxCost": { "amount": 0.2, "currency": "USD" } } })
 ```
 
-两者都是逐任务选择性开启；两个字段都不传时行为不变（有空槽就启动，首次失败即结算）。
+三者都是逐任务选择性开启；这些字段都不传时行为不变（有空槽就启动，首次失败即结算）。
 
 ## 排障
 
@@ -369,6 +376,8 @@ task_submit({ "prompt": "…", "profile": "pi",
 | `dependency_limit_exceeded` | `dependsOn` 条数超过 `limits.maxDependencies`（默认 16） | 拆分扇入，或调大上限 |
 | `deadline_exceeded` | 触到 `deadlineMs`/`deadlineAt`——可能在排队中，也可能在运行中 | 给更大预算；若它全程没启动过，那是容量问题，不是任务问题 |
 | `task_timeout` | 运行超过 `timeoutMs`（不涉及截止时间） | 给长回合调大 `timeoutMs` |
+| `budget_exceeded` | 任务越过自身 `budget`（token 和/或成本） | 调高上限，或把活拆小；它永不重试 |
+| `budget_exhausted` | 进程已用掉 `limits.maxTotalTokens` / `maxTotalCost`，新提交被拒 | 调高上限或换个新进程；已受理的任务仍会跑完 |
 | `delegation_depth_exceeded` | 委派链达到 `maxDelegationDepth` | 通常是 master 在循环委派——先查链路再考虑抬上限 |
 | `handoff_unknown_task` | `handoff.fromTaskId` 找不到对应任务 | 核对 id；另一个 `workdir` 下的任务在这里不可见 |
 | `handoff_predecessor_not_ready` | 前驱任务还没到 `succeeded` | 先 `task_wait` 它；失败/取消的输出永远不会被交接 |
@@ -442,14 +451,14 @@ docs/
 
 ```bash
 npm run typecheck   # tsc --noEmit，干净
-npm test            # 108 个测试，全离线，无 API 费用，约 25 秒
+npm test            # 119 个测试，全离线，无 API 费用，约 26 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
 npm run deploy:tls  # 在本机真实网卡上跑 TLS/mTLS（不走 loopback）
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **108/108**，分八个文件——生命周期、持久化与守卫（32），交接产物（12），结果契约与用量（10），依赖与重试（18），远程 daemon（18），部署 TLS 与审计轮转（8），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
+`npm test` 为 **119/119**，分九个文件——生命周期、持久化与守卫（32），交接产物（12），结果契约与用量（10），依赖与重试（18），预算与审批（11），远程 daemon（18），部署 TLS 与审计轮转（8），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
 
 最近一次在 Windows + Node v22.22 上运行。真实的 OpenCode 与 Pi worker 也已端到端跑通（`npm run real`：两者都到达 `succeeded`，共持久化 2 个任务 / 27 条事件）。
 
@@ -472,11 +481,12 @@ npm run real        # 本机真实的 opencode + pi（两者都需已安装并�
 - ✅ 结构化结果契约（`outputSchema`，强制生效——违约即失败）与从 ACP `usage_update` 事件汇总的 token/成本，按任务记录并经 `usage_summary` 聚合。
 - ✅ DAG 依赖（`dependsOn`：就绪才入队、失败/取消级联、计入队列容量）与可选重试（固定/指数退避、尝试归档、花费跨尝试累加）。
 - ✅ 部署补强：可选双向 TLS；证书/密钥/CA 支持路径与内联 PEM 并在启动时报 `tls_invalid`（而不是让对方看到一句莫名的握手失败）；按大小轮转的审计日志；systemd 单元 / Windows 计划任务；防火墙规则；以及在本机真实网卡上验证过的双机部署手册（`npm run deploy:tls`）。
+- ✅ 花费与审批预算：逐任务 `budget`（token/成本，回合中途叫停且永不重试）、`limits.maxWaitingTasks` 限制审批宽度，以及进程级 `maxTotalTokens`/`maxTotalCost` 天花板——越过后新提交被拒。
 
 接下来：
 
-- **审批与成本预算**——限制一次扇出最多能挂起多少个 `waiting` 任务，超了就必须停下来问人；并让任务带上一个由 `usage_summary` 结算的成本上限。
 - **可选 Web 控制台**——审计日志与 `scheduler_status` 已经提供了只读视图所需的数据。
+- **跨机交接产物**——远程后继目前会拒绝 `diff`/`predecessor` 交接（`handoff_artifact_unavailable`），因为产物是 master 本地磁盘上的文件。
 
 这些决定背后的设计笔记、被否决的替代方案与分阶段构建过程：[docs/PLAN.md](docs/PLAN.md)（英文）。
 

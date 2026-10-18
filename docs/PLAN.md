@@ -25,7 +25,7 @@
    **Stage 5 并行调度**已落地核心：有界队列 + 单一 queue owner（`limits.maxQueuedTasks` 开启排队，
    `scheduler_status` 可观测），队列 TTL 与截止时间（`limits.queueTtlMs`、`task_submit{deadlineMs|deadlineAt}`）、
    跨 profile 加权公平（profile `weight`，WFQ finish tag）亦已实现并测试；叠加此前的并发/输出/递归上限。
-   余下重点是 **Stage 5 的进阶调度**（DAG 依赖 ✅、重试 ✅、审批/成本预算 ⏳）与
+   余下重点是 **Stage 5 的进阶调度**（DAG 依赖 ✅、重试 ✅、审批/成本预算 ✅）与
    **可选 Web 控制台**；**远程生产化补强**（开机启动、日志轮转、防火墙、双机 TLS 手册）已落地。
 
 ---
@@ -50,8 +50,8 @@
 | CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 干净通过；`npm test` **108/108**（tasks(32) + handoff(12) + contract(10) +
-dag(18) + remote(18) + deploy(8) + orchestrator(6) + skill(4)）；
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **119/119**（tasks(32) + handoff(12) + contract(10) +
+dag(18) + budget(11) + remote(18) + deploy(8) + orchestrator(6) + skill(4)）；
 `npm run demo` 双场景闭环 `CLOSED ✅`；`npm run smoke` 真实 MCP stdio 全生命周期
 （`accepted, started, output…, waiting, resumed, output…, completed`）；`npm run real`
 对**真实 opencode + pi** 走 `submit → wait → result`，均 `succeeded`（2 任务 / 27 事件入库）。
@@ -273,7 +273,7 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 - ✅ 独立 git worktree（代码已备）；失败/超时/取消路径均有测试（`test/tasks.test.ts` 的调度用例：
   排队并 FIFO 出队、队满拒绝、取消排队任务即时结算、并发扇出受 `maxConcurrentTasks` 约束、队列 TTL 过期、
   排队/运行两种 deadline 命中、默认权重保序 + `weight: 3` 抢占前 4 个名额中的 3 个）。
-- ⏳ DAG **依赖与重试已落地**（见下）；余下为人工审批预算（一次扇出最多挂起多少个 `waiting`）与可选 Web 控制台。
+- ✅ DAG **依赖与重试已落地**（见下），审批预算（`limits.maxWaitingTasks`）与花费预算（任务级 `budget`、进程级 `maxTotalTokens`/`maxTotalCost`）亦已落地；余下为可选 Web 控制台。
   - ✅ **DAG 依赖**：`task_submit`/`dispatch_task` 的 `dependsOn`（受理期校验：未知任务 `dependency_unknown_task`、
     已失败/取消/超时的前置 `dependency_failed`、超过 `limits.maxDependencies` 的 `dependency_limit_exceeded`、
     未开队列的 `dependency_requires_queue`）。被门控任务以 `queued` + `blockedBy` 受理，**不进派发队列**
@@ -300,7 +300,7 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 远程认证 + TLS/可信通道；不向局域网暴露未保护的 ACP stdio 桥；工作目录白名单；命令/工具权限最小化；
 密钥从环境变量或安全凭证存储读取（**不入配置文件/版本库**）；结构化审计日志；超时/最大并发/输出大小限制
 （✅ `limits.maxConcurrentTasks` + 有界 FIFO 队列 `maxQueuedTasks` + `maxOutputBytes` 已落地）；
-**防无限递归委派**（Master 也是 Agent，需深度/预算上限；✅ 深度上限已落地，预算上限待 Stage 5 进阶）；
+**防无限递归委派**（Master 也是 Agent，需深度/预算上限；✅ 深度上限与花费/审批预算均已落地）；
 Agent 输出视为不可信；不可逆操作人工确认；记录 Agent/Adapter/协议版本。
 
 **落地状态**：远程认证/TLS ✅、工作目录白名单 ✅、密钥仅存环境 ✅、零停机密钥轮换 ✅、结构化审计日志（NDJSON，密钥仅记指纹、不落不可信文本）✅、超时 ✅、
@@ -327,7 +327,7 @@ acpx 会话作用域按 `(agentCommand, cwd, sessionKey)` 精确匹配，跨目�
 | Agent 要求人工输入 | `waiting` 态 + 批准接口 |
 | 远程权限过大 | 白名单、最小权限、审计、人工审批 |
 | **acpx pre-1.0 接口演进** | 锁 `acpx` 版本；封装在 `adapter-acp` 内，隔离上游变更 |
-| **递归委派失控** | ✅ 深度上限 `limits.maxDelegationDepth` + `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播；达上限的 submit 失败且不 spawn worker（预算上限待 Stage 5） |
+| **递归委派失控** | ✅ 深度上限 `limits.maxDelegationDepth` + `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播；达上限的 submit 失败且不 spawn worker。宽度与金额另由 `limits.maxWaitingTasks`、任务级 `budget`、进程级 `maxTotalTokens`/`maxTotalCost` 约束 |
 | **资源耗尽（并发/输出爆炸）** | ✅ `limits.maxConcurrentTasks` 限制在飞任务数（超限 submit 失败不 spawn）；`limits.maxOutputBytes` 截断超长结果并按 UTF-8 边界安全裁剪、标记 `outputTruncated` |
 
 ---
@@ -362,7 +362,7 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    `maxOutputBytes` / 递归深度上限；队列 TTL（`queueTtlMs`）、每任务截止时间（`deadlineMs`/`deadlineAt`）、
    跨 profile 加权公平（`weight` + WFQ finish tag）亦已落地并测试；多 worktree 并行代码已备；失败/超时/取消路径
    均有并发测试（`test/tasks.test.ts`）。
-   ⏳ 进阶：审批/成本预算、可选 Web 控制台。（DAG 依赖与可配置重试已完成，见下。）
+   ✅ 进阶：审批/成本预算已落地（见 §10），可选 Web 控制台待做。（DAG 依赖与可配置重试已完成。）
 2. **远程生产化补强**：状态对账（`query`）、推送式续订（`attach` + orphan 宽限）、透明自动重连（`resume`）、
    **零停机密钥轮换**（多 token + `SIGHUP`/`reloadTokens()`）、**结构化审计日志**（NDJSON，密钥仅记指纹）均已落地。
    ✅ 后续补强已完成：**可选双向 TLS**（配置 `daemon.tls.ca` 即强制客户端证书，握手拒绝记 `tls_reject`）、
@@ -407,7 +407,7 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    - 偏差说明：schema 本身不落库（只存 `structured` 与 `outputContract` 判定）——它是提交者的输入，重放时由调用方提供；
      避免每条任务记录被 16 KiB schema 撑大。`$schema` 声明其他草案时被忽略而非报错。
 6. ~~**递归守卫**~~ ✅ 已落地：`limits.maxDelegationDepth`（默认 8）+ `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播，
-   达上限的 submit 以 `delegation_depth_exceeded` 失败且不 spawn worker（预算上限并入 Stage 5）。
+   达上限的 submit 以 `delegation_depth_exceeded` 失败且不 spawn worker（花费/审批预算见 §10）。
    ~~最大并发 / 单任务输出大小上限~~ ✅ 亦已落地（见 §7）。
 7. ~~**Stage 5 · DAG 依赖与可配置重试**~~ ✅ 已落地：`dependsOn` 门控（受理期拒绝未知/已失败/超扇入/无队列，
    就绪才入队，失败与取消沿链级联，计入 `maxQueuedTasks`）与 `retry`（`maxAttempts`/`delayMs`/`fixed|exponential`/
@@ -417,6 +417,19 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
 9. ~~**Stage 6 · 远程部署补强**~~ ✅ 已落地：可选 mTLS、TLS 材料路径解析（`tls_invalid` 前置报错）、审计日志按大小轮转、
    systemd / Windows 计划任务开机启动、防火墙规则与 `docs/deploy.md` 双机手册；`npm run deploy:tls` 在本机真实网卡上
    跑通 9/9 检查。8 项新用例见 `test/deploy.test.ts`（测试总数 100 → 108）。
+10. ~~**Stage 7 · 花费与审批预算**~~ ✅ 已落地，三层各自回答一个不同的问题：
+    - **任务级 `budget: { maxTokens, maxCost }`** —— 墙钟管时间，这个管钱。每次 `usage` 上报时检查（不是事后），
+      越界即 abort、以 `budget_exceeded` 结算为 `failed`，**次数统计跨所有尝试**（`usageBase` 已合并进判定，
+      重试不会拿到新额度），且 `scheduleRetry` 显式拒绝重试它（重放只会再花一次）。成本上限只在币种一致时比较；
+      不一致时**不生效**并在时间线上记一次 `budget_currency_mismatch`——把 2 分美元和 2 分人民币相比是单位错误，
+      静默放行则更糟，所以选「明确不适用 + 留痕」。
+    - **`limits.maxWaitingTasks`** —— 审批宽度。达到上限后新权限请求**当场拒绝**（`reject_once` / `decline`）
+      而非挂起：worker 少一个工具但继续干活，扇出不会堆出一堵没人回答的问题墙、也不会白占并发槽。
+      记 `approval_budget` 事件，让运维能区分「预算决策」和「审批链路坏了」。
+    - **`limits.maxTotalTokens` / `maxTotalCost`** —— 进程级天花板。累计账由 `rollUpUsage` 的**增量**维护
+      （ACP 报的是累计值，逐次相加会重复计费），越过后只拒新提交（`budget_exhausted`），**已受理的任务照常跑完**：
+      取消它既找不回结果也退不了钱。`usage_summary` 增加 `budget` 段暴露余量，让 master 能在发下一批**之前**查。
+    11 项新用例见 `test/budget.test.ts`（测试总数 108 → 119）。
 
-> Stage 0–3 已完成并通过 108 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总，以及远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证）。
-> 下一步：跨物理链路实跑（DNS/路由/防火墙）、Stage 5 余项（审批/成本预算）与可选 Web 控制台。
+> Stage 0–3 已完成并通过 119 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算）。
+> 下一步：跨物理链路实跑（DNS/路由/防火墙）、跨机交接产物传输与可选 Web 控制台。

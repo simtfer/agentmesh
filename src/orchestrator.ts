@@ -5,6 +5,7 @@ import type {
   MeshConfig,
   PermissionDecision,
   RetryPolicy,
+  TaskBudget,
   TaskEvent,
   TaskRecord,
   TaskStatus,
@@ -58,6 +59,8 @@ export interface DispatchInput {
   dependsOn?: string[];
   /** Automatic retry policy for this task. Omitted = settle on the first failure. */
   retry?: RetryPolicy;
+  /** Spend ceiling for this task (tokens and/or cost), enforced while it runs. */
+  budget?: TaskBudget;
   /** live task-event stream (also persisted to the store) */
   onEvent?: (ev: TaskEvent) => void;
 }
@@ -139,6 +142,9 @@ export class Orchestrator {
       maxHandoffBytes: config.limits?.maxHandoffBytes,
       maxRetryAttempts: config.limits?.maxRetryAttempts,
       maxDependencies: config.limits?.maxDependencies,
+      maxWaitingTasks: config.limits?.maxWaitingTasks,
+      maxTotalTokens: config.limits?.maxTotalTokens,
+      maxTotalCost: config.limits?.maxTotalCost,
       // Handoff artifacts (diff sidecars) live next to the rest of the per-repo
       // state, and snapshots are only usable when both tasks share this repo.
       workdir: this.workdir,
@@ -289,6 +295,7 @@ export class Orchestrator {
         outputSchema: input.outputSchema,
         dependsOn: input.dependsOn,
         retry: input.retry,
+        budget: input.budget,
       },
       { onEvent: input.onEvent },
     );

@@ -13,7 +13,7 @@ import type {
 } from "./types.js";
 import { DEFAULT_MAX_DELEGATION_DEPTH, DEFAULT_MAX_HANDOFF_BYTES } from "./types.js";
 import { DEFAULT_MAX_DEPENDENCIES, DEFAULT_MAX_RETRY_ATTEMPTS } from "./types.js";
-import type { HandoffSpec, RetryPolicy } from "./types.js";
+import type { HandoffSpec, RetryPolicy, TaskBudget } from "./types.js";
 import { isTerminal, canTransition } from "./statemachine.js";
 import type { ApprovalBroker } from "./approvals.js";
 import type { WorkerRecord } from "./registry.js";
@@ -65,9 +65,17 @@ interface LiveTask {
   retrying?: boolean;
   /** true once `run()` has begun an attempt (a retryable failure must have run) */
   attemptStarted?: boolean;
-  abortReason?: "timeout" | "cancel";
+  abortReason?: "timeout" | "cancel" | "budget";
   /** which budget fired when `abortReason === "timeout"` */
   timeoutCode?: "task_timeout" | "deadline_exceeded";
+  /**
+   * Why the task was stopped for overspending, captured at the moment of the
+   * breach: by the time the turn unwinds, another usage report could have moved
+   * the numbers, and the audit should say what actually tripped the limit.
+   */
+  budgetBreach?: { message: string; usage: TaskUsage };
+  /** set once the cost ceiling turned out to be in an incomparable currency */
+  budgetCurrencyWarned?: boolean;
   /** the original submit input, retained so a queued task can be started later */
   input: TaskSubmitInput;
   done: Promise<TaskRecord>;
@@ -186,6 +194,19 @@ export interface TaskManagerOptions {
    * consumes a queue slot. 0/undefined → `DEFAULT_MAX_DEPENDENCIES`.
    */
   maxDependencies?: number;
+  /**
+   * Approval-width cap: how many tasks may sit in `waiting` at once. 0/undefined
+   * = unlimited. Past it, a permission request is denied on the spot rather than
+   * parked, so a wide fan-out cannot bury the master in unanswerable questions.
+   */
+  maxWaitingTasks?: number;
+  /**
+   * Whole-process spend ceilings. Crossing either refuses *new* submits
+   * (`budget_exhausted`); accepted work keeps running, because stopping it
+   * mid-turn would waste what it already spent without refunding it.
+   */
+  maxTotalTokens?: number;
+  maxTotalCost?: { amount: number; currency?: string };
 }
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -247,8 +268,34 @@ function mergeUsage(base: TaskUsage | undefined, add: TaskUsage | undefined): Ta
   return out;
 }
 
-/** Delay before attempt N+1, honouring the policy's backoff and its own cap. */
-function retryDelay(policy: RetryPolicy, attempt: number): number {
+/**
+ * Best available total for a usage record. Adapters that report `totalTokens`
+ * give it directly; otherwise input+output is the honest approximation (cached
+ * and thought tokens are included in those by every adapter seen so far).
+ */
+function totalTokensOf(u: TaskUsage | undefined): number {
+  if (!u) return 0;
+  if (u.totalTokens !== undefined) return u.totalTokens;
+  return (u.inputTokens ?? 0) + (u.outputTokens ?? 0);
+}
+
+/** Two cost figures are comparable only when they name the same currency. */
+function sameCurrency(
+  a: { currency?: string },
+  b: { currency?: string },
+): boolean {
+  return a.currency === b.currency;
+}
+
+/**
+ * Bucket key for a cost. An unreported currency is its own bucket rather than
+ * being merged into a named one — "unknown" is not the same claim as "USD".
+ */
+function costKey(c: { currency?: string }): string {
+  return c.currency ?? "";
+}
+
+/** Delay before attempt N+1, honouring the policy's backoff and its own cap. */function retryDelay(policy: RetryPolicy, attempt: number): number {
   const base = Math.max(0, Math.trunc(policy.delayMs ?? 0));
   const raw = policy.backoff === "exponential" ? base * 2 ** Math.max(0, attempt - 1) : base;
   const cap = policy.maxDelayMs !== undefined && policy.maxDelayMs >= 0 ? policy.maxDelayMs : 300_000;
@@ -290,6 +337,18 @@ export class TaskManager {
   private maxHandoffBytes: number;
   private maxRetryAttempts: number;
   private maxDependencies: number;
+  private maxWaitingTasks: number;
+  private maxTotalTokens: number;
+  private maxTotalCost?: { amount: number; currency?: string };
+  /**
+   * Per-task spend as it stood at the last usage report. ACP reports cumulative
+   * totals, so the process-wide roll-up is the sum of *deltas* here — adding
+   * each report verbatim would count the same tokens again on every update.
+   */
+  private spentByTask = new Map<string, { tokens: number; cost?: { amount: number; currency?: string } }>();
+  private spentTokens = 0;
+  /** spend per currency; never summed across currencies, same rule as usageSummary */
+  private spentCostByCurrency = new Map<string, number>();
   private profileWeight: (profile: string) => number;
   private workdir: string;
   private baseRepo: string;
@@ -324,6 +383,9 @@ export class TaskManager {
     this.maxHandoffBytes = Math.max(0, Math.trunc(opts.maxHandoffBytes ?? DEFAULT_MAX_HANDOFF_BYTES));
     this.maxRetryAttempts = Math.max(1, Math.trunc(opts.maxRetryAttempts ?? DEFAULT_MAX_RETRY_ATTEMPTS));
     this.maxDependencies = Math.max(1, Math.trunc(opts.maxDependencies ?? DEFAULT_MAX_DEPENDENCIES));
+    this.maxWaitingTasks = Math.max(0, Math.trunc(opts.maxWaitingTasks ?? 0));
+    this.maxTotalTokens = Math.max(0, Math.trunc(opts.maxTotalTokens ?? 0));
+    this.maxTotalCost = opts.maxTotalCost;
     this.workdir = path.resolve(opts.workdir ?? ".agentmesh");
     this.baseRepo = path.resolve(opts.baseRepo ?? process.cwd());
     this.profileWorktree = opts.profileWorktree ?? (() => false);
@@ -395,6 +457,7 @@ export class TaskManager {
       attempt: 1,
       maxAttempts,
       ...(dependsOn.length > 0 ? { dependsOn } : {}),
+      ...(input.budget ? { budget: input.budget } : {}),
       metadata: { ...(input.metadata ?? {}), delegationDepth: depth },
     };
     this.store.createTask(rec);
@@ -414,6 +477,12 @@ export class TaskManager {
     });
 
     this.append(taskId, "accepted", `task accepted for profile ${profile}`);
+
+    // Whole-process spend ceiling. Refusing here is the only place it can be
+    // enforced without destroying work: a task that already ran has spent its
+    // money, so cancelling it would save nothing and lose the result.
+    const exhausted = this.sessionBudgetExhausted();
+    if (exhausted) return this.refuse(taskId, "budget_exhausted", exhausted);
 
     // Recursion guard: refuse to go deeper than the cap. Fail fast WITHOUT
     // spawning a worker so a master↔worker loop (or a runaway delegation chain)
@@ -1285,6 +1354,10 @@ export class TaskManager {
             retryable: false,
           },
         });
+      } else if (live.abortReason === "budget") {
+        // `failed`, not `timed_out`: the task did not run out of time, it ran out
+        // of money.
+        this.setState(taskId, "failed", this.budgetPatch(taskId, live));
       } else if (live.abortReason === "cancel") {
         this.setState(taskId, "cancelled", { finishedAt: Date.now() });
       } else if (turn.status === "completed") {
@@ -1358,17 +1431,23 @@ export class TaskManager {
         : live.abortReason === "cancel" ? "cancelled"
         : "failed";
       if (cur && !isTerminal(cur.status) && canTransition(cur.status, status)) {
-        this.setState(taskId, status, {
-          finishedAt: Date.now(),
-          error:
-            status === "failed"
-              ? {
-                  code: err instanceof HandoffError ? err.code : "exception",
-                  message,
-                  retryable: false,
-                }
-              : undefined,
-        });
+        this.setState(
+          taskId,
+          status,
+          live.abortReason === "budget"
+            ? this.budgetPatch(taskId, live)
+            : {
+                finishedAt: Date.now(),
+                error:
+                  status === "failed"
+                    ? {
+                        code: err instanceof HandoffError ? err.code : "exception",
+                        message,
+                        retryable: false,
+                      }
+                    : undefined,
+              },
+        );
       }
     } finally {
       if (live.timer) clearTimeout(live.timer);
@@ -1449,13 +1528,164 @@ export class TaskManager {
 
     usage.reports = (usage.reports ?? 0) + 1;
     live.usage = usage;
+    const total = mergeUsage(live.usageBase, usage) ?? usage;
     // Persist immediately: a task that times out or is cancelled mid-turn should
     // still report what it already spent. Retried tasks keep the spend of every
     // earlier attempt, so the roll-up is the whole cost of getting a result.
-    this.store.updateTask(taskId, { usage: mergeUsage(live.usageBase, usage) });
+    this.store.updateTask(taskId, { usage: total });
+    // Two ceilings, one measurement: the process-wide roll-up only needs the
+    // delta, the per-task ceiling needs the total. Both are fed from `total` so
+    // they can never disagree about what this task has spent.
+    this.accountSpend(taskId, total);
+    this.enforceTaskBudget(taskId, total);
+  }
+
+  /**
+   * Fold a task's cumulative spend into the process-wide totals, counting only
+   * the increase since the last report.
+   */
+  private accountSpend(taskId: string, total: TaskUsage): void {
+    const tokens = totalTokensOf(total);
+    const cost = total.cost;
+    const prev = this.spentByTask.get(taskId);
+
+    const prevTokens = prev?.tokens ?? 0;
+    if (tokens > prevTokens) this.spentTokens += tokens - prevTokens;
+
+    if (cost) {
+      const prevCost = prev?.cost;
+      // A currency switch makes the two figures incomparable; treat the new one
+      // as the task's spend from here on rather than subtracting across units.
+      const delta =
+        prevCost && sameCurrency(prevCost, cost) && cost.amount >= prevCost.amount
+          ? cost.amount - prevCost.amount
+          : cost.amount;
+      if (delta > 0) {
+        const key = costKey(cost);
+        this.spentCostByCurrency.set(key, (this.spentCostByCurrency.get(key) ?? 0) + delta);
+      }
+    }
+
+    this.spentByTask.set(taskId, {
+      tokens: Math.max(prevTokens, tokens),
+      ...(cost ? { cost } : prev?.cost ? { cost: prev.cost } : {}),
+    });
+  }
+
+  /**
+   * Why new work must be refused, or undefined when there is budget left.
+   * Checked at submit time only; see `TaskManagerOptions.maxTotalTokens`.
+   */
+  private sessionBudgetExhausted(): string | undefined {
+    if (this.maxTotalTokens > 0 && this.spentTokens >= this.maxTotalTokens) {
+      return (
+        `this process has spent ${this.spentTokens} tokens, reaching the configured ` +
+        `limits.maxTotalTokens of ${this.maxTotalTokens}; refusing to start more work`
+      );
+    }
+    const cap = this.maxTotalCost;
+    if (cap) {
+      const spent = this.spentCostByCurrency.get(costKey(cap)) ?? 0;
+      if (spent >= cap.amount) {
+        return (
+          `this process has spent ${spent}${cap.currency ? ` ${cap.currency}` : ""}, reaching the ` +
+          `configured limits.maxTotalCost of ${cap.amount}${cap.currency ? ` ${cap.currency}` : ""}; ` +
+          `refusing to start more work`
+        );
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Enforce the task's own spend ceiling. A breach aborts the turn like a timeout
+   * does, but settles `failed` (`budget_exceeded`) rather than `timed_out`: the
+   * task did not run out of time, it ran out of money.
+   */
+  private enforceTaskBudget(taskId: string, total: TaskUsage): void {
+    const budget = this.store.getTask(taskId)?.budget;
+    if (!budget) return;
+    const live = this.live.get(taskId);
+    if (!live || live.abortReason) return; // already stopping for another reason
+
+    const tokens = totalTokensOf(total);
+    let message: string | undefined;
+    if (budget.maxTokens !== undefined && tokens > budget.maxTokens) {
+      message =
+        `task spent ${tokens} tokens, exceeding its budget of ${budget.maxTokens}; ` +
+        `stopping before it spends more`;
+    } else if (budget.maxCost && total.cost) {
+      if (!sameCurrency(budget.maxCost, total.cost)) {
+        // Comparing 0.02 USD against 0.02 CNY would be a unit error, not a
+        // ceiling, so the limit simply does not apply. Say so once, loudly, in
+        // the task's timeline rather than failing open in silence.
+        if (!live.budgetCurrencyWarned) {
+          live.budgetCurrencyWarned = true;
+          const want = budget.maxCost.currency ?? "(no currency reported)";
+          const got = total.cost.currency ?? "(no currency reported)";
+          this.append(
+            taskId,
+            "budget",
+            `cost ceiling is in ${want} but the worker reports ${got}; the cost limit cannot be applied`,
+            { kind: "budget_currency_mismatch", maxCost: budget.maxCost, reported: total.cost },
+          );
+        }
+      } else if (total.cost.amount > budget.maxCost.amount) {
+        const cur = budget.maxCost.currency ? ` ${budget.maxCost.currency}` : "";
+        message =
+          `task cost ${total.cost.amount}${cur}, exceeding its budget of ` +
+          `${budget.maxCost.amount}${cur}; stopping before it spends more`;
+      }
+    }
+    if (!message) return;
+
+    live.abortReason = "budget";
+    live.budgetBreach = { message, usage: total };
+    this.append(taskId, "budget", message, {
+      kind: "budget",
+      totalTokens: tokens,
+      ...(total.cost ? { cost: total.cost } : {}),
+      ...(budget.maxTokens !== undefined ? { maxTokens: budget.maxTokens } : {}),
+      ...(budget.maxCost ? { maxCost: budget.maxCost } : {}),
+    });
+    // Same teardown as a timeout: unblock any approval this turn is parked on,
+    // abort the turn, and ask the driver to stop the worker.
+    this.approvals.cancelTask(taskId);
+    live.controller.abort();
+    if (live.workerId) void this.provider.cancelWorkerTurn(live.workerId).catch(() => {});
+  }
+
+  /**
+   * Terminal patch for a task stopped by its spend ceiling, shared by the two
+   * places a turn can unwind (a returned result and a thrown error).
+   */
+  private budgetPatch(taskId: string, live: LiveTask): Partial<TaskRecord> {
+    const breach = live.budgetBreach;
+    return {
+      finishedAt: Date.now(),
+      metadata: {
+        ...(this.store.getTask(taskId)?.metadata ?? {}),
+        budget: {
+          exceeded: true,
+          at: Date.now(),
+          totalTokens: totalTokensOf(breach?.usage),
+          ...(breach?.usage?.cost ? { cost: breach.usage.cost } : {}),
+        },
+      },
+      error: {
+        code: "budget_exceeded",
+        message: breach?.message ?? "task exceeded its spend budget",
+        retryable: false,
+      },
+    };
   }
 
   private async onPermission(taskId: string, req: PermissionRequest): Promise<PermissionDecision> {
+    // Approval-width cap. Parking one more task on a question the master has not
+    // answered grows its queue without making the answer any likelier, so past
+    // the cap the request is refused on the spot. The task keeps running — it
+    // simply does not get this tool — instead of the whole fan-out going quiet.
+    if (this.approvalBudgetSpent(taskId, "permission")) return "reject_once";
     const { id, promise } = this.approvals.requestPermission(taskId, req);
     this.setState(taskId, "waiting", { waitingReason: `permission:${req.toolKind ?? "tool"}` });
     this.append(taskId, "waiting", `awaiting approval for ${req.toolKind ?? "tool"}`, {
@@ -1471,6 +1701,7 @@ export class TaskManager {
   }
 
   private async onElicitation(taskId: string, req: ElicitationRequest): Promise<ElicitationResponse> {
+    if (this.approvalBudgetSpent(taskId, "elicitation")) return { action: "decline" };
     const { id, promise } = this.approvals.requestElicitation(taskId, req);
     this.setState(taskId, "waiting", { waitingReason: "elicitation" });
     this.append(taskId, "waiting", "agent requested input", { approvalId: id, kind: "elicitation" });
@@ -1478,6 +1709,27 @@ export class TaskManager {
     const resp = await promise;
     this.resumeFromWaiting(taskId, `elicitation: ${resp.action}`, { approvalId: id, action: resp.action });
     return resp;
+  }
+
+  /**
+   * True when admitting another `waiting` task would exceed `maxWaitingTasks`.
+   *
+   * The refusal is written to the task's timeline rather than thrown: the worker
+   * sees an ordinary denial, and an operator reading the events can tell a
+   * deliberate budget decision from a broken approval flow.
+   */
+  private approvalBudgetSpent(taskId: string, kind: "permission" | "elicitation"): boolean {
+    if (this.maxWaitingTasks <= 0) return false;
+    const pending = this.approvals.size();
+    if (pending < this.maxWaitingTasks) return false;
+    this.append(
+      taskId,
+      "budget",
+      `${kind} request refused without waiting: ${pending} task(s) are already blocked ` +
+        `on an approval (limits.maxWaitingTasks = ${this.maxWaitingTasks})`,
+      { kind: "approval_budget", pending, limit: this.maxWaitingTasks, approvalKind: kind },
+    );
+    return true;
   }
 
   /**
@@ -1559,6 +1811,19 @@ export class TaskManager {
     thoughtTokens: number;
     totalTokens: number;
     cost: Array<{ currency: string; amount: number }>;
+    /**
+     * Headroom against the process-wide ceilings. `spent*` counts what *this
+     * process* has seen since it started — not the whole store — because the
+     * limit is a per-run guard, not a lifetime ledger.
+     */
+    budget: {
+      exhausted: boolean;
+      reason?: string;
+      spentTokens: number;
+      spentCost: Array<{ currency: string; amount: number }>;
+      maxTotalTokens?: number;
+      maxTotalCost?: { amount: number; currency?: string };
+    };
   } {
     const totals = {
       tasks: 0,
@@ -1591,11 +1856,22 @@ export class TaskManager {
       }
     }
 
+    const exhausted = this.sessionBudgetExhausted();
     return {
       ...totals,
       cost: [...cost.entries()]
         .map(([currency, amount]) => ({ currency, amount }))
         .sort((a, b) => a.currency.localeCompare(b.currency)),
+      budget: {
+        exhausted: exhausted !== undefined,
+        ...(exhausted ? { reason: exhausted } : {}),
+        spentTokens: this.spentTokens,
+        spentCost: [...this.spentCostByCurrency.entries()]
+          .map(([currency, amount]) => ({ currency, amount }))
+          .sort((a, b) => a.currency.localeCompare(b.currency)),
+        ...(this.maxTotalTokens > 0 ? { maxTotalTokens: this.maxTotalTokens } : {}),
+        ...(this.maxTotalCost ? { maxTotalCost: this.maxTotalCost } : {}),
+      },
     };
   }
 
@@ -1797,6 +2073,9 @@ export class TaskManager {
     if (!live.attemptStarted) return false;
     // Retrying a queue-TTL expiry would just re-enter the same congested queue.
     if (patch.error?.code === "queue_ttl_exceeded") return false;
+    // Overspending is not transient: the retry starts at the same enforced
+    // ceiling, so it would spend again only to stop at the same place.
+    if (patch.error?.code === "budget_exceeded") return false;
     if (cur.deadlineAt !== undefined && cur.deadlineAt <= Date.now()) return false;
     const attempt = cur.attempt ?? 1;
     const maxAttempts = Math.max(1, cur.maxAttempts ?? 1);

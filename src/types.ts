@@ -287,6 +287,30 @@ export interface MeshConfig {
      * the size of the dependency index). Default 16.
      */
     maxDependencies?: number;
+    /**
+     * How many tasks may sit in `waiting` (blocked on an approval/elicitation)
+     * at once. 0/omitted = unlimited.
+     *
+     * A fan-out can otherwise park the whole batch on questions the master has
+     * not answered yet: every one holds a concurrency slot and produces one more
+     * entry in `pending_approvals`, and the master's attention is the resource
+     * that actually runs out. Past the cap, further permission requests are
+     * refused immediately (denied) instead of parking, and the worker carries on
+     * without that tool rather than the batch stalling silently.
+     */
+    maxWaitingTasks?: number;
+    /**
+     * Total tokens this process may spend across every task. Once the running
+     * roll-up crosses it, new submits are refused (`budget_exhausted`); work
+     * already accepted is left alone, because cancelling it would not un-spend
+     * the money. 0/omitted = unlimited.
+     */
+    maxTotalTokens?: number;
+    /**
+     * Same idea as `maxTotalTokens`, in money. Costs are accumulated per
+     * currency and compared against the matching one only.
+     */
+    maxTotalCost?: { amount: number; currency?: string };
   };
 }
 
@@ -384,6 +408,7 @@ export type TaskEventType =
   | "output"
   | "waiting"
   | "resumed"
+  | "budget"
   | "completed"
   | "failed"
   | "cancelled"
@@ -422,6 +447,28 @@ export interface TaskUsage {
   contextSize?: number;
   /** How many usage reports the worker sent; absent/0 = it reported nothing. */
   reports?: number;
+}
+
+/**
+ * Spend ceiling for a single task, enforced while it runs.
+ *
+ * A wall-clock budget already bounds *time*; this bounds *money*. The two are
+ * independent: an agent can finish in two seconds and still burn a fortune in
+ * tokens, which is exactly the fan-out failure mode a deadline does not catch.
+ *
+ * Checked on every usage report, so a breach stops the turn mid-flight instead
+ * of surfacing after the fact in `usage_summary`. Both ceilings count the whole
+ * task across all attempts — a retry does not get a fresh allowance, because the
+ * money it already spent is gone either way.
+ */
+export interface TaskBudget {
+  /** Max tokens (total, or input+output when the adapter reports no total). */
+  maxTokens?: number;
+  /**
+   * Max cost. Compared only against reports in the same currency, so a task
+   * cannot be failed by a currency switch it did not cause.
+   */
+  maxCost?: { amount: number; currency?: string };
 }
 
 /**
@@ -479,6 +526,12 @@ export interface TaskRecord {
   maxAttempts?: number;
   /** Epoch ms before which a retry must not start (backoff delay). */
   retryAt?: number;
+  /**
+   * Spend ceiling for this task. Reaching it aborts the turn and settles the task
+   * `failed` (`budget_exceeded`); the attempt is never retried, since replaying
+   * it would spend again. Absent = only the wall-clock limits apply.
+   */
+  budget?: TaskBudget;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
@@ -527,6 +580,12 @@ export interface TaskSubmitInput {
   dependsOn?: string[];
   /** Automatic retry policy. Omitted = fail once, settle immediately. */
   retry?: RetryPolicy;
+  /**
+   * Spend ceiling for this task (tokens and/or cost). Enforced on every usage
+   * report: a breach aborts the turn and settles `failed` (`budget_exceeded`),
+   * counting every attempt, never retried.
+   */
+  budget?: TaskBudget;
   /** Cross-worker handoff (Phase 1): inject a predecessor's result as untrusted context. */
   handoff?: HandoffSpec;
   /**

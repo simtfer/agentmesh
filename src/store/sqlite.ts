@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   text TEXT,
   structured TEXT,
   usage TEXT,
+  budget TEXT,
   stopReason TEXT,
   waitingReason TEXT,
   errorCode TEXT,
@@ -60,6 +61,7 @@ const ADDED_COLUMNS: Array<{ table: string; column: string; decl: string }> = [
   { table: "tasks", column: "attempt", decl: "INTEGER" },
   { table: "tasks", column: "maxAttempts", decl: "INTEGER" },
   { table: "tasks", column: "retryAt", decl: "INTEGER" },
+  { table: "tasks", column: "budget", decl: "TEXT" },
 ];
 
 type Row = Record<string, unknown>;
@@ -107,6 +109,9 @@ function rowToTask(r: Row): TaskRecord {
   }
   if (r.usage != null) {
     try { rec.usage = JSON.parse(String(r.usage)) as TaskRecord["usage"]; } catch { /* ignore */ }
+  }
+  if (r.budget != null) {
+    try { rec.budget = JSON.parse(String(r.budget)) as TaskRecord["budget"]; } catch { /* ignore */ }
   }
   rec.stopReason = str(r.stopReason);
   rec.waitingReason = str(r.waitingReason);
@@ -173,9 +178,9 @@ export class SqliteTaskStore implements TaskStore {
       .prepare(
         `INSERT INTO tasks (taskId, profile, workerId, prompt, workingDirectory, status,
           sessionId, idempotencyKey, timeoutMs, deadlineAt, createdAt, updatedAt, startedAt,
-          finishedAt, text, structured, usage, stopReason, waitingReason, errorCode, errorMessage,
+          finishedAt, text, structured, usage, budget, stopReason, waitingReason, errorCode, errorMessage,
           errorRetryable, dependsOn, blockedBy, attempt, maxAttempts, retryAt, metadata)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         rec.taskId, rec.profile, rec.workerId ?? null, rec.prompt, rec.workingDirectory, rec.status,
@@ -184,6 +189,7 @@ export class SqliteTaskStore implements TaskStore {
         rec.startedAt ?? null, rec.finishedAt ?? null, rec.text ?? null,
         rec.structured === undefined ? null : JSON.stringify(rec.structured),
         rec.usage ? JSON.stringify(rec.usage) : null,
+        rec.budget ? JSON.stringify(rec.budget) : null,
         rec.stopReason ?? null,
         rec.waitingReason ?? null, rec.error?.code ?? null, rec.error?.message ?? null,
         rec.error ? (rec.error.retryable ? 1 : 0) : null,
@@ -202,7 +208,7 @@ export class SqliteTaskStore implements TaskStore {
       .prepare(
         `UPDATE tasks SET profile=?, workerId=?, prompt=?, workingDirectory=?, status=?,
           sessionId=?, idempotencyKey=?, timeoutMs=?, deadlineAt=?, createdAt=?, updatedAt=?,
-          startedAt=?, finishedAt=?, text=?, structured=?, usage=?, stopReason=?, waitingReason=?,
+          startedAt=?, finishedAt=?, text=?, structured=?, usage=?, budget=?, stopReason=?, waitingReason=?,
           errorCode=?, errorMessage=?, errorRetryable=?, dependsOn=?, blockedBy=?, attempt=?,
           maxAttempts=?, retryAt=?, metadata=?
          WHERE taskId=?`,
@@ -214,6 +220,7 @@ export class SqliteTaskStore implements TaskStore {
         next.startedAt ?? null, next.finishedAt ?? null, next.text ?? null,
         next.structured === undefined ? null : JSON.stringify(next.structured),
         next.usage ? JSON.stringify(next.usage) : null,
+        next.budget ? JSON.stringify(next.budget) : null,
         next.stopReason ?? null,
         next.waitingReason ?? null, next.error?.code ?? null, next.error?.message ?? null,
         next.error ? (next.error.retryable ? 1 : 0) : null,

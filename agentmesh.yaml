@@ -53,6 +53,17 @@ workdir: .agentmesh
 #   • retry: { maxAttempts, delayMs, backoff, maxDelayMs, onlyRetryable } — re-run
 #     a failed/timed-out attempt instead of settling. Admission refusals are never
 #     retried; each attempt's spend is archived and token/cost totals are summed.
+#   • budget: { maxTokens, maxCost } — stop a task the moment it overspends,
+#     rather than finding out afterwards from usage_summary. Checked on every
+#     usage report, counted across attempts, never retried.
+#
+# Three ceilings bound what a fan-out can consume. maxWaitingTasks caps how many
+# tasks may sit in `waiting` at once: past it, further permission requests are
+# denied on the spot instead of parked, because a queue of questions the master
+# has not answered helps nobody and every parked task holds a concurrency slot.
+# maxTotalTokens / maxTotalCost bound the whole process: once crossed, new
+# submits are refused (`budget_exhausted`) while work already accepted runs to
+# its end — cancelling it would not un-spend the money.
 # Both caps below bound what a caller may ask for.
 # limits:
 #   maxDelegationDepth: 8        # default 8; lower it for tighter environments
@@ -63,6 +74,11 @@ workdir: .agentmesh
 #   maxHandoffBytes: 262144      # default 256 KiB of predecessor result injected per handoff
 #   maxRetryAttempts: 5          # default 5; clamps every task's retry.maxAttempts
 #   maxDependencies: 16          # default 16; max dependsOn entries per task
+#   maxWaitingTasks: 0           # 0/omitted = unlimited tasks parked on approvals
+#   maxTotalTokens: 0            # 0/omitted = no process-wide token ceiling
+#   maxTotalCost:                # optional process-wide cost ceiling
+#     amount: 5
+#     currency: USD
 
 defaults:
   # acpx permission mode for workers: deny-all | approve-reads | approve-all

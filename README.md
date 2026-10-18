@@ -222,7 +222,7 @@ Cancelling or timing out a task auto-resolves its pending approvals.
 | `task_cancel` | request cancellation (settles once the worker confirms) |
 | `list_tasks` | list tasks, optionally filtered by status |
 | `scheduler_status` | running vs queued vs dependency-blocked counts, configured caps (`maxQueuedTasks`, `queueTtlMs`), the queue in dispatch order, and per-entry weight / wait / time-to-expiry |
-| `usage_summary` | token/cost roll-up across tasks (`profile`, `since` filters), costs grouped by currency |
+| `usage_summary` | token/cost roll-up across tasks (`profile`, `since` filters), costs grouped by currency, plus `budget` headroom (`exhausted`, `spentTokens`, `maxTotalTokens`) against the process ceilings |
 | `pending_approvals` | approval/elicitation requests blocking a `waiting` task |
 | `task_approve` | resolve a permission request (allow/deny/cancel) |
 | `task_respond` | answer an elicitation request |
@@ -563,6 +563,28 @@ audit trail — lives in [docs/remote.md](docs/remote.md#security-model).)
   preview), and token/cost totals are **summed across attempts** because every
   attempt really spent them. `limits.maxRetryAttempts` (default 5) clamps what a
   caller may ask for.
+- **Spend budgets (`budget`).** A wall-clock budget bounds *time*; this bounds
+  *money* — the failure a deadline does not catch, since an agent can finish in
+  two seconds and still burn a fortune. `{ maxTokens, maxCost }` is checked on
+  every usage report, so a breach aborts the turn mid-flight instead of surfacing
+  afterwards in `usage_summary`. It counts **all attempts** (a retry gets no fresh
+  allowance — the money is gone either way), settles `failed` with
+  `budget_exceeded`, and is **never retried**. A cost ceiling only applies to
+  reports in the same currency; a mismatch is recorded once as
+  `budget_currency_mismatch` and otherwise ignored, because comparing 0.02 USD
+  against 0.02 CNY would be a unit error rather than a limit.
+- **Approval width (`limits.maxWaitingTasks`).** Bounds how many tasks may block
+  on an approval at once. Past it, a permission request is **denied on the spot**
+  rather than parked: the worker carries on without that tool, and the refusal is
+  written to the task's timeline as an `approval_budget` event. A fan-out that
+  queues a hundred unanswered questions is not making progress — it is spending
+  concurrency slots on questions nobody is reading.
+- **Process ceilings (`limits.maxTotalTokens`, `limits.maxTotalCost`).** Once the
+  running roll-up crosses either, new submits are refused with
+  `budget_exhausted`; work already accepted runs to its end, because cancelling it
+  would lose the result without refunding the spend. `usage_summary` reports the
+  headroom (`budget.exhausted`, `budget.spentTokens`), so a master can check
+  *before* launching the next batch instead of discovering it when it is refused.
 
 ```jsonc
 // B runs only after A and C both succeeded; a dead A/C fails B immediately.
@@ -570,6 +592,9 @@ task_submit({ "prompt": "…", "profile": "pi", "dependsOn": ["<taskA>", "<taskC
 // Same task, retried up to 3 times with 0.5s/1s backoff before it gives up.
 task_submit({ "prompt": "…", "profile": "pi",
               "retry": { "maxAttempts": 3, "delayMs": 500, "backoff": "exponential" } })
+// Stop this task the moment it passes 50k tokens or $0.20.
+task_submit({ "prompt": "…", "profile": "pi",
+              "budget": { "maxTokens": 50000, "maxCost": { "amount": 0.2, "currency": "USD" } } })
 ```
 
 Both are opt-in per task; with neither field the behaviour is unchanged (start as
@@ -591,6 +616,8 @@ Every failure lands on the task record (`error.code`) *and* the event log, so
 | `dependency_limit_exceeded` | more entries in `dependsOn` than `limits.maxDependencies` (default 16) | split the fan-in or raise the cap |
 | `deadline_exceeded` | hit its `deadlineMs`/`deadlineAt` — while queued **or** running | give it a bigger budget; if it never started, that's a capacity problem, not a task problem |
 | `task_timeout` | the run exceeded `timeoutMs` (no deadline involved) | raise `timeoutMs` for long turns |
+| `budget_exceeded` | the task passed its own `budget` (tokens and/or cost) | raise the ceiling or split the work; it is never retried |
+| `budget_exhausted` | the process has spent `limits.maxTotalTokens` / `maxTotalCost`; new submits are refused | raise the ceiling or start a fresh process; accepted work still finishes |
 | `delegation_depth_exceeded` | the chain reached `maxDelegationDepth` | usually a master delegating in a loop — inspect the chain before raising the cap |
 | `handoff_unknown_task` | `handoff.fromTaskId` matches no stored task | check the id; a task under another `workdir` is invisible |
 | `handoff_predecessor_not_ready` | the predecessor is not `succeeded` yet | `task_wait` on it first; failed/cancelled output is never handed off |
@@ -678,17 +705,17 @@ Swap the two and it still works.
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 108 tests, offline, no API cost, ~25s
+npm test            # 119 tests, offline, no API cost, ~26s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # real TLS/mTLS run over this host's LAN interface (not loopback)
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **108/108** across eight files — lifecycle, persistence and guards (32),
+`npm test` is **119/119** across nine files — lifecycle, persistence and guards (32),
 handoff artifacts (12), result contracts and usage (10), dependencies and retries
-(18), remote daemon (18), deployment TLS and audit rotation (8), orchestrator (6),
-master skill (4).
+(18), budgets and approvals (11), remote daemon (18), deployment TLS and audit
+rotation (8), orchestrator (6), master skill (4).
 Every case drives a public surface (Orchestrator, MCP tools, or the daemon's
 HTTP/WS endpoints) and asserts the resulting task record, not a mock's internal
 calls.
@@ -732,14 +759,18 @@ Done:
   and validated (`tls_invalid` instead of an opaque handshake failure),
   size-rotated audit log, boot-time unit/task, firewall recipes, and a
   two-host runbook verified over a real interface (`npm run deploy:tls`).
+- ✅ Spend and approval budgets: per-task `budget` (tokens/cost, enforced mid-turn
+  and never retried), `limits.maxWaitingTasks` for approval width, and
+  process-wide `maxTotalTokens`/`maxTotalCost` ceilings that refuse new submits
+  once crossed.
 
 Next:
 
-- **Approval budgets** — cap how many `waiting` tasks a fan-out may open before it
-  must stop and ask, and let a task carry a cost ceiling that `usage_summary`
-  enforces.
 - **Optional web console** — the audit trail and scheduler status already expose
   the data a read-only view would render.
+- **Cross-host handoff artifacts** — a remote successor currently refuses a
+  `diff`/`predecessor` handoff (`handoff_artifact_unavailable`) because the
+  artifact is a file on the master's disk.
 
 Design notes, rejected alternatives and the staged build-up behind these
 decisions: [docs/PLAN.md](docs/PLAN.md).

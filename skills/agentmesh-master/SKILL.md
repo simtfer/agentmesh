@@ -107,6 +107,8 @@ agent_list ─▶ plan/decompose ─▶ scheduler_status ─▶ task_submit (×N
 | Chain B onto A's finished output | `task_submit` with `handoff` (`inject`, `base`) |
 | Run B only after A *and* C succeed (DAG) | `task_submit` with `dependsOn: [a, c]` — a dead A/C fails B, it never runs on missing work |
 | Survive a flaky worker without re-planning | `task_submit` with `retry: { maxAttempts, delayMs, backoff }` |
+| Cap what one task may spend | `task_submit` with `budget: { maxTokens, maxCost }` — stops mid-turn, never retried |
+| Check headroom before the next batch | `usage_summary` → `budget.exhausted` / `budget.spentTokens` |
 | Get machine-readable output instead of prose | `task_submit` with `outputSchema` → read `structured` from `task_result` |
 | See what a fan-out cost | `usage_summary` (`profile`, `since`) |
 
