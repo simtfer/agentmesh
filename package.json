@@ -33,6 +33,7 @@
     "skills",
     "agentmesh.yaml",
     "README.md",
+    "README.zh.md",
     "LICENSE"
   ],
   "exports": {

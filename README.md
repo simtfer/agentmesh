@@ -1,5 +1,7 @@
 # agentmesh
 
+**English** · [简体中文](README.zh.md)
+
 A **protocol-native adapter** that lets one coding agent act as a **master** and
 command a pool of **heterogeneous worker agents** (OpenCode, Pi, Codex, Gemini,
 Claude Code, …). Roles are decided by *configuration*, not by agent type — so an
@@ -32,6 +34,7 @@ anything else, with the same code.
 - [CLI](#cli)
 - [Remote Worker Daemon (cross-machine workers)](#remote-worker-daemon-cross-machine-workers)
 - [Safety and limits](#safety-and-limits)
+- [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
 - [Verification](#verification)
 - [Roadmap](#roadmap)
@@ -56,6 +59,17 @@ tmux-screen-scraping supervisors: the master stays a normal agent, workers stay
 normal agents, and the adapter is just the protocol bridge + lifecycle manager
 between them.
 
+What it is **not** — so nobody adopts it for the wrong job:
+
+- **Not an agent IDE or GUI.** No desktop app, no chat pane, no visual canvas. The
+  master is the agent you already use.
+- **Not an agent framework.** It defines no agent loop, prompt format, or model
+  abstraction; it drives agents that already exist and speak ACP.
+- **Not a workflow/DAG engine.** Tasks are flat and independent. Chaining exists
+  only as an explicit `handoff` from one *finished* task to the next.
+- **Not a sandbox.** Isolation is git worktrees plus permission modes; it does not
+  containerise or otherwise confine worker processes.
+
 ## Status
 
 Working and verified end-to-end: an **8-state persistent task machine** (SQLite),
@@ -70,13 +84,20 @@ cross-machine workers over an authenticated, TLS-capable channel — driven agai
 
 ## Install
 
+agentmesh is **not published to npm yet** — install from source:
+
 ```bash
+git clone https://github.com/simtfer/agentmesh.git
 cd agentmesh
 npm install
 ```
 
 Requires Node.js ≥ 22.13. Real workers additionally require the upstream CLI
 (`pi`, `opencode`, …) installed and authenticated on the machine.
+
+The repo ships a working `agentmesh.yaml` at its root: every command reads
+`./agentmesh.yaml` by default, and `--config <path>` points at a different file.
+Edit the one in place, or copy it next to your project and pass `--config`.
 
 ## Try it (no API keys, no cost)
 
@@ -92,7 +113,7 @@ round trip plus the async approval loop.
 To exercise the **real** agents on this machine (trivial prompt, minimal cost):
 
 ```bash
-npx tsx scripts/real-smoke.ts   # opencode + pi through submit → wait → result
+npm run real    # == npx tsx scripts/real-smoke.ts; opencode + pi through submit → wait → result
 ```
 
 ## Configuration
@@ -416,10 +437,42 @@ audit trail — lives in [docs/remote.md](docs/remote.md#security-model).)
   backlog on a stale tag. Weights only reorder *waiting* work — they never let
   more than `maxConcurrentTasks` run.
 
+## Troubleshooting
+
+Every failure lands on the task record (`error.code`) *and* the event log, so
+`task_result` / `task_events` tell you **why**, not just that it failed.
+
+| `error.code` | What happened | What to do |
+|---|---|---|
+| `concurrency_limit_exceeded` | every slot busy and `maxQueuedTasks` is `0` | retry after one settles, or set `maxQueuedTasks > 0` to queue instead of refuse |
+| `queue_full` | slots busy **and** the queue is at `maxQueuedTasks` | raise `maxQueuedTasks` or submit smaller batches; `scheduler_status` shows the backlog |
+| `queue_ttl_exceeded` | waited longer than `queueTtlMs` without ever starting | raise `queueTtlMs`, add capacity, or split the batch |
+| `deadline_exceeded` | hit its `deadlineMs`/`deadlineAt` — while queued **or** running | give it a bigger budget; if it never started, that's a capacity problem, not a task problem |
+| `task_timeout` | the run exceeded `timeoutMs` (no deadline involved) | raise `timeoutMs` for long turns |
+| `delegation_depth_exceeded` | the chain reached `maxDelegationDepth` | usually a master delegating in a loop — inspect the chain before raising the cap |
+| `handoff_unknown_task` | `handoff.fromTaskId` matches no stored task | check the id; a task under another `workdir` is invisible |
+| `handoff_predecessor_not_ready` | the predecessor is not `succeeded` yet | `task_wait` on it first; failed/cancelled output is never handed off |
+
+Symptoms that aren't error codes:
+
+- **A task sits in `waiting` and nothing happens.** It is blocked on a permission
+  or elicitation request — call `pending_approvals`, then `task_approve` /
+  `task_respond`. `task_wait` returns as soon as this occurs, by design.
+- **`dispatch_task` appears to hang.** It waits for a terminal state, so a task
+  that needs approval can never advance inside it. Use `task_submit` +
+  `task_wait` when human intervention is possible.
+- **`cli submit` exits and the task never progresses.** Expected: the one-shot
+  CLI's live run ends with the process. Use the long-lived `mcp` server for real
+  async work (also called out under [CLI](#cli)).
+- **Daemon refuses the connection or returns 401.** Bind/TLS/token rules are in
+  [docs/remote.md](docs/remote.md#security-model); the token must come from the
+  environment named by `--token-env`.
+
 ## Architecture
 
 ```
 src/
+  index.ts             public package entry (the surface `package.json#exports` points at)
   types.ts             domain types (WorkerProfile, TaskRecord, TaskStatus, TaskEvent, ...)
   config.ts            YAML load + zod validation
   statemachine.ts      8-state transitions + terminal/legality guards
@@ -440,14 +493,19 @@ src/
     security.ts        token compare, cwd whitelist, TLS load, safe-bind guard
     daemon.ts          WorkerDaemon: HTTP+WS shim wrapping a local Orchestrator
     client.ts          RemoteWorkerDriver: a remote profile as a normal WorkerDriver
+    audit.ts           append-only NDJSON audit log; secrets reduced to a fingerprint
   mcp/server.ts        exposes the orchestrator as 17 MCP tools over stdio
   skill.ts             loads the self-hosted master playbook from skills/ (root resolver)
   cli.ts               demo | list | mcp | dispatch | submit | tasks | daemon
 skills/
   agentmesh-master/    the master delegation playbook (SKILL.md + SKILL.zh.md),
                        served over MCP as the master_playbook tool + resources
+scripts/
+  mcp-smoke.mjs        drives the real MCP server over stdio (`npm run smoke`)
+  real-smoke.ts        drives real opencode + pi workers (`npm run real`)
 docs/
   remote.md            the full Remote Worker Daemon guide
+  verification.md      the full test-by-test verification log
   PLAN.md              design notes + roadmap
 ```
 
@@ -457,58 +515,25 @@ Swap the two and it still works.
 
 ## Verification
 
-Checked on this machine (Node v26, Windows):
+```bash
+npm run typecheck   # tsc --noEmit, clean
+npm test            # 60 tests, offline, no API cost, ~8s
+npm run demo        # Scene A + Scene B both close
+npm run smoke       # real MCP server over stdio through the full lifecycle
+npm run real        # real local opencode + pi (both must be installed & authenticated)
+```
 
-- `tsc --noEmit` — clean.
-- `npm test` — **60/60** pass:
-  - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
-  - `test/tasks.test.ts` (32) — happy path, worker failure, `timeout → timed_out`,
-    `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
-    idempotency de-dup, SQLite restart-and-requery, store column-merge safety, an
-    old-schema DB forward-migrated with the `deadlineAt` column, the
-    recursion guard (depth-stamped success within the cap, refusal at the cap with
-    no worker spawned, and an inherited env depth tripping the cap), the
-    resource limits (a submit past `maxConcurrentTasks` refused with no worker,
-    a settled task freeing its slot, an oversized result truncated + flagged
-    `outputTruncated`, and truncation never splitting a multibyte codepoint), the
-    Stage 5 scheduler (over-cap submits queue then drain FIFO as slots free, a
-    full queue refuses with `queue_full`, cancelling a queued task settles
-    immediately without the grace wait, and a fan-out runs concurrently bounded by
-    `maxConcurrentTasks`), queue TTL and deadlines (a queued task expires
-    `queue_ttl_exceeded` without ever spawning a worker, a queued task's
-    `deadlineMs` expires `deadline_exceeded`, a running turn is bounded by its
-    deadline rather than its much larger `timeoutMs`, and an already-past deadline
-    is refused at submit), weighted fairness (default weights keep submit order
-    exactly; a `weight: 3` profile takes 3 of the first 4 dispatch slots), and
-    Phase 1 cross-worker handoff (the predecessor's
-    result reaches the successor's prompt, a no-handoff control never sees it, the
-    injected block is wrapped untrusted while the stored prompt stays original, a
-    non-succeeded / unknown source is refused with no worker spawned, and the
-    artifact is capped to `maxBytes` and flagged `truncated`).
-  - `test/remote.test.ts` (18) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
-    streamed events, approval round-trip, cancel, bad-token rejection,
-    cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, reconnect
-    reconciliation (completed-task query, unknown-id → `undefined`, dropped
-    mid-run → `cancelled` not `succeeded`), push-based resumption (`attach`
-    replays to success, `afterSequence` boundary, unknown-task reject, transparent
-    `runTurn` re-attach), zero-downtime key rotation (multi-token accept over
-    HTTP + WS, live `reloadTokens()`, empty-set refusal), a structured NDJSON
-    audit trail (decisions recorded, token never in cleartext), and unit guards
-    for `assertSafeBind` / `assertCwdAllowed`. See
-    [docs/remote.md](docs/remote.md#remote-tests).
-  - `test/skill.test.ts` (4) — the self-hosted master skill: the package-root
-    resolver finds `skills/agentmesh-master/`, both languages load from disk, and
-    an in-memory MCP client confirms the server serves the playbook via the
-    `master_playbook` tool (`en`/`zh`) and as browsable resources.
-- `npm run demo` — Scene A (sync dispatch to two workers) and Scene B
-  (submit → waiting → approve → succeeded) both close.
-- `npm run smoke` — real MCP stdio server through the full lifecycle; event
-  sequence `accepted, started, output…, waiting, resumed, output…, completed`.
-- `agentmesh daemon` boot check — `/healthz` open, `/profiles` 401 without a token
-  and 200 with `Authorization: Bearer …`, clean SIGINT shutdown.
-- `scripts/real-smoke.ts` — **real local OpenCode and Pi** driven through
-  `task_submit → task_wait → task_result`; both return `OK`, reach `succeeded`,
-  and persist their tasks + events to SQLite (2 tasks / 27 events observed).
+`npm test` is **60/60** across four files — lifecycle, persistence and guards (32),
+remote daemon (18), orchestrator (6), master skill (4). Every case drives a public
+surface (Orchestrator, MCP tools, or the daemon's HTTP/WS endpoints) and asserts
+the resulting task record, not a mock's internal calls.
+
+Last run on Windows with Node v22.22. Real OpenCode and Pi workers have also been
+driven end-to-end (`npm run real`: both reach `succeeded` and persist 2 tasks /
+27 events).
+
+**Per-case breakdown, reproduce steps, and the known gaps — what is *not* covered
+yet: [docs/verification.md](docs/verification.md).**
 
 ## Roadmap
 
@@ -537,6 +562,9 @@ Next:
   `base: "predecessor"` worktree branched from the predecessor's end state).
 - Structured result contracts (JSON output schema per task) + cost/usage roll-up
   from ACP `usage_update` events.
+
+Design notes, rejected alternatives and the staged build-up behind these
+decisions: [docs/PLAN.md](docs/PLAN.md).
 
 ## License
 
