@@ -66,8 +66,9 @@ What it is **not** — so nobody adopts it for the wrong job:
   master is the agent you already use.
 - **Not an agent framework.** It defines no agent loop, prompt format, or model
   abstraction; it drives agents that already exist and speak ACP.
-- **Not a workflow/DAG engine.** Tasks are flat and independent. Chaining exists
-  only as an explicit `handoff` from one *finished* task to the next.
+- **Not a workflow engine.** Tasks are flat. `dependsOn` gates them into a static
+  DAG — no cycles (a dependency must already exist), no conditionals, no loops, no
+  DSL. Cross-task *artifacts* still travel only through an explicit `handoff`.
 - **Not a sandbox.** Isolation is git worktrees plus permission modes; it does not
   containerise or otherwise confine worker processes.
 
@@ -77,7 +78,8 @@ Working and verified end-to-end: an **8-state persistent task machine** (SQLite)
 **async task lifecycle** (`task_submit` / `task_wait` / `task_result` / …), a
 **human-in-the-loop approval flow** for worker permission/elicitation requests, a
 **bounded, weighted-fair scheduler** (queue TTLs, per-task deadlines, opt-in
-profile weights) for parallel fan-out, **cross-worker handoff** (result text,
+profile weights, `dependsOn` DAG gating, opt-in retries with backoff) for
+parallel fan-out, **cross-worker handoff** (result text,
 redacted diff sidecars, predecessor end-state worktrees), **enforced JSON result
 contracts** with **token/cost roll-up**, a
 self-hosted **master delegation skill**, and a **remote Worker Daemon** for
@@ -155,8 +157,8 @@ profiles:
 `agent` can be any acpx built-in name (`pi`, `opencode`, `codex`, `claude`,
 `gemini`, `cursor`, `qwen`, `qoder`, …) or a custom key paired with `command`.
 The optional `limits:` block (delegation depth, concurrency, queue, output and
-handoff byte caps) is documented inline in `agentmesh.yaml` and under
-[Safety and limits](#safety-and-limits).
+handoff byte caps, retry attempts, dependency fan-in) is documented inline in
+`agentmesh.yaml` and under [Safety and limits](#safety-and-limits).
 
 ## Task lifecycle and the 8-state machine
 
@@ -169,6 +171,7 @@ queued ─▶ starting ─▶ running ─▶ succeeded
                         ▼  │
                        (loops back to running)
    queued (no slot, TTL/deadline hit) ─▶ timed_out         (terminal)
+   starting/running/waiting ─▶ queued        (retry: another attempt is due)
    running/waiting ─▶ failed | cancelled | timed_out   (terminal)
 ```
 
@@ -211,14 +214,14 @@ Cancelling or timing out a task auto-resolves its pending approvals.
 | `agent_inspect` | one worker's status + recent event log |
 | `spawn_worker` | start a worker (optionally in a git worktree) |
 | `kill_worker` | close a worker and clean its worktree |
-| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call); `deadlineMs`/`deadlineAt` bound queue wait + execution; optional `handoff` chains onto a finished task; `outputSchema` enforces a JSON result contract |
+| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call); `deadlineMs`/`deadlineAt` bound queue wait + execution; `dependsOn` gates it behind other tasks; `retry` re-runs transient failures; optional `handoff` chains onto a finished task; `outputSchema` enforces a JSON result contract |
 | `task_status` | current status of a task |
 | `task_wait` | block until terminal **or** `waiting` (needs approval) |
 | `task_result` | final text / status / error of a task, plus `structured` (contract result), `usage` (tokens/cost) and `contract` (verdict) |
 | `task_events` | persisted event log after a sequence number |
 | `task_cancel` | request cancellation (settles once the worker confirms) |
 | `list_tasks` | list tasks, optionally filtered by status |
-| `scheduler_status` | running vs queued counts, configured caps (`maxQueuedTasks`, `queueTtlMs`), the queue in dispatch order, and per-entry weight / wait / time-to-expiry |
+| `scheduler_status` | running vs queued vs dependency-blocked counts, configured caps (`maxQueuedTasks`, `queueTtlMs`), the queue in dispatch order, and per-entry weight / wait / time-to-expiry |
 | `usage_summary` | token/cost roll-up across tasks (`profile`, `since` filters), costs grouped by currency |
 | `pending_approvals` | approval/elicitation requests blocking a `waiting` task |
 | `task_approve` | resolve a permission request (allow/deny/cancel) |
@@ -531,6 +534,40 @@ audit trail — lives in [docs/remote.md](docs/remote.md#security-model).)
   while virtual time advances on *service*, so a late arrival cannot jump a
   backlog on a stale tag. Weights only reorder *waiting* work — they never let
   more than `maxConcurrentTasks` run.
+- **Dependencies (`dependsOn`).** A task may name other tasks that must settle
+  `succeeded` before it is allowed to start. It is accepted immediately as
+  `queued` with a `blockedBy` list, stays out of the dispatch queue (so it never
+  consumes a slot or distorts queue order), and enters the queue the moment its
+  last dependency succeeds. A dependency that ends any other way fails the
+  dependent with `dependency_failed` — *without spawning a worker* — and that
+  failure cascades down the chain, so a broken DAG collapses instead of stranding
+  a tail of tasks. `blockedBy` also clears on cancellation. Gated tasks count
+  against `maxQueuedTasks` (they are accepted work waiting for the scheduler), so
+  `dependsOn` requires `maxQueuedTasks > 0` and refuses with
+  `dependency_requires_queue` otherwise. Queue TTL starts when the task becomes
+  *ready*; a per-task deadline still covers the whole wait.
+- **Retries (`retry`).** Opt-in per task: `{ maxAttempts, delayMs, backoff,
+  maxDelayMs, onlyRetryable }`. A failed or timed-out attempt that actually ran is
+  re-queued (after the backoff) instead of settling, up to `maxAttempts` total
+  runs — the record never touches a terminal state in between, so `task_wait`
+  spans every attempt and dependents keep waiting. Admission refusals (queue full,
+  depth exceeded, bad handoff, …) are never retried: they never reached a worker.
+  Each attempt gets a fresh worker/AbortController, the failed ones are archived
+  under `metadata.attempts` (status, error, timing, spend, a bounded text
+  preview), and token/cost totals are **summed across attempts** because every
+  attempt really spent them. `limits.maxRetryAttempts` (default 5) clamps what a
+  caller may ask for.
+
+```jsonc
+// B runs only after A and C both succeeded; a dead A/C fails B immediately.
+task_submit({ "prompt": "…", "profile": "pi", "dependsOn": ["<taskA>", "<taskC>"] })
+// Same task, retried up to 3 times with 0.5s/1s backoff before it gives up.
+task_submit({ "prompt": "…", "profile": "pi",
+              "retry": { "maxAttempts": 3, "delayMs": 500, "backoff": "exponential" } })
+```
+
+Both are opt-in per task; with neither field the behaviour is unchanged (start as
+soon as a slot is free, settle on the first failure).
 
 ## Troubleshooting
 
@@ -542,6 +579,10 @@ Every failure lands on the task record (`error.code`) *and* the event log, so
 | `concurrency_limit_exceeded` | every slot busy and `maxQueuedTasks` is `0` | retry after one settles, or set `maxQueuedTasks > 0` to queue instead of refuse |
 | `queue_full` | slots busy **and** the queue is at `maxQueuedTasks` | raise `maxQueuedTasks` or submit smaller batches; `scheduler_status` shows the backlog |
 | `queue_ttl_exceeded` | waited longer than `queueTtlMs` without ever starting | raise `queueTtlMs`, add capacity, or split the batch |
+| `dependency_unknown_task` | `dependsOn` names a task that does not exist (a task under another `workdir` is invisible) | fix the id |
+| `dependency_failed` | a dependency settled `failed`/`cancelled`/`timed_out`, so this task can never run | fix or re-run the upstream task; the message names the culprit |
+| `dependency_requires_queue` | `dependsOn` used with `maxQueuedTasks: 0` (nowhere to hold a gated task) | set `limits.maxQueuedTasks > 0` |
+| `dependency_limit_exceeded` | more entries in `dependsOn` than `limits.maxDependencies` (default 16) | split the fan-in or raise the cap |
 | `deadline_exceeded` | hit its `deadlineMs`/`deadlineAt` — while queued **or** running | give it a bigger budget; if it never started, that's a capacity problem, not a task problem |
 | `task_timeout` | the run exceeded `timeoutMs` (no deadline involved) | raise `timeoutMs` for long turns |
 | `delegation_depth_exceeded` | the chain reached `maxDelegationDepth` | usually a master delegating in a loop — inspect the chain before raising the cap |
@@ -620,15 +661,15 @@ Swap the two and it still works.
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 82 tests, offline, no API cost, ~22s
+npm test            # 100 tests, offline, no API cost, ~24s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **82/82** across six files — lifecycle, persistence and guards (32),
-handoff artifacts (12), result contracts and usage (10), remote daemon (18),
-orchestrator (6), master skill (4).
+`npm test` is **100/100** across seven files — lifecycle, persistence and guards (32),
+handoff artifacts (12), result contracts and usage (10), dependencies and retries
+(18), remote daemon (18), orchestrator (6), master skill (4).
 Every case drives a public surface (Orchestrator, MCP tools, or the daemon's
 HTTP/WS endpoints) and asserts the resulting task record, not a mock's internal
 calls.
@@ -665,16 +706,18 @@ Done:
 - ✅ Structured result contracts (`outputSchema`, enforced — a violation fails the
   task) and token/cost roll-up from ACP `usage_update` events, per task and
   aggregated through `usage_summary`.
+- ✅ DAG dependencies (`dependsOn`: ready-queue admission, failure/cancel cascade,
+  queue-capacity accounting) and opt-in retries with fixed/exponential backoff,
+  attempt archiving, and spend summed across attempts.
 
 Next:
 
 - **Remote production hardening:** boot-time start, log rotation, firewall rules,
   and a real two-host TLS deployment recipe (the loopback path is verified; two
   machines are not).
-- **DAG dependencies** (`task B waits for A *and* C`) and configurable retries —
-  the contract codes are already marked `retryable` where a retry is meaningful.
 - **Approval budgets** — cap how many `waiting` tasks a fan-out may open before it
-  must stop and ask.
+  must stop and ask, and let a task carry a cost ceiling that `usage_summary`
+  enforces.
 
 Design notes, rejected alternatives and the staged build-up behind these
 decisions: [docs/PLAN.md](docs/PLAN.md).

@@ -26,13 +26,13 @@
    `scheduler_status` 可观测），队列 TTL 与截止时间（`limits.queueTtlMs`、`task_submit{deadlineMs|deadlineAt}`）、
    跨 profile 加权公平（profile `weight`，WFQ finish tag）亦已实现并测试；叠加此前的并发/输出/递归上限。
    余下重点是 **远程生产化补强**（开机启动、日志轮转、防火墙、真实双机 TLS 部署样例）与
-   **Stage 5 的进阶调度**（DAG 依赖、重试、预算）。
+   **Stage 5 的进阶调度**（DAG 依赖 ✅、重试 ✅、审批/成本预算 ⏳）。
 
 ---
 
 ## 1. 现状：已落地并验证（agentmesh）
 
-代码位置：`D:\Programs\QoderCN\tmp\agentmesh`。验证环境：Windows / Node v26 / git 2.55。
+代码位置：`D:\projects\agentmesh`。验证环境：Windows / Node v22.22 / git 2.55。
 
 | 能力 | 状态 | 位置 / 证据 |
 |---|---|---|
@@ -45,14 +45,15 @@
 | 人工批准（权限 + elicitation → waiting） | ✅ 完成 | `src/approvals.ts` |
 | Worker 注册表 + 事件环形缓冲 | ✅ 完成 | `src/registry.ts` |
 | git worktree 并行隔离 | ✅ 完成 | `src/worktree.ts` |
-| MCP Server（15 工具，stdio） | ✅ 完成 | `src/mcp/server.ts` |
+| MCP Server（18 工具，stdio） | ✅ 完成 | `src/mcp/server.ts` |
 | **远程 Worker Daemon（HTTP+WS）** | ✅ 完成，loopback 端到端验证 | `src/remote/*`、`test/remote.test.ts` |
 | CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 干净通过；`npm test` **23/23**（orchestrator + tasks(9) + remote(8)）；
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **100/100**（tasks(32) + handoff(12) + contract(10) +
+dag(18) + remote(18) + orchestrator(6) + skill(4)）；
 `npm run demo` 双场景闭环 `CLOSED ✅`；`npm run smoke` 真实 MCP stdio 全生命周期
-（`accepted, started, output…, waiting, resumed, output…, completed`）；`scripts/real-smoke.ts`
+（`accepted, started, output…, waiting, resumed, output…, completed`）；`npm run real`
 对**真实 opencode + pi** 走 `submit → wait → result`，均 `succeeded`（2 任务 / 27 事件入库）。
 远程侧：daemon CLI 启动自检 `/healthz` 开放、`/profiles` 无 token 401 / 带 token 200、干净退出。
 
@@ -68,7 +69,7 @@
 | SQLite 任务持久化、重启可查 | ✅ 已实现（node:sqlite） | `src/store/sqlite.ts` |
 | 远程 Worker Daemon（HTTP/WebSocket） | ✅ 已实现（loopback 验证） | `src/remote/*`，作为一个 `WorkerDriver` |
 | Adapter 受理语义 `startTask/getStatus/subscribe` | ✅ 受理式异步（task_submit/wait/status/result/events） | `src/tasks.ts` |
-| MCP 工具 `agent_*/task_*` | ✅ 已合并为 15 工具 | `src/mcp/server.ts` |
+| MCP 工具 `agent_*/task_*` | ✅ 已合并为 18 工具 | `src/mcp/server.ts` |
 | monorepo `apps/`+`packages/` | 单体 `src/`（remote/ 子模块边界清晰） | 暂缓拆包 |
 | Worker 心跳/在线状态 | ✅ daemon 侧 ping/pong 心跳 | `src/remote/daemon.ts` |
 
@@ -270,7 +271,24 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 - ✅ 独立 git worktree（代码已备）；失败/超时/取消路径均有测试（`test/tasks.test.ts` 的调度用例：
   排队并 FIFO 出队、队满拒绝、取消排队任务即时结算、并发扇出受 `maxConcurrentTasks` 约束、队列 TTL 过期、
   排队/运行两种 deadline 命中、默认权重保序 + `weight: 3` 抢占前 4 个名额中的 3 个）。
-- ⏳ DAG 依赖、可配置重试、人工审批预算、可选 Web 控制台。
+- ⏳ DAG **依赖与重试已落地**（见下）；余下为人工审批预算（一次扇出最多挂起多少个 `waiting`）与可选 Web 控制台。
+  - ✅ **DAG 依赖**：`task_submit`/`dispatch_task` 的 `dependsOn`（受理期校验：未知任务 `dependency_unknown_task`、
+    已失败/取消/超时的前置 `dependency_failed`、超过 `limits.maxDependencies` 的 `dependency_limit_exceeded`、
+    未开队列的 `dependency_requires_queue`）。被门控任务以 `queued` + `blockedBy` 受理，**不进派发队列**
+    （不占并发槽、不干扰 FIFO/加权顺序），最后一个依赖成功的瞬间入队；依赖非成功结算则以 `dependency_failed`
+    失败**且不 spawn worker**，并沿链级联（每个下游都失败而不是永久卡住）；取消时 `blockedBy` 一并清理。
+    被门控任务计入 `maxQueuedTasks`（它是"已受理、等调度"的工作），因此不会出现无界积压；队列 TTL 从**就绪**起算，
+    截止时间仍覆盖全程（阻塞期间只挂截止计时器）。依赖关系在受理时冻结且只能指向已存在任务 ⇒ 结构上无法成环。
+  - ✅ **可配置重试**：`retry: { maxAttempts, delayMs, backoff: fixed|exponential, maxDelayMs, onlyRetryable }`，
+    由 `limits.maxRetryAttempts`（默认 5）钳制。**只在真正跑过的尝试**失败/超时后重试（受理期拒绝不算，
+    重放只会同样失败），`cancelled` 永不重试，`queue_ttl_exceeded` 也不重试（同一条拥堵队列没有意义），
+    截止时间已过则不重试。重试在 `setState` 写入终态**之前**拦截，记录因此从不落到终态 ⇒ `task_wait` 跨越多轮、
+    依赖者继续等待；每轮换新的 `AbortController`（上一轮超时已 abort）与新 worker/worktree；失败轮归档进
+    `metadata.attempts`（状态/错误/耗时/花费/有界文本预览）；token 与成本**跨尝试累加**（每轮都真的花了）。
+    退避期间任务不占队列槽，只挂截止计时器；`cancel` 立即清掉退避计时器并结算。
+    验收：`test/dag.test.ts` 17 例（阻塞后放行、失败级联、取消级联、阻塞期可取消、无队列拒绝、三类受理期拒绝、
+    容量计入、阻塞期截止、重试耗尽、瞬时失败恢复、退避时序、跨尝试用量累加、受理拒绝不重试 + `onlyRetryable`、
+    退避中取消、退避期截止、`maxRetryAttempts` 钳制、SQLite 往返）。
 - 验收：多任务并发；同一工作目录不被多个写任务无保护同时改；失败/超时/取消路径均有测试。
 
 ---
@@ -342,7 +360,7 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    `maxOutputBytes` / 递归深度上限；队列 TTL（`queueTtlMs`）、每任务截止时间（`deadlineMs`/`deadlineAt`）、
    跨 profile 加权公平（`weight` + WFQ finish tag）亦已落地并测试；多 worktree 并行代码已备；失败/超时/取消路径
    均有并发测试（`test/tasks.test.ts`）。
-   ⏳ 进阶：DAG 依赖、可配置重试、预算上限。
+   ⏳ 进阶：审批/成本预算、可选 Web 控制台。（DAG 依赖与可配置重试已完成，见下。）
 2. **远程生产化补强**：状态对账（`query`）、推送式续订（`attach` + orphan 宽限）、透明自动重连（`resume`）、
    **零停机密钥轮换**（多 token + `SIGHUP`/`reloadTokens()`）、**结构化审计日志**（NDJSON，密钥仅记指纹）均已落地。
    ⏳ 余下：开机启动/日志轮转、防火墙与部署样例；把 loopback 验证形态推向真实双机 TLS 部署。
@@ -383,7 +401,11 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
 6. ~~**递归守卫**~~ ✅ 已落地：`limits.maxDelegationDepth`（默认 8）+ `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播，
    达上限的 submit 以 `delegation_depth_exceeded` 失败且不 spawn worker（预算上限并入 Stage 5）。
    ~~最大并发 / 单任务输出大小上限~~ ✅ 亦已落地（见 §7）。
-7. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
+7. ~~**Stage 5 · DAG 依赖与可配置重试**~~ ✅ 已落地：`dependsOn` 门控（受理期拒绝未知/已失败/超扇入/无队列，
+   就绪才入队，失败与取消沿链级联，计入 `maxQueuedTasks`）与 `retry`（`maxAttempts`/`delayMs`/`fixed|exponential`/
+   `maxDelayMs`/`onlyRetryable`，在终态写入前拦截、尝试归档于 `metadata.attempts`、token/成本跨尝试累加）。
+   18 项新用例见 `test/dag.test.ts`（测试总数 82 → 100）。
+8. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
 
-> Stage 0–3 已完成并通过 82 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree，以及结构化结果契约 + token/成本汇总）。
-> 下一步优先远程真实双机 TLS 部署、Stage 5 进阶调度（DAG 依赖、重试、审批预算）与可选 Web 控制台。
+> Stage 0–3 已完成并通过 100 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree，以及结构化结果契约 + token/成本汇总）。
+> 下一步优先远程真实双机 TLS 部署、Stage 5 余项（审批/成本预算）与可选 Web 控制台。

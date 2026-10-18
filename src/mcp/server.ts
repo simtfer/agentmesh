@@ -37,6 +37,19 @@ const handoffSchema = z.object({
 });
 
 /**
+ * Automatic retry (Stage 5). Opt-in: omit it and a task settles on its first
+ * failure. `maxAttempts` counts total runs including the first, and is clamped by
+ * `limits.maxRetryAttempts`; admission refusals are never retried.
+ */
+const retrySchema = z.object({
+  maxAttempts: z.number().int().positive().max(100).optional(),
+  delayMs: z.number().int().nonnegative().optional(),
+  backoff: z.enum(["fixed", "exponential"]).optional(),
+  maxDelayMs: z.number().int().nonnegative().optional(),
+  onlyRetryable: z.boolean().optional(),
+});
+
+/**
  * Expose the orchestrator as MCP tools. Any MCP-capable agent (opencode, pi,
  * claude, ...) that connects becomes a "master" able to submit tasks to and
  * command heterogeneous workers — with zero changes to the master itself.
@@ -107,7 +120,7 @@ export function createMcpServer(orch: Orchestrator): McpServer {
     {
       title: "Submit a task (async)",
       description:
-        "Submit a task and return immediately with a taskId. The task runs in the background; poll task_status / task_wait, or stream task_events. Reuse a worker via workerId or spawn one from profile. Optionally chain off a predecessor via `handoff` to inject its result as untrusted context.",
+        "Submit a task and return immediately with a taskId. The task runs in the background; poll task_status / task_wait, or stream task_events. Reuse a worker via workerId or spawn one from profile. Optionally chain off a predecessor via `handoff` to inject its result as untrusted context, gate the task on other tasks via `dependsOn` (DAG), and retry transient failures via `retry`.",
       inputSchema: {
         prompt: z.string(),
         profile: z.string().optional(),
@@ -120,9 +133,16 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         idempotencyKey: z.string().optional(),
         handoff: handoffSchema.optional(),
         outputSchema: z.record(z.unknown()).optional(),
+        dependsOn: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Task IDs that must settle `succeeded` before this task starts. A dependency that fails fails this task (`dependency_failed`). Needs limits.maxQueuedTasks > 0.",
+          ),
+        retry: retrySchema.optional(),
       },
     },
-    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, deadlineMs, deadlineAt, idempotencyKey, handoff, outputSchema }) =>
+    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, deadlineMs, deadlineAt, idempotencyKey, handoff, outputSchema, dependsOn, retry }) =>
       orch.submitTask({
         prompt,
         profile,
@@ -135,6 +155,8 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         idempotencyKey,
         handoff,
         outputSchema,
+        dependsOn,
+        retry,
       }),
     ),
   );
@@ -314,10 +336,12 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         deadlineMs: z.number().int().positive().optional(),
         handoff: handoffSchema.optional(),
         outputSchema: z.record(z.unknown()).optional(),
+        dependsOn: z.array(z.string()).optional(),
+        retry: retrySchema.optional(),
       },
     },
-    wrap(async ({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema }) => {
-      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema });
+    wrap(async ({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry }) => {
+      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry });
       return r;
     }),
   );

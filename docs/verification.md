@@ -17,13 +17,13 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 82 tests, offline, ~22s
+npm test            # 100 tests, offline, ~24s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run real        # real local opencode + pi workers (needs both installed & authenticated)
 ```
 
-`npm test` runs the six files below with `tsx --test`. Nothing is skipped, nothing
+`npm test` runs the seven files below with `tsx --test`. Nothing is skipped, nothing
 is marked `todo`, and no test asserts a mock's internal calls in place of
 observable behaviour — each one drives the public surface (Orchestrator, MCP
 tools, or the daemon's HTTP/WS endpoints) and checks the resulting task record.
@@ -131,6 +131,51 @@ workers whose replies are fixed strings.
   separate buckets (never sums across currencies), filters by `profile`, and a
   future `since` cutoff selects nothing.
 
+## `test/dag.test.ts` — 18 cases
+
+Stage 5 advanced scheduling: `dependsOn` gating and per-task retries. Every case
+drives submit → wait → record/events; the mock's `failFirst` knob (fail the
+profile's first N turns *across workers*) is what makes a transient failure
+observable without changing the prompt.
+
+- **Gate then release.** A task with an unfinished dependency is accepted as
+  `queued` with `dependsOn`/`blockedBy` and reported by `scheduler_status` under
+  `blocked` (not `queued`); when the predecessor succeeds, a `dependency` event is
+  recorded before `started` and `blockedBy` ends up empty.
+- **Failure cascades.** A failed predecessor fails its dependent with
+  `dependency_failed` and no worker spawned; a two-link chain (A→B→C) collapses
+  completely, so nothing stays blocked.
+- **Cancellation cascades.** Cancelling a dependency fails its dependents instead
+  of stranding them; cancelling a *blocked* task settles immediately (no cancel
+  grace period) and the predecessor finishing later does not resurrect it.
+- **Admission refusals.** `dependency_unknown_task`; `dependency_failed` when the
+  predecessor already settled badly; `dependency_limit_exceeded` past
+  `maxDependencies`; `dependency_requires_queue` when `maxQueuedTasks` is `0`.
+- **Capacity.** Blocked tasks count against `maxQueuedTasks`, so the next gated
+  submit is refused with `queue_full` rather than piling up.
+- **Deadline while blocked.** A deadline that elapses in the gate settles
+  `timed_out` (`deadline_exceeded`) with no worker and no residue.
+- **TTL starts at ready.** A 60ms `queueTtlMs` does not expire a task that waited
+  ~200ms on its predecessor and then ran: waiting on a dependency is not queue
+  starvation.
+- **Retry exhaustion.** `retry: { maxAttempts: 3 }` produces three `started`
+  events, two `retry` events, `attempt: 3`, `maxAttempts: 3`, and archives the two
+  failed attempts (status/code) under `metadata.attempts`.
+- **Recovery.** A transient first-turn failure succeeds on attempt 2, with the
+  previous attempt's error cleared from the record.
+- **Backoff.** With `delayMs: 80`, attempt 2 starts no earlier than the `retryAt`
+  stamped on the retry event.
+- **Spend across attempts.** Two metered attempts roll up to 2× tokens and 2× cost
+  (each attempt really spent it) while the first attempt's own usage stays visible
+  in `metadata.attempts[0].usage`; `usage_summary` agrees.
+- **What is not retried.** Admission refusals (never reached a worker) skip the
+  retry path; `onlyRetryable` also skips a `retryable: false` worker error;
+  cancelling during the backoff settles `cancelled` and the pending attempt never
+  starts; a deadline during the backoff settles `timed_out`.
+- **Clamping.** `limits.maxRetryAttempts: 2` caps a `maxAttempts: 99` request.
+- **Persistence.** `dependsOn`, `blockedBy`, `attempt`, `maxAttempts` and `retryAt`
+  survive a SQLite round trip and an update to an empty `blockedBy`.
+
 ## `test/remote.test.ts` — 18 cases
 
 Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
@@ -210,3 +255,9 @@ Honest limits of the evidence above — these are not covered by the suite yet:
   through, so the artifact is still untrusted data.
 - **Handoff sidecars are not garbage-collected.** They accumulate under
   `<workdir>/handoffs/` (one per diff handoff); pruning is left to the operator.
+- **Retry and dependency state live in memory.** A restart preserves the records
+  (and their `attempt`/`blockedBy` columns) but does not rehydrate the scheduler:
+  queued, blocked and backoff-waiting tasks stay where they are, exactly like
+  queued tasks before this change. Each retried attempt also gets its own worker
+  (and worktree, when the profile isolates edits), which is only cleaned up when
+  the worker is killed or the orchestrator shuts down.

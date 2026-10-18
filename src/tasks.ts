@@ -12,7 +12,8 @@ import type {
   WorkerEvent,
 } from "./types.js";
 import { DEFAULT_MAX_DELEGATION_DEPTH, DEFAULT_MAX_HANDOFF_BYTES } from "./types.js";
-import type { HandoffSpec } from "./types.js";
+import { DEFAULT_MAX_DEPENDENCIES, DEFAULT_MAX_RETRY_ATTEMPTS } from "./types.js";
+import type { HandoffSpec, RetryPolicy } from "./types.js";
 import { isTerminal, canTransition } from "./statemachine.js";
 import type { ApprovalBroker } from "./approvals.js";
 import type { WorkerRecord } from "./registry.js";
@@ -58,6 +59,12 @@ interface LiveTask {
   timer?: NodeJS.Timeout;
   /** queue-phase expiry timer (queue TTL and/or the task deadline) */
   queueTimer?: NodeJS.Timeout;
+  /** backoff timer between attempts (a retry waiting out its delay) */
+  retryTimer?: NodeJS.Timeout;
+  /** true while this attempt's settle is being converted into another attempt */
+  retrying?: boolean;
+  /** true once `run()` has begun an attempt (a retryable failure must have run) */
+  attemptStarted?: boolean;
   abortReason?: "timeout" | "cancel";
   /** which budget fired when `abortReason === "timeout"` */
   timeoutCode?: "task_timeout" | "deadline_exceeded";
@@ -69,8 +76,10 @@ interface LiveTask {
   waiting: Promise<TaskRecord>;
   resolveWaiting: (r: TaskRecord) => void;
   onEvent?: (ev: TaskEvent) => void;
-  /** usage roll-up accumulated from the worker's `usage` events */
+  /** usage roll-up accumulated from the worker's `usage` events (this attempt) */
   usage?: TaskUsage;
+  /** usage already spent by earlier attempts; every attempt adds to the total */
+  usageBase?: TaskUsage;
   /**
    * The worker's cumulative session cost at the moment this turn started. The
    * task's cost is reported as a delta against it, so a reused worker does not
@@ -166,6 +175,17 @@ export interface TaskManagerOptions {
    * producing a prompt that points at a path the worker cannot see.
    */
   profileIsRemote?: (profile: string) => boolean;
+  /**
+   * Upper bound on a task's total attempts (`retry.maxAttempts` is clamped to
+   * it), so a caller cannot ask for an unbounded retry loop. 0/undefined →
+   * `DEFAULT_MAX_RETRY_ATTEMPTS`.
+   */
+  maxRetryAttempts?: number;
+  /**
+   * Max `dependsOn` entries per task; a task with more is refused before it
+   * consumes a queue slot. 0/undefined → `DEFAULT_MAX_DEPENDENCIES`.
+   */
+  maxDependencies?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -192,6 +212,49 @@ function capText(
   return { text: buf.subarray(0, end).toString("utf8"), truncated: true, originalBytes: buf.length };
 }
 
+/**
+ * Add one attempt's usage onto the totals carried over from earlier attempts.
+ *
+ * Within an attempt ACP reports *state* (latest wins, see `rollUpUsage`), but
+ * across attempts every run really did spend its tokens again — so attempts add
+ * up. Cost is summed only when the currencies match: adding USD to CNY would be
+ * a lie, and a task that switched currencies mid-way keeps the latest figure.
+ * Context occupancy is a snapshot of the current window, not a spend, so it is
+ * taken from the newest attempt.
+ */
+function mergeUsage(base: TaskUsage | undefined, add: TaskUsage | undefined): TaskUsage | undefined {
+  if (!base) return add;
+  if (!add) return base;
+  const out: TaskUsage = { ...base };
+  for (const key of TOKEN_KEYS) {
+    const a = base[key];
+    const b = add[key];
+    if (a === undefined && b === undefined) continue;
+    out[key] = (a ?? 0) + (b ?? 0);
+  }
+  if (add.cost) {
+    const sameCurrency = base.cost === undefined || base.cost.currency === add.cost.currency;
+    const currency = add.cost.currency ?? base.cost?.currency;
+    out.cost = sameCurrency
+      ? { amount: (base.cost?.amount ?? 0) + add.cost.amount }
+      : add.cost;
+    if (currency !== undefined) out.cost.currency = currency;
+  }
+  if (add.contextUsed !== undefined) out.contextUsed = add.contextUsed;
+  if (add.contextSize !== undefined) out.contextSize = add.contextSize;
+  const reports = (base.reports ?? 0) + (add.reports ?? 0);
+  if (reports > 0) out.reports = reports;
+  return out;
+}
+
+/** Delay before attempt N+1, honouring the policy's backoff and its own cap. */
+function retryDelay(policy: RetryPolicy, attempt: number): number {
+  const base = Math.max(0, Math.trunc(policy.delayMs ?? 0));
+  const raw = policy.backoff === "exponential" ? base * 2 ** Math.max(0, attempt - 1) : base;
+  const cap = policy.maxDelayMs !== undefined && policy.maxDelayMs >= 0 ? policy.maxDelayMs : 300_000;
+  return Math.max(0, Math.min(raw, cap));
+}
+
 export class TaskManager {
   private live = new Map<string, LiveTask>();
   /**
@@ -201,6 +264,16 @@ export class TaskManager {
    * when any profile carries a scheduling `weight`.
    */
   private queue: QueueEntry[] = [];
+  /**
+   * DAG-gated tasks: accepted, but not allowed to compete for a scheduler slot
+   * until `pending` is empty. They are kept out of `queue` so dispatch order
+   * stays honest, yet they count against `maxQueuedTasks` — a blocked task is
+   * still accepted work waiting for the scheduler, and without that accounting a
+   * master could pile up unbounded gated tasks.
+   */
+  private blocked = new Map<string, { profile: string; pending: Set<string> }>();
+  /** reverse dependency index: settled-candidate taskId → dependents waiting on it */
+  private dependents = new Map<string, Set<string>>();
   /** taskIds that have been handed to `run()` and not yet settled. */
   private running = new Set<string>();
   private store: TaskStore;
@@ -215,6 +288,8 @@ export class TaskManager {
   private maxQueuedTasks: number;
   private queueTtlMs: number;
   private maxHandoffBytes: number;
+  private maxRetryAttempts: number;
+  private maxDependencies: number;
   private profileWeight: (profile: string) => number;
   private workdir: string;
   private baseRepo: string;
@@ -247,6 +322,8 @@ export class TaskManager {
     this.queueTtlMs = Math.max(0, Math.trunc(opts.queueTtlMs ?? 0));
     this.profileWeight = opts.profileWeight ?? (() => 1);
     this.maxHandoffBytes = Math.max(0, Math.trunc(opts.maxHandoffBytes ?? DEFAULT_MAX_HANDOFF_BYTES));
+    this.maxRetryAttempts = Math.max(1, Math.trunc(opts.maxRetryAttempts ?? DEFAULT_MAX_RETRY_ATTEMPTS));
+    this.maxDependencies = Math.max(1, Math.trunc(opts.maxDependencies ?? DEFAULT_MAX_DEPENDENCIES));
     this.workdir = path.resolve(opts.workdir ?? ".agentmesh");
     this.baseRepo = path.resolve(opts.baseRepo ?? process.cwd());
     this.profileWorktree = opts.profileWorktree ?? (() => false);
@@ -282,6 +359,16 @@ export class TaskManager {
     const depth = Math.max(this.baseDelegationDepth, Number.isFinite(metaDepth) ? Math.trunc(metaDepth) : 0);
 
     const now = Date.now();
+    // Retry policy is opt-in and clamped: a caller may ask for at most
+    // `limits.maxRetryAttempts` total attempts, and never for zero.
+    const maxAttempts = input.retry
+      ? Math.min(this.maxRetryAttempts, Math.max(1, Math.trunc(input.retry.maxAttempts ?? 1)))
+      : 1;
+    // De-duplicate and trim dependency ids so a sloppy caller cannot make one
+    // predecessor occupy several pending slots (or trip the fan-in cap twice).
+    const dependsOn = [
+      ...new Set((input.dependsOn ?? []).map((id) => String(id).trim()).filter(Boolean)),
+    ];
     // Per-task deadline: an end-to-end budget covering queue wait *and* run. The
     // earlier of a relative `deadlineMs` and an absolute `deadlineAt` wins, so a
     // caller can pass either shape (or both, to clamp an inherited budget).
@@ -305,6 +392,9 @@ export class TaskManager {
       updatedAt: now,
       workerId: input.workerId,
       idempotencyKey: input.idempotencyKey,
+      attempt: 1,
+      maxAttempts,
+      ...(dependsOn.length > 0 ? { dependsOn } : {}),
       metadata: { ...(input.metadata ?? {}), delegationDepth: depth },
     };
     this.store.createTask(rec);
@@ -404,6 +494,90 @@ export class TaskManager {
       }
     }
 
+    // DAG dependencies (Stage 5). Validated before consuming a scheduler slot:
+    // an unknown or already-failed predecessor is refused outright, and a
+    // dependency-gated task needs a queue to wait in (see `limits.maxQueuedTasks`)
+    // — otherwise "accepted but not running" would have nowhere to live and the
+    // only honest answer would be an unbounded in-memory limbo.
+    let pending = new Set<string>();
+    if (dependsOn.length > 0) {
+      if (dependsOn.length > this.maxDependencies) {
+        return this.refuse(
+          taskId,
+          "dependency_limit_exceeded",
+          `task declares ${dependsOn.length} dependencies; the configured maximum is ` +
+            `${this.maxDependencies} (limits.maxDependencies)`,
+        );
+      }
+      if (this.maxQueuedTasks <= 0) {
+        return this.refuse(
+          taskId,
+          "dependency_requires_queue",
+          `dependsOn needs a scheduler queue to hold a gated task; set limits.maxQueuedTasks > 0 ` +
+            `(and usually limits.maxConcurrentTasks) to use dependencies`,
+        );
+      }
+      for (const depId of dependsOn) {
+        if (depId === taskId) {
+          return this.refuse(taskId, "dependency_cycle", `task cannot depend on itself`);
+        }
+        const dep = this.store.getTask(depId);
+        if (!dep) {
+          return this.refuse(
+            taskId,
+            "dependency_unknown_task",
+            `dependency not found: ${depId}`,
+          );
+        }
+        if (isTerminal(dep.status)) {
+          // A settled predecessor is only useful as a gate when it succeeded;
+          // otherwise the work this task builds on never happened.
+          if (dep.status !== "succeeded") {
+            return this.refuse(
+              taskId,
+              "dependency_failed",
+              `dependency ${depId} already settled '${dep.status}'` +
+                (dep.error ? ` (${dep.error.code})` : ``) +
+                `; it can never satisfy this task`,
+            );
+          }
+          continue;
+        }
+        pending.add(depId);
+      }
+      if (pending.size > 0) {
+        // Blocked tasks occupy queue capacity, exactly like ready ones: the bound
+        // is on accepted-but-not-running work, not on this particular flavour.
+        if (this.waitingCount() >= this.maxQueuedTasks) {
+          return this.refuse(
+            taskId,
+            "queue_full",
+            `queue ${this.queue.length}/${this.maxQueuedTasks} and ${this.blocked.size} dependency-blocked ` +
+              `task(s); refusing to accept another — retry once a task settles`,
+          );
+        }
+        this.blocked.set(taskId, { profile, pending });
+        for (const depId of pending) this.trackDependent(depId, taskId);
+        this.store.updateTask(taskId, { blockedBy: [...pending] });
+        this.append(
+          taskId,
+          "queued",
+          `waiting on ${pending.size} dependenc${pending.size === 1 ? "y" : "ies"}: ${[...pending].join(", ")}`,
+          {
+            kind: "dependency",
+            dependsOn,
+            blockedBy: [...pending],
+            ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+          },
+        );
+        // Only the wall-clock deadline applies while blocked. The queue TTL
+        // starts when the task becomes *ready* — waiting on a slow predecessor is
+        // not backpressure, so it must not expire a task for doing its job.
+        this.armExpiry(taskId);
+        return this.store.getTask(taskId)!;
+      }
+    }
+
     // Scheduler admission (Stage 5). A single queue owner decides, at the one
     // choke point every submit passes through, whether to start now, wait in the
     // bounded FIFO queue, or refuse. This replaces the old "over cap → refuse"
@@ -412,7 +586,7 @@ export class TaskManager {
     const slotFree = this.maxConcurrentTasks <= 0 || this.running.size < this.maxConcurrentTasks;
     if (slotFree) {
       this.start(taskId);
-    } else if (this.maxQueuedTasks > 0 && this.queue.length < this.maxQueuedTasks) {
+    } else if (this.maxQueuedTasks > 0 && this.waitingCount() < this.maxQueuedTasks) {
       const entry = this.enqueue(taskId, profile);
       const position = this.queuePosition(taskId);
       this.append(
@@ -430,7 +604,7 @@ export class TaskManager {
       );
       // Bound how long it may wait: queue TTL, its own deadline, or whichever
       // comes first. A task that overstays settles `timed_out` without a worker.
-      this.armQueueExpiry(taskId, entry);
+      this.armExpiry(taskId, entry.enqueuedAt);
     } else {
       // No slot and no queue room. Fail fast WITHOUT spawning a worker so a
       // fan-out burst cannot exhaust the host.
@@ -558,45 +732,53 @@ export class TaskManager {
     return this.dispatchOrder().findIndex((e) => e.taskId === taskId) + 1;
   }
 
+  /** Accepted-but-not-running tasks: queue + dependency-blocked, i.e. used queue capacity. */
+  private waitingCount(): number {
+    return this.queue.length + this.blocked.size;
+  }
+
   /**
-   * Arm the queue-phase expiry timer: whichever of the queue TTL and the task's
+   * Arm the wait-phase expiry timer: whichever of the queue TTL and the task's
    * own deadline comes first. Fires at most once; `start()` disarms it if a slot
    * frees first. `unref()` keeps an idle queue from holding the process open.
+   *
+   * `enqueuedAt` is omitted while a task is dependency-blocked: the queue TTL
+   * measures time spent waiting for a *slot*, and a task waiting on a slow
+   * predecessor is not being starved by the scheduler. Its deadline still counts,
+   * because that is an end-to-end budget the caller asked for.
    */
-  private armQueueExpiry(taskId: string, entry: QueueEntry): void {
+  private armExpiry(taskId: string, enqueuedAt?: number): void {
     const live = this.live.get(taskId);
     if (!live) return;
     const deadlineAt = this.store.getTask(taskId)?.deadlineAt;
     const candidates: Array<{ at: number; code: "queue_ttl_exceeded" | "deadline_exceeded" }> = [];
-    if (this.queueTtlMs > 0) {
-      candidates.push({ at: entry.enqueuedAt + this.queueTtlMs, code: "queue_ttl_exceeded" });
+    if (enqueuedAt !== undefined && this.queueTtlMs > 0) {
+      candidates.push({ at: enqueuedAt + this.queueTtlMs, code: "queue_ttl_exceeded" });
     }
     if (deadlineAt !== undefined) candidates.push({ at: deadlineAt, code: "deadline_exceeded" });
     if (candidates.length === 0) return;
     candidates.sort((a, b) => a.at - b.at);
     const { at, code } = candidates[0]!;
+    if (live.queueTimer) clearTimeout(live.queueTimer);
     live.queueTimer = setTimeout(
-      () => this.expireQueued(taskId, code),
+      () => this.expireWaiting(taskId, code),
       Math.max(0, at - Date.now()),
     );
     live.queueTimer.unref?.();
   }
 
   /**
-   * Settle a task that waited too long without ever starting. It holds no worker,
-   * so this is immediate: leave the queue first (so `pump()` cannot start it
+   * Settle a task that waited too long without ever starting — whether it was
+   * queued for a slot or still blocked on dependencies. It holds no worker, so
+   * this is immediate: leave every wait list first (so `pump()` cannot start it
    * afterwards), record `timed_out` with the reason, and resolve any `wait()`.
    */
-  private expireQueued(taskId: string, code: "queue_ttl_exceeded" | "deadline_exceeded"): void {
+  private expireWaiting(taskId: string, code: "queue_ttl_exceeded" | "deadline_exceeded"): void {
     const live = this.live.get(taskId);
     if (!live) return;
     const rec = this.store.getTask(taskId);
     if (!rec || rec.status !== "queued") return; // started (or settled) meanwhile
-    if (!this.dequeue(taskId)) return;
-    if (live.queueTimer) {
-      clearTimeout(live.queueTimer);
-      live.queueTimer = undefined;
-    }
+    if (!this.removeFromWait(taskId)) return;
     const waitedMs = Date.now() - rec.createdAt;
     this.setState(taskId, "timed_out", {
       finishedAt: Date.now(),
@@ -605,19 +787,192 @@ export class TaskManager {
         message:
           code === "queue_ttl_exceeded"
             ? `task waited ${waitedMs}ms in the queue, exceeding the ${this.queueTtlMs}ms queue TTL`
-            : `task reached its deadline after waiting ${waitedMs}ms in the queue`,
+            : `task reached its deadline after waiting ${waitedMs}ms before starting`,
         retryable: false,
       },
     });
-    const final = this.store.getTask(taskId)!;
+    // A scheduled retry took the record back to `queued` and owns the live handle
+    // from here; resolving `done` now would strand the next attempt.
+    if (live.retrying) return;
+    this.settleIdle(taskId);
+  }
+
+  /**
+   * Finish a task that settled without ever running (dependency failure, queue
+   * expiry, cancellation while waiting): its `run()` will never reach its
+   * `finally`, so the waiters and the live handle must be cleaned up here.
+   */
+  private settleIdle(taskId: string): void {
+    const live = this.live.get(taskId);
+    if (!live || live.retrying) return;
+    const final = this.store.getTask(taskId);
+    if (!final || !isTerminal(final.status)) return;
+    if (live.queueTimer) {
+      clearTimeout(live.queueTimer);
+      live.queueTimer = undefined;
+    }
+    if (live.retryTimer) {
+      clearTimeout(live.retryTimer);
+      live.retryTimer = undefined;
+    }
     live.resolveDone(final);
     this.live.delete(taskId);
+  }
+
+  /* --------------------------- dependencies ---------------------------- */
+
+  /** Record that `dependent` is waiting on `depId` (reverse index for settle fan-out). */
+  private trackDependent(depId: string, dependent: string): void {
+    let set = this.dependents.get(depId);
+    if (!set) this.dependents.set(depId, (set = new Set()));
+    set.add(dependent);
+  }
+
+  /** Drop a task's outbound links (called when it stops waiting for good). */
+  private forgetLinks(taskId: string): void {
+    for (const depId of this.store.getTask(taskId)?.dependsOn ?? []) {
+      const set = this.dependents.get(depId);
+      if (!set) continue;
+      set.delete(taskId);
+      if (set.size === 0) this.dependents.delete(depId);
+    }
+  }
+
+  /**
+   * Fan a settle out to every task gated on it.
+   *
+   * `succeeded` releases one pending id; the dependent enters the queue only when
+   * nothing is left to wait for. Anything else fails it with `dependency_failed`
+   * — and because failing it is itself a terminal settle, its own dependents are
+   * released (and failed) the same way, so a broken DAG collapses instead of
+   * leaving a tail of tasks blocked forever.
+   *
+   * Bounded work: each dependent is visited once per dependency, and the reverse
+   * index is deleted as it is consumed, so a re-entrant call cannot loop.
+   */
+  private releaseDependents(settledId: string): void {
+    const waiters = this.dependents.get(settledId);
+    if (!waiters || waiters.size === 0) return;
+    this.dependents.delete(settledId);
+    const dep = this.store.getTask(settledId);
+    const ok = dep?.status === "succeeded";
+    for (const taskId of waiters) {
+      const gate = this.blocked.get(taskId);
+      if (!gate) continue; // cancelled, expired or already settled
+      const rec = this.store.getTask(taskId);
+      if (!rec || isTerminal(rec.status)) {
+        this.blocked.delete(taskId);
+        this.forgetLinks(taskId);
+        continue;
+      }
+      if (!ok) {
+        this.blocked.delete(taskId);
+        this.forgetLinks(taskId);
+        const why = dep?.error?.code ? ` (${dep.error.code})` : ``;
+        const message = `dependency ${settledId} settled '${dep?.status ?? "missing"}'${why}, so this task can never run`;
+        this.append(taskId, "dependency", message, {
+          kind: "dependency",
+          failedDependency: settledId,
+          status: dep?.status,
+          code: dep?.error?.code,
+        });
+        this.setState(taskId, "failed", {
+          finishedAt: Date.now(),
+          error: { code: "dependency_failed", message, retryable: false },
+        });
+        // It never ran, so `run()`'s finally will not fire: resolve its waiters
+        // here or a `task_wait` on it would hang until its own timeout.
+        this.settleIdle(taskId);
+        continue;
+      }
+      gate.pending.delete(settledId);
+      this.store.updateTask(taskId, { blockedBy: [...gate.pending] });
+      this.append(
+        taskId,
+        "dependency",
+        gate.pending.size === 0
+          ? `dependency ${settledId} succeeded; all dependencies satisfied`
+          : `dependency ${settledId} succeeded; ${gate.pending.size} still pending`,
+        { kind: "dependency", satisfied: settledId, blockedBy: [...gate.pending] },
+      );
+      if (gate.pending.size === 0) this.unblock(taskId);
+    }
+  }
+
+  /**
+   * Move a ready task from the dependency gate into the dispatch queue. It
+   * already holds a queue slot (blocked tasks count against the bound), so this
+   * cannot fail for capacity; only a deadline that elapsed while it waited can
+   * stop it here.
+   */
+  private unblock(taskId: string): void {
+    const gate = this.blocked.get(taskId);
+    if (!gate) return;
+    this.blocked.delete(taskId);
+    const rec = this.store.getTask(taskId);
+    if (!rec || isTerminal(rec.status)) return;
+    if (rec.deadlineAt !== undefined && rec.deadlineAt <= Date.now()) {
+      this.setState(taskId, "timed_out", {
+        finishedAt: Date.now(),
+        error: {
+          code: "deadline_exceeded",
+          message: `task reached its deadline ${new Date(rec.deadlineAt).toISOString()} while waiting on dependencies`,
+          retryable: false,
+        },
+      });
+      const live = this.live.get(taskId);
+      if (live && !live.retrying) this.settleIdle(taskId);
+      return;
+    }
+    this.store.updateTask(taskId, { blockedBy: [] });
+    const entry = this.enqueue(taskId, gate.profile);
+    this.append(
+      taskId,
+      "queued",
+      `dependencies satisfied; queued behind ${this.running.size} running task(s)`,
+      {
+        kind: "status",
+        queuePosition: this.queuePosition(taskId),
+        running: this.running.size,
+        readyAt: entry.enqueuedAt,
+        ...(rec.deadlineAt !== undefined ? { deadlineAt: rec.deadlineAt } : {}),
+      },
+    );
+    // The queue TTL now starts counting: from this moment the task is actually
+    // competing for a slot.
+    this.armExpiry(taskId, entry.enqueuedAt);
+    this.pump();
+  }
+
+  /**
+   * Take a task out of every not-yet-running wait list: the dispatch queue, the
+   * dependency gate, or a retry backoff. True if it was waiting somewhere.
+   */
+  private removeFromWait(taskId: string): boolean {
+    let removed = this.dequeue(taskId);
+    if (this.blocked.delete(taskId)) {
+      this.forgetLinks(taskId);
+      removed = true;
+    }
+    const live = this.live.get(taskId);
+    if (live?.queueTimer) {
+      clearTimeout(live.queueTimer);
+      live.queueTimer = undefined;
+    }
+    if (live?.retryTimer) {
+      clearTimeout(live.retryTimer);
+      live.retryTimer = undefined;
+      removed = true;
+    }
+    return removed;
   }
 
   /** Snapshot of scheduler state for introspection (MCP `scheduler_status`). */
   schedulerStats(): {
     running: number;
     queued: number;
+    /** accepted tasks gated on unfinished dependencies (counted against `maxQueuedTasks`) */
+    blocked: number;
     maxConcurrentTasks: number;
     maxQueuedTasks: number;
     queueTtlMs: number;
@@ -633,12 +988,14 @@ export class TaskManager {
       /** ms until this entry expires from the queue (queue TTL or deadline) */
       expiresInMs?: number;
     }>;
+    blockedTasks: Array<{ taskId: string; profile: string; waitingOn: string[]; attempt: number }>;
   } {
     const now = Date.now();
     const order = this.dispatchOrder();
     return {
       running: this.running.size,
       queued: this.queue.length,
+      blocked: this.blocked.size,
       maxConcurrentTasks: this.maxConcurrentTasks,
       maxQueuedTasks: this.maxQueuedTasks,
       queueTtlMs: this.queueTtlMs,
@@ -658,6 +1015,12 @@ export class TaskManager {
           ...(bounds.length > 0 ? { expiresInMs: Math.max(0, Math.min(...bounds) - now) } : {}),
         };
       }),
+      blockedTasks: [...this.blocked.entries()].map(([taskId, gate]) => ({
+        taskId,
+        profile: gate.profile,
+        waitingOn: [...gate.pending],
+        attempt: this.store.getTask(taskId)?.attempt ?? 1,
+      })),
     };
   }
 
@@ -841,6 +1204,9 @@ export class TaskManager {
         return;
       }
       this.setState(taskId, "starting");
+      // From here on a failure is retryable: an attempt actually began, so
+      // re-running it is meaningful (unlike an admission refusal).
+      live.attemptStarted = true;
 
       // Phase 3: snapshot the predecessor's working tree *before* spawning, so the
       // successor's worktree can branch from exactly where the predecessor stopped.
@@ -1011,6 +1377,15 @@ export class TaskManager {
       // task. This is the single place a running task settles, so the queue
       // always drains fairly (FIFO) as slots free up.
       this.running.delete(taskId);
+      // A retry intercepted the settle: the live handle (and its `done` promise)
+      // must survive so `wait()` spans every attempt. The slot is already freed,
+      // so the retry can be dispatched as soon as its backoff allows.
+      if (live.retrying) {
+        live.retrying = false;
+        live.attemptStarted = false;
+        this.pump();
+        return;
+      }
       const final = this.store.getTask(taskId)!;
       live.resolveDone(final);
       this.live.delete(taskId);
@@ -1075,8 +1450,9 @@ export class TaskManager {
     usage.reports = (usage.reports ?? 0) + 1;
     live.usage = usage;
     // Persist immediately: a task that times out or is cancelled mid-turn should
-    // still report what it already spent.
-    this.store.updateTask(taskId, { usage });
+    // still report what it already spent. Retried tasks keep the spend of every
+    // earlier attempt, so the roll-up is the whole cost of getting a result.
+    this.store.updateTask(taskId, { usage: mergeUsage(live.usageBase, usage) });
   }
 
   private async onPermission(taskId: string, req: PermissionRequest): Promise<PermissionDecision> {
@@ -1255,20 +1631,14 @@ export class TaskManager {
     if (live) {
       live.abortReason = "cancel";
       this.approvals.cancelTask(taskId);
-      // Queued but never started: it holds no worker and `run()`'s finally (which
-      // resolves `done`) will never fire, so settle it here instead of waiting out
-      // the grace period. Dequeue first so `pump()` won't start it later.
-      if (!this.running.has(taskId) && this.dequeue(taskId)) {
-        // Disarm the queue-expiry timer: this task is settled by the caller now.
-        if (live.queueTimer) {
-          clearTimeout(live.queueTimer);
-          live.queueTimer = undefined;
-        }
+      // Queued, dependency-blocked or waiting out a retry backoff: it holds no
+      // worker and `run()`'s finally (which resolves `done`) will never fire, so
+      // settle it here instead of waiting out the grace period. Leave every wait
+      // list first so `pump()` / a retry timer cannot start it later.
+      if (!this.running.has(taskId) && this.removeFromWait(taskId)) {
         this.setState(taskId, "cancelled", { finishedAt: Date.now() });
-        const final = this.store.getTask(taskId)!;
-        live.resolveDone(final);
-        this.live.delete(taskId);
-        return final;
+        this.settleIdle(taskId);
+        return this.store.getTask(taskId);
       }
       live.controller.abort();
       if (live.workerId) await this.provider.cancelWorkerTurn(live.workerId).catch(() => {});
@@ -1376,6 +1746,13 @@ export class TaskManager {
       // ignore illegal late transitions (e.g. a settle after terminal)
       return;
     }
+    // Retry intercept (Stage 5). A failed/timed-out attempt with attempts left is
+    // re-admitted to the queue instead of settling. Doing it *before* the write
+    // means the record never touches a terminal state, so `wait()` keeps waiting
+    // and dependents are not told the task is dead while another attempt is due.
+    if (status === "failed" || status === "timed_out") {
+      if (this.scheduleRetry(taskId, cur, status, patch)) return;
+    }
     this.store.updateTask(taskId, { status, ...patch });
     const map: Partial<Record<TaskStatus, TaskEvent["type"]>> = {
       running: cur.status === "waiting" ? "resumed" : "started",
@@ -1385,7 +1762,185 @@ export class TaskManager {
       timed_out: "timed_out",
     };
     const type = map[status];
-    if (type && type !== "resumed") this.append(taskId, type, `status -> ${status}`);
+    if (type && type !== "resumed") {
+      this.append(
+        taskId,
+        type,
+        patch.error ? `status -> ${status}: ${patch.error.code}` : `status -> ${status}`,
+        patch.error ? { kind: "status", code: patch.error.code, message: patch.error.message } : undefined,
+      );
+    }
+    // Terminal settle releases (or fails) everything gated on this task.
+    if (isTerminal(status)) this.releaseDependents(taskId);
+  }
+
+  /**
+   * Decide whether a would-be failure becomes another attempt.
+   *
+   * Only tasks that actually ran are retried: an admission refusal (queue full,
+   * depth exceeded, bad handoff, …) never reached a worker, so replaying it would
+   * fail the same way and burn the budget. Cancellation is never retried, and a
+   * task whose deadline has passed is out of time by definition.
+   *
+   * Returns true when the failure was converted into a retry, in which case the
+   * caller must not write the terminal state.
+   */
+  private scheduleRetry(
+    taskId: string,
+    cur: TaskRecord,
+    status: TaskStatus,
+    patch: Partial<TaskRecord>,
+  ): boolean {
+    const live = this.live.get(taskId);
+    const policy = live?.input.retry;
+    if (!live || !policy) return false;
+    if (!live.attemptStarted) return false;
+    // Retrying a queue-TTL expiry would just re-enter the same congested queue.
+    if (patch.error?.code === "queue_ttl_exceeded") return false;
+    if (cur.deadlineAt !== undefined && cur.deadlineAt <= Date.now()) return false;
+    const attempt = cur.attempt ?? 1;
+    const maxAttempts = Math.max(1, cur.maxAttempts ?? 1);
+    if (attempt >= maxAttempts) return false;
+    if (policy.onlyRetryable && patch.error?.retryable !== true) return false;
+
+    const delay = retryDelay(policy, attempt);
+    const next = attempt + 1;
+    const now = Date.now();
+
+    // Archive the attempt before its fields are cleared, so the full history
+    // (status, error, timing, spend, a bounded text preview) survives.
+    const metadata = this.archiveAttempt(cur, status, patch, now);
+    const reset: Partial<TaskRecord> = {
+      status: "queued",
+      attempt: next,
+      retryAt: delay > 0 ? now + delay : undefined,
+      error: undefined,
+      finishedAt: undefined,
+      startedAt: undefined,
+      text: undefined,
+      structured: undefined,
+      stopReason: undefined,
+      outputTruncated: undefined,
+      waitingReason: undefined,
+      workerId: undefined,
+      sessionId: undefined,
+      metadata,
+    };
+    this.store.updateTask(taskId, reset);
+
+    const lastCode = patch.error?.code ?? status;
+    this.append(
+      taskId,
+      "retry",
+      `attempt ${attempt}/${maxAttempts} ended '${status}' (${lastCode}); ` +
+        (delay > 0 ? `retrying #${next} in ${delay}ms` : `retrying as #${next} now`),
+      {
+        kind: "retry",
+        attempt,
+        next,
+        maxAttempts,
+        previousStatus: status,
+        code: patch.error?.code,
+        delayMs: delay,
+        retryAt: reset.retryAt,
+      },
+    );
+
+    // Fresh per-attempt state. A new AbortController matters: the previous one is
+    // aborted after a timeout/cancel and would fail the next turn immediately.
+    live.controller = new AbortController();
+    live.abortReason = undefined;
+    live.timeoutCode = undefined;
+    live.workerId = undefined;
+    live.costBaseline = undefined;
+    live.usageBase = mergeUsage(live.usageBase, live.usage);
+    live.usage = undefined;
+    live.retrying = true;
+    if (live.queueTimer) {
+      clearTimeout(live.queueTimer);
+      live.queueTimer = undefined;
+    }
+
+    if (delay <= 0) {
+      // Straight back into the queue; `run()`'s finally calls `pump()` once this
+      // attempt's slot is released, so it cannot start while still counted.
+      this.enqueue(taskId, cur.profile);
+      this.armExpiry(taskId, Date.now());
+      return true;
+    }
+
+    // Backoff: the task waits outside the queue (it holds no slot) and enters it
+    // when the delay elapses. The timer is deliberately *not* unref'd: a pending
+    // retry is accepted work, so it should keep the process alive the way a
+    // running turn's timeout does. `cancel()` clears it.
+    live.retryTimer = setTimeout(() => {
+      live.retryTimer = undefined;
+      this.admitRetry(taskId);
+    }, delay);
+    // While it waits out the backoff only the deadline applies: no queue TTL
+    // (it holds no slot) but still an end-to-end budget.
+    this.armExpiry(taskId);
+    return true;
+  }
+
+  /** Backoff elapsed: put a waiting retry back into the dispatch queue. */
+  private admitRetry(taskId: string): void {
+    const rec = this.store.getTask(taskId);
+    const live = this.live.get(taskId);
+    if (!rec || !live || rec.status !== "queued") return;
+    if (live.retryTimer) {
+      clearTimeout(live.retryTimer);
+      live.retryTimer = undefined;
+    }
+    // The deadline is end-to-end: a backoff that runs past it has run out of
+    // time just like a queued or running task would have.
+    if (rec.deadlineAt !== undefined && rec.deadlineAt <= Date.now()) {
+      this.setState(taskId, "timed_out", {
+        finishedAt: Date.now(),
+        error: {
+          code: "deadline_exceeded",
+          message: `task reached its deadline ${new Date(rec.deadlineAt).toISOString()} during a retry backoff`,
+          retryable: false,
+        },
+      });
+      this.settleIdle(taskId);
+      return;
+    }
+    const entry = this.enqueue(taskId, rec.profile);
+    this.store.updateTask(taskId, { retryAt: undefined });
+    this.append(taskId, "queued", `retry ${rec.attempt ?? 1} ready; entering the queue`, {
+      kind: "status",
+      queuePosition: this.queuePosition(taskId),
+      readyAt: entry.enqueuedAt,
+    });
+    this.armExpiry(taskId, entry.enqueuedAt);
+    this.pump();
+  }
+
+  /** Append a compact record of the attempt that just ended to `metadata.attempts`. */
+  private archiveAttempt(
+    rec: TaskRecord,
+    status: TaskStatus,
+    patch: Partial<TaskRecord>,
+    finishedAt: number,
+  ): Record<string, unknown> {
+    const meta = rec.metadata ?? {};
+    const prior = Array.isArray(meta.attempts) ? [...(meta.attempts as unknown[])] : [];
+    prior.push({
+      attempt: rec.attempt ?? 1,
+      status,
+      code: patch.error?.code,
+      message: patch.error?.message,
+      workerId: rec.workerId,
+      startedAt: rec.startedAt,
+      finishedAt,
+      // Keep a bounded preview only: metadata is not a result store, and a full
+      // 1 MiB answer per attempt would bloat every later read of the record.
+      textPreview: rec.text ? rec.text.slice(0, 2000) : undefined,
+      textBytes: rec.text ? Buffer.byteLength(rec.text, "utf8") : undefined,
+      usage: rec.usage,
+    });
+    return { ...meta, attempts: prior };
   }
 
   private append(

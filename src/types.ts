@@ -98,6 +98,13 @@ export interface MockBehavior {
   delayMs?: number;
   /** if the task contains this substring, the turn fails (for testing) */
   failOn?: string;
+  /**
+   * Fail this profile's first N turns *across workers* (a deterministic stand-in
+   * for a transient upstream failure), then behave normally. Unlike `failOn` it
+   * does not depend on the prompt, so a retried attempt sees different behaviour
+   * without the test having to change the text.
+   */
+  failFirst?: number;
   /** simulate N tool calls before replying */
   toolCalls?: number;
   /** if true, ask for permission before replying (drives the `waiting` state) */
@@ -263,6 +270,16 @@ export interface MeshConfig {
      * boundary and flagged in the task's `handoff` metadata. Default 256 KiB.
      */
     maxHandoffBytes?: number;
+    /**
+     * Upper bound on a task's total attempts (`retry.maxAttempts`), so a caller
+     * cannot ask for an unbounded retry loop. Default 5.
+     */
+    maxRetryAttempts?: number;
+    /**
+     * Max `dependsOn` entries per task. Bounds the fan-in of one DAG node (and
+     * the size of the dependency index). Default 16.
+     */
+    maxDependencies?: number;
   };
 }
 
@@ -279,6 +296,12 @@ export const DEFAULT_MAX_DELEGATION_DEPTH = 8;
 
 /** Default cap on injected handoff artifact bytes when `limits.maxHandoffBytes` is unset. */
 export const DEFAULT_MAX_HANDOFF_BYTES = 256 * 1024;
+
+/** Default cap on total task attempts when `retry.maxAttempts` exceeds `limits.maxRetryAttempts`. */
+export const DEFAULT_MAX_RETRY_ATTEMPTS = 5;
+
+/** Default cap on `dependsOn` entries per task. */
+export const DEFAULT_MAX_DEPENDENCIES = 16;
 
 /**
  * Cross-worker handoff spec (Phase 1). Injects a predecessor task's output into
@@ -347,7 +370,9 @@ export const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatu
 export type TaskEventType =
   | "accepted"
   | "queued"
+  | "dependency"
   | "started"
+  | "retry"
   | "handoff"
   | "output"
   | "waiting"
@@ -392,6 +417,31 @@ export interface TaskUsage {
   reports?: number;
 }
 
+/**
+ * Automatic retry policy for a task (Stage 5 advanced scheduling).
+ *
+ * Retries are opt-in: with no policy a task settles on its first failure, exactly
+ * as before. When present, a failed/timed-out attempt that actually started is
+ * re-queued instead of settling, up to `maxAttempts` runs in total. Admission
+ * refusals (queue full, depth exceeded, bad handoff, …) are never retried: they
+ * never reached a worker, so replaying them would fail identically.
+ */
+export interface RetryPolicy {
+  /** Total attempts including the first. 1 = no retry. Capped by `limits.maxRetryAttempts`. */
+  maxAttempts?: number;
+  /** Base delay before re-queueing, in ms. Default 0 (immediate). */
+  delayMs?: number;
+  /** `fixed` (default) or `exponential` (delayMs × 2^(attempt-1)). */
+  backoff?: "fixed" | "exponential";
+  /** Cap on any single delay, in ms. Default 300000 (5 min). */
+  maxDelayMs?: number;
+  /**
+   * Retry only when the failure is marked retryable (contract violations are,
+   * most worker errors are not). Default false = retry any failure that ran.
+   */
+  onlyRetryable?: boolean;
+}
+
 export interface TaskRecord {
   taskId: string;
   profile: string;
@@ -408,6 +458,20 @@ export interface TaskRecord {
    * `deadline_exceeded`, whether it was still queued or already running.
    */
   deadlineAt?: number;
+  /**
+   * Dependencies (Stage 5 DAG). The task is accepted but will not compete for a
+   * scheduler slot until every listed task has settled `succeeded`; a dependency
+   * that settles any other way fails this task with `dependency_failed`.
+   */
+  dependsOn?: string[];
+  /** Dependencies still outstanding. Empty/absent → the task is ready. */
+  blockedBy?: string[];
+  /** 1-based attempt counter; absent means the first (and only) attempt. */
+  attempt?: number;
+  /** Total attempts allowed by the task's retry policy; absent = 1. */
+  maxAttempts?: number;
+  /** Epoch ms before which a retry must not start (backoff delay). */
+  retryAt?: number;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
@@ -448,6 +512,14 @@ export interface TaskSubmitInput {
   deadlineAt?: number;
   idempotencyKey?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * DAG dependencies: task IDs that must settle `succeeded` before this task is
+   * allowed to start. Requires a queue (`limits.maxQueuedTasks > 0`), since a
+   * blocked task is accepted work waiting for a scheduler slot.
+   */
+  dependsOn?: string[];
+  /** Automatic retry policy. Omitted = fail once, settle immediately. */
+  retry?: RetryPolicy;
   /** Cross-worker handoff (Phase 1): inject a predecessor's result as untrusted context. */
   handoff?: HandoffSpec;
   /**

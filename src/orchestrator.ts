@@ -4,6 +4,7 @@ import type {
   HandoffSpec,
   MeshConfig,
   PermissionDecision,
+  RetryPolicy,
   TaskEvent,
   TaskRecord,
   TaskStatus,
@@ -53,6 +54,10 @@ export interface DispatchInput {
   handoff?: HandoffSpec;
   /** Structured result contract: JSON Schema the final answer must satisfy. */
   outputSchema?: Record<string, unknown>;
+  /** DAG dependencies: task IDs that must succeed before this task may start. */
+  dependsOn?: string[];
+  /** Automatic retry policy for this task. Omitted = settle on the first failure. */
+  retry?: RetryPolicy;
   /** live task-event stream (also persisted to the store) */
   onEvent?: (ev: TaskEvent) => void;
 }
@@ -132,6 +137,8 @@ export class Orchestrator {
         return typeof w === "number" && Number.isFinite(w) && w > 0 ? w : 1;
       },
       maxHandoffBytes: config.limits?.maxHandoffBytes,
+      maxRetryAttempts: config.limits?.maxRetryAttempts,
+      maxDependencies: config.limits?.maxDependencies,
       // Handoff artifacts (diff sidecars) live next to the rest of the per-repo
       // state, and snapshots are only usable when both tasks share this repo.
       workdir: this.workdir,
@@ -280,6 +287,8 @@ export class Orchestrator {
         deadlineAt: input.deadlineAt,
         handoff: input.handoff,
         outputSchema: input.outputSchema,
+        dependsOn: input.dependsOn,
+        retry: input.retry,
       },
       { onEvent: input.onEvent },
     );

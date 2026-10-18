@@ -89,6 +89,8 @@ agent_list ─▶ 规划/拆解 ─▶ scheduler_status ─▶ task_submit（×N
 | 看一次扇出花了多少 | `usage_summary`（`profile`、`since`） |
 | 回答 elicitation | `task_respond` |
 | 把 B 接在已完成 A 的产物上 | `task_submit` 的 `handoff`（`inject`、`base`） |
+| 让 B 在 A **和** C 都成功后才跑（DAG） | `task_submit` 带 `dependsOn: [a, c]`——A/C 挂了 B 直接失败，绝不会在缺件上开工 |
+| 不用重规划就扛过抖动的 worker | `task_submit` 带 `retry: { maxAttempts, delayMs, backoff }` |
 
 ## 怎么写好一个子任务 prompt
 

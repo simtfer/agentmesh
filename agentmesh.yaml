@@ -42,6 +42,18 @@ workdir: .agentmesh
 # the successor's prompt. The injected block is wrapped as untrusted data and
 # truncated on a UTF-8 boundary, so a large upstream artifact cannot bloat or
 # hijack the downstream prompt.
+#
+# Stage 5 advanced scheduling is opt-in per task:
+#   • dependsOn: [taskIds] — the task is accepted but does not compete for a slot
+#     until every listed task has succeeded. A dependency that fails/cancels/times
+#     out fails the dependent (`dependency_failed`) without spawning a worker, and
+#     the failure cascades down the chain. Blocked tasks count against
+#     maxQueuedTasks, so dependencies require maxQueuedTasks > 0. The queue TTL
+#     starts when a task becomes ready; a per-task deadline covers the whole wait.
+#   • retry: { maxAttempts, delayMs, backoff, maxDelayMs, onlyRetryable } — re-run
+#     a failed/timed-out attempt instead of settling. Admission refusals are never
+#     retried; each attempt's spend is archived and token/cost totals are summed.
+# Both caps below bound what a caller may ask for.
 # limits:
 #   maxDelegationDepth: 8        # default 8; lower it for tighter environments
 #   maxConcurrentTasks: 0        # 0/omitted = unlimited in-flight tasks
@@ -49,6 +61,8 @@ workdir: .agentmesh
 #   queueTtlMs: 0                # 0/omitted = a queued task may wait forever
 #   maxOutputBytes: 1048576      # default 1 MiB of persisted result text/task
 #   maxHandoffBytes: 262144      # default 256 KiB of predecessor result injected per handoff
+#   maxRetryAttempts: 5          # default 5; clamps every task's retry.maxAttempts
+#   maxDependencies: 16          # default 16; max dependsOn entries per task
 
 defaults:
   # acpx permission mode for workers: deny-all | approve-reads | approve-all

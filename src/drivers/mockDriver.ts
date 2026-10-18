@@ -32,6 +32,8 @@ class MockWorkerHandle implements WorkerHandle {
     readonly cwd: string,
     private behavior: NonNullable<WorkerProfile["mock"]>,
     private profileName: string,
+    /** this worker was born into one of the profile's "fail first N turns" slots */
+    private failTurn = false,
   ) {}
 
   async runTurn(
@@ -146,6 +148,20 @@ class MockWorkerHandle implements WorkerHandle {
     }
 
     await sleep(Math.min(this.behavior.delayMs ?? 20, 50));
+
+    // `failFirst` failures happen *after* the turn's work (and its usage report),
+    // modelling a run that spent tokens and then died — which is exactly the case
+    // where a retry has to accumulate the wasted spend.
+    if (this.failTurn) {
+      emit({ type: "error", text: "mock transient failure (failFirst)" });
+      return {
+        status: "failed",
+        text: "",
+        events,
+        error: { message: "mock worker failed", code: "MOCK_FAIL" },
+      };
+    }
+
     emit({ type: "text", text: reply });
     emit({ type: "done", text: "end_turn", data: { stopReason: "end_turn" } });
     return { status: "completed", text: reply, stopReason: "end_turn", events };
@@ -162,17 +178,32 @@ class MockWorkerHandle implements WorkerHandle {
 
 export class MockWorkerDriver implements WorkerDriver {
   readonly kind = "mock" as const;
+  /**
+   * Per-profile "transient failure" budget left (`mock.failFirst`). It lives on
+   * the driver, not the worker, so a retry — which spawns a *new* worker — still
+   * observes the failure: that is the whole point of modelling it this way.
+   */
+  private failBudget = new Map<string, number>();
 
   async createWorker(
     profile: WorkerProfile,
     opts: { id: string; cwd: string },
   ): Promise<WorkerHandle> {
+    let failTurn = false;
+    if (profile.mock?.failFirst !== undefined) {
+      const left = this.failBudget.get(profile.name) ?? Math.max(0, Math.trunc(profile.mock.failFirst));
+      if (left > 0) {
+        this.failBudget.set(profile.name, left - 1);
+        failTurn = true;
+      }
+    }
     return new MockWorkerHandle(
       opts.id,
       profile.name,
       opts.cwd,
       profile.mock ?? {},
       profile.name,
+      failTurn,
     );
   }
 }

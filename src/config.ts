@@ -7,6 +7,7 @@ const MockBehavior = z.object({
   reply: z.string().optional(),
   delayMs: z.number().int().nonnegative().optional(),
   failOn: z.string().optional(),
+  failFirst: z.number().int().nonnegative().optional(),
   toolCalls: z.number().int().nonnegative().optional(),
   requireApproval: z.boolean().optional(),
   writeFiles: z.record(z.string()).optional(),
@@ -93,6 +94,8 @@ const ConfigSchema = z.object({
       maxQueuedTasks: z.number().int().nonnegative().optional(),
       queueTtlMs: z.number().int().nonnegative().optional(),
       maxHandoffBytes: z.number().int().nonnegative().optional(),
+      maxRetryAttempts: z.number().int().positive().optional(),
+      maxDependencies: z.number().int().positive().optional(),
     })
     .optional(),
 });

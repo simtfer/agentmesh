@@ -50,12 +50,12 @@
 
 - **不是 agent IDE 或 GUI。** 没有桌面端、没有聊天面板、没有可视化画布。master 就是你本来在用的 agent。
 - **不是 agent 框架。** 它不定义 agent 循环、提示词格式或模型抽象；它驱动的是已经存在、且会说 ACP 的 agent。
-- **不是工作流 / DAG 引擎。** 任务默认是扁平、相互独立的。链式关系只以显式 `handoff` 的形式存在——从一个*已完成*的任务交给下一个。
+- **不是工作流引擎。** 任务是扁平的；`dependsOn` 把它们组成一张**静态 DAG**——无环（依赖必须已存在）、无条件分支、无循环、无 DSL。任务之间的*产物*传递仍然只走显式 `handoff`。
 - **不是沙箱。** 隔离靠 git worktree 加权限模式；它不做容器化，也不对 worker 进程做其他形式的限制。
 
 ## 当前状态
 
-已实现并做过端到端验证：**8 态持久化任务机**（SQLite）、**异步任务生命周期**（`task_submit` / `task_wait` / `task_result`……）、面向 worker 权限/交互请求的**人在环路审批流**、用于并行扇出的**有界、加权公平调度器**（队列 TTL、每任务截止时间、可选 profile 权重）、**跨 Worker 交接**（结果注入、脱敏 diff 旁挂、前驱末态 worktree）、**强制的 JSON 结果契约**与 **token/成本汇总**、自托管的 **master 委派技能**，以及让 worker 跨机器运行的**远程 Worker Daemon**（带认证、可走 TLS）——驱动对象既有**本机真实的 OpenCode 和 Pi**，也有确定性的 mock。详见[验证](#验证)。
+已实现并做过端到端验证：**8 态持久化任务机**（SQLite）、**异步任务生命周期**（`task_submit` / `task_wait` / `task_result`……）、面向 worker 权限/交互请求的**人在环路审批流**、用于并行扇出的**有界、加权公平调度器**（队列 TTL、每任务截止时间、可选 profile 权重、`dependsOn` DAG 门控、可选退避重试）、**跨 Worker 交接**（结果注入、脱敏 diff 旁挂、前驱末态 worktree）、**强制的 JSON 结果契约**与 **token/成本汇总**、自托管的 **master 委派技能**，以及让 worker 跨机器运行的**远程 Worker Daemon**（带认证、可走 TLS）——驱动对象既有**本机真实的 OpenCode 和 Pi**，也有确定性的 mock。详见[验证](#验证)。
 
 ## 安装
 
@@ -119,7 +119,7 @@ profiles:
   #   model: anthropic/claude-sonnet-4-5
 ```
 
-`agent` 可以是任何 acpx 内置名（`pi`、`opencode`、`codex`、`claude`、`gemini`、`cursor`、`qwen`、`qoder`……），也可以是自定义 key 搭配 `command`。可选的 `limits:` 块（递归深度、并发、队列、输出与交接字节上限）在 `agentmesh.yaml` 里有内联注释，另见[安全与限制](#安全与限制)。
+`agent` 可以是任何 acpx 内置名（`pi`、`opencode`、`codex`、`claude`、`gemini`、`cursor`、`qwen`、`qoder`……），也可以是自定义 key 搭配 `command`。可选的 `limits:` 块（递归深度、并发、队列、输出与交接字节上限、重试次数、依赖扇入）在 `agentmesh.yaml` 里有内联注释，另见[安全与限制](#安全与限制)。
 
 ## 任务生命周期与 8 态机
 
@@ -132,6 +132,7 @@ queued ─▶ starting ─▶ running ─▶ succeeded
                         ▼  │
                        (loops back to running)
    queued (no slot, TTL/deadline hit) ─▶ timed_out         (terminal)
+   starting/running/waiting ─▶ queued        (retry: another attempt is due)
    running/waiting ─▶ failed | cancelled | timed_out   (terminal)
 ```
 
@@ -162,14 +163,14 @@ worker 撞上高风险工具（ACP permission request）或需要补充输入（
 | `agent_inspect` | 单个 worker 的状态与最近事件日志 |
 | `spawn_worker` | 启动一个 worker（可选在 git worktree 中） |
 | `kill_worker` | 关闭 worker 并清理它的 worktree |
-| `task_submit` | **提交任务，立刻返回 `taskId`**（异步主动作）；`deadlineMs`/`deadlineAt` 约束排队 + 执行总时长；可选 `handoff` 接在一个已完成任务之后；`outputSchema` 强制 JSON 结果契约 |
+| `task_submit` | **提交任务，立刻返回 `taskId`**（异步主动作）；`deadlineMs`/`deadlineAt` 约束排队 + 执行总时长；`dependsOn` 让它等在其他任务之后；`retry` 重跑瞬时失败；可选 `handoff` 接在一个已完成任务之后；`outputSchema` 强制 JSON 结果契约 |
 | `task_status` | 某个任务的当前状态 |
 | `task_wait` | 阻塞到终态**或** `waiting`（需要审批） |
 | `task_result` | 任务的最终文本 / 状态 / 错误，外加 `structured`（契约结果）、`usage`（token/成本）与 `contract`（判定） |
 | `task_events` | 按序号翻取持久化事件日志 |
 | `task_cancel` | 请求取消（worker 确认后才结算） |
 | `list_tasks` | 列出任务，可按状态过滤 |
-| `scheduler_status` | 运行/排队计数、已配置上限（`maxQueuedTasks`、`queueTtlMs`）、按派发顺序排列的队列，以及每项的权重 / 等待时长 / 距过期时间 |
+| `scheduler_status` | 运行/排队/依赖阻塞计数、已配置上限（`maxQueuedTasks`、`queueTtlMs`）、按派发顺序排列的队列，以及每项的权重 / 等待时长 / 距过期时间 |
 | `usage_summary` | 跨任务汇总 token/成本（可按 `profile`、`since` 过滤），成本按币种分组 |
 | `pending_approvals` | 阻塞某个 `waiting` 任务的审批/elicitation 请求 |
 | `task_approve` | 处理权限请求（允许/拒绝/取消） |
@@ -340,6 +341,18 @@ master (machine A)                              worker daemon (machine B)
 - **有界、公平的调度器。** 每个槽位都忙时新提交会怎样，由 `limits.maxQueuedTasks` 决定。留在 `0`（默认）：提交立刻被拒，返回 `concurrency_limit_exceeded`，且**不启动 worker**——纯背压，扇出突发撑不爆主机。设为 `>0` 则开启真正的调度：超限提交停进有界队列，随运行中任务结算自动排空，只有队列也满了才拒（`queue_full`）。队列只有一个所有者（`pump()`），槽位一释放就推进，因此同一 tick 内的突发也不会产生竞态。排队任务不占 worker，且可以取消——它立即结算，而不必等取消宽限期。`scheduler_status` 工具暴露运行/排队计数、上限，以及按派发顺序排列的队列，master 扇出前可以先读背压。
 - **排队的工作有保质期。** `limits.queueTtlMs` 限制一个任务能*等*多久：到期即离队并结算为 `timed_out`，错误 `queue_ttl_exceeded`，自始至终没启动过 worker。每任务截止时间更强——`task_submit { deadlineMs }`（从提交起算的预算）或 `{ deadlineAt }`（绝对 epoch 毫秒）覆盖排队**和**执行，所以再深的积压也不能悄悄吹掉一个墙钟承诺：任务无论仍在排队还是已在运行，都会结算为 `timed_out` 且错误为 `deadline_exceeded`；提交时就已经过期的截止时间直接拒收。运行计时器取 `timeoutMs` 与截止剩余量的**较小值**，两个预算互相配合而不是互相打架。
 - **加权公平队列。** profile 权重默认为 `1` 时队列是严格 FIFO（提交顺序 == 派发顺序）。给某个 profile 设 `weight`，调度器就切换成按 finish tag 的加权公平队列（`tag = max(pass[profile], virtualTime) + 1/weight`）：在争用下，`weight: 3` 的 profile 拿到的派发槽位大约是 `weight: 1` 的三倍；而虚拟时间按*被服务*推进，所以后到者无法凭一个陈旧 tag 插到积压前面。权重只重排*等待中*的工作——永远不会让同时运行数超过 `maxConcurrentTasks`。
+- **依赖（`dependsOn`）。** 任务可以声明若干个必须结算为 `succeeded` 的前置任务。它被受理时即为 `queued` 并带一份 `blockedBy` 清单，**不进派发队列**（因此不占槽位、不干扰队列顺序），最后一个依赖成功的那一刻才入队。依赖以任何其他方式结束，都会让该任务以 `dependency_failed` 失败且**不启动 worker**，并且这一失败会沿链向下级联，所以断掉的 DAG 会整体塌陷而不是留下一串永远卡住的任务；取消时 `blockedBy` 同样会清理。被门控的任务计入 `maxQueuedTasks`（它就是「已受理但在等调度器」的工作），因此 `dependsOn` 要求 `maxQueuedTasks > 0`，否则以 `dependency_requires_queue` 拒收。队列 TTL 从任务*就绪*时开始计；每任务截止时间仍然覆盖全程等待。
+- **重试（`retry`）。** 逐任务选择性开启：`{ maxAttempts, delayMs, backoff, maxDelayMs, onlyRetryable }`。一个真正跑过的尝试失败或超时后不会直接结算，而是（按退避）重新入队，直到总次数用完——期间记录从不落到终态，所以 `task_wait` 会跨越所有尝试，依赖它的任务也继续等。受理阶段的拒绝（队满、超深度、交接不合法……）永不重试：它们根本没到过 worker。每次尝试都用新的 worker/AbortController，失败的尝试归档进 `metadata.attempts`（状态、错误、时间、花费、有上限的文本预览），token/成本**跨尝试累加**——因为每次尝试都真的花掉了。`limits.maxRetryAttempts`（默认 5）限制调用方能要到的上限。
+
+```jsonc
+// B 只有在 A 和 C 都成功后才跑；A/C 之一挂掉，B 立刻失败。
+task_submit({ "prompt": "…", "profile": "pi", "dependsOn": ["<taskA>", "<taskC>"] })
+// 同一个任务，最多重试 3 次，退避 0.5s / 1s 后放弃。
+task_submit({ "prompt": "…", "profile": "pi",
+              "retry": { "maxAttempts": 3, "delayMs": 500, "backoff": "exponential" } })
+```
+
+两者都是逐任务选择性开启；两个字段都不传时行为不变（有空槽就启动，首次失败即结算）。
 
 ## 排障
 
@@ -350,6 +363,10 @@ master (machine A)                              worker daemon (machine B)
 | `concurrency_limit_exceeded` | 槽位全忙，且 `maxQueuedTasks` 为 `0` | 等某个任务结算后重试，或设 `maxQueuedTasks > 0` 改为排队而非拒绝 |
 | `queue_full` | 槽位全忙**且**队列已达 `maxQueuedTasks` | 调大 `maxQueuedTasks`，或拆小批次；`scheduler_status` 可看积压 |
 | `queue_ttl_exceeded` | 等待超过 `queueTtlMs` 且从未启动 | 调大 `queueTtlMs`、加容量，或拆批 |
+| `dependency_unknown_task` | `dependsOn` 指向不存在的任务（另一个 `workdir` 下的任务在这里不可见） | 核对 id |
+| `dependency_failed` | 某个依赖结算为 `failed`/`cancelled`/`timed_out`，本任务永远跑不成 | 修复或重跑上游任务；消息里点名了是哪个 |
+| `dependency_requires_queue` | 用了 `dependsOn` 但 `maxQueuedTasks` 为 `0`（没有地方安置被门控任务） | 设 `limits.maxQueuedTasks > 0` |
+| `dependency_limit_exceeded` | `dependsOn` 条数超过 `limits.maxDependencies`（默认 16） | 拆分扇入，或调大上限 |
 | `deadline_exceeded` | 触到 `deadlineMs`/`deadlineAt`——可能在排队中，也可能在运行中 | 给更大预算；若它全程没启动过，那是容量问题，不是任务问题 |
 | `task_timeout` | 运行超过 `timeoutMs`（不涉及截止时间） | 给长回合调大 `timeoutMs` |
 | `delegation_depth_exceeded` | 委派链达到 `maxDelegationDepth` | 通常是 master 在循环委派——先查链路再考虑抬上限 |
@@ -418,13 +435,13 @@ docs/
 
 ```bash
 npm run typecheck   # tsc --noEmit，干净
-npm test            # 82 个测试，全离线，无 API 费用，约 22 秒
+npm test            # 100 个测试，全离线，无 API 费用，约 24 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **82/82**，分六个文件——生命周期、持久化与守卫（32），交接产物（12），结果契约与用量（10），远程 daemon（18），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
+`npm test` 为 **100/100**，分七个文件——生命周期、持久化与守卫（32），交接产物（12），结果契约与用量（10），依赖与重试（18），远程 daemon（18），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
 
 最近一次在 Windows + Node v22.22 上运行。真实的 OpenCode 与 Pi worker 也已端到端跑通（`npm run real`：两者都到达 `succeeded`，共持久化 2 个任务 / 27 条事件）。
 
@@ -445,12 +462,12 @@ npm run real        # 本机真实的 opencode + pi（两者都需已安装并�
 - ✅ 自托管 master 技能：委派手册随仓库发布，并通过 MCP（`master_playbook` 工具 + 资源）提供，master 默认就能委派得体，无需任何复制粘贴。
 - ✅ 跨 Worker 交接（Phase 1–3）：把任务接在已完成前驱的 `result` 上；把前驱的工作树 `diff` 作为脱敏旁挂文件交接，而不是把补丁塞进 prompt；让后继的 worktree 从前驱末态的快照分叉。注入的产物一律按不可信数据、受字节上限约束，存储的 prompt 保持原样。
 - ✅ 结构化结果契约（`outputSchema`，强制生效——违约即失败）与从 ACP `usage_update` 事件汇总的 token/成本，按任务记录并经 `usage_summary` 聚合。
+- ✅ DAG 依赖（`dependsOn`：就绪才入队、失败/取消级联、计入队列容量）与可选重试（固定/指数退避、尝试归档、花费跨尝试累加）。
 
 接下来：
 
 - **远程生产化补强**：开机启动、日志轮转、防火墙，以及真实的双机 TLS 部署样例（loopback 路径已验证，双机还没有）。
-- **DAG 依赖**（任务 B 同时等 A 和 C）与可配置重试——契约类错误码已经标了 `retryable`，重试是有意义的。
-- **审批预算**——限制一次扇出最多能挂起多少个 `waiting` 任务，超了就必须停下来问人。
+- **审批与成本预算**——限制一次扇出最多能挂起多少个 `waiting` 任务，超了就必须停下来问人；并让任务带上一个由 `usage_summary` 结算的成本上限。
 
 这些决定背后的设计笔记、被否决的替代方案与分阶段构建过程：[docs/PLAN.md](docs/PLAN.md)（英文）。
 
