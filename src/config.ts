@@ -10,6 +10,22 @@ const MockBehavior = z.object({
   toolCalls: z.number().int().nonnegative().optional(),
   requireApproval: z.boolean().optional(),
   writeFiles: z.record(z.string()).optional(),
+  usage: z
+    .object({
+      inputTokens: z.number().nonnegative().optional(),
+      outputTokens: z.number().nonnegative().optional(),
+      cachedReadTokens: z.number().nonnegative().optional(),
+      cachedWriteTokens: z.number().nonnegative().optional(),
+      thoughtTokens: z.number().nonnegative().optional(),
+      totalTokens: z.number().nonnegative().optional(),
+      cost: z
+        .object({ amount: z.number().nonnegative(), currency: z.string().optional() })
+        .optional(),
+      contextUsed: z.number().nonnegative().optional(),
+      contextSize: z.number().nonnegative().optional(),
+      reports: z.number().int().positive().optional(),
+    })
+    .optional(),
 });
 
 const RemoteSettings = z.object({

@@ -145,6 +145,22 @@ function mapEvent(
       });
       break;
     case "status":
+      // `usage_update` is a status event carrying token/cost accounting. It is
+      // surfaced as its own worker event type so the task layer can roll it up
+      // without re-parsing the human-facing status text.
+      if (ev.tag === "usage_update") {
+        emit({
+          type: "usage",
+          text: "usage update",
+          data: {
+            ...(ev.cost ? { cost: ev.cost } : {}),
+            ...(ev.breakdown ? { breakdown: ev.breakdown } : {}),
+            ...(ev.used !== undefined ? { contextUsed: ev.used } : {}),
+            ...(ev.size !== undefined ? { contextSize: ev.size } : {}),
+          },
+        });
+        break;
+      }
       emit({ type: "status", text: ev.text, data: { tag: ev.tag } });
       break;
     case "error":

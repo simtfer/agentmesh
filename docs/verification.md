@@ -17,13 +17,13 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 72 tests, offline, ~22s
+npm test            # 82 tests, offline, ~22s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run real        # real local opencode + pi workers (needs both installed & authenticated)
 ```
 
-`npm test` runs the five files below with `tsx --test`. Nothing is skipped, nothing
+`npm test` runs the six files below with `tsx --test`. Nothing is skipped, nothing
 is marked `todo`, and no test asserts a mock's internal calls in place of
 observable behaviour — each one drives the public surface (Orchestrator, MCP
 tools, or the daemon's HTTP/WS endpoints) and checks the resulting task record.
@@ -43,7 +43,7 @@ The lifecycle core. Covers, in order:
 - **Persistence.** A SQLite store survives an orchestrator restart (persist, then
   re-query from a fresh instance); `update()` merges fields without clobbering
   columns the caller left unset; an **old-schema DB is forward-migrated** with the
-  `deadlineAt` column on open.
+  `deadlineAt`, `structured` and `usage` columns on open.
 - **Recursion guard.** A delegation within the cap succeeds and stamps its depth
   into metadata; a submit *at* the cap is refused with `delegation_depth_exceeded`
   and spawns no worker; an inherited `AGENTMESH_DELEGATION_DEPTH` raises the
@@ -96,6 +96,40 @@ repositories (each test gets its own repo with one commit):
 - **Remote successors.** Both artifact handoffs are refused with
   `handoff_artifact_unavailable`, because the sidecar and the snapshot live on the
   master's filesystem.
+
+## `test/contract.test.ts` — 10 cases
+
+Result contracts and usage accounting, all through the Orchestrator with mock
+workers whose replies are fixed strings.
+
+- **Parsing units.** `extractJson` accepts a bare object, a fenced block, and JSON
+  embedded in prose; it rejects prose-only text and the empty string. A `}` inside
+  a string value does not end the scan early (the brace counter is
+  string/escape-aware).
+- **Contract satisfied.** A conforming reply settles `succeeded` with `structured`
+  deep-equal to the parsed value, `metadata.outputContract.status = "ok"`, and the
+  stored `prompt` still exactly what the master submitted (the schema is prompt
+  payload, never persisted).
+- **Tolerant extraction.** JSON wrapped in a sentence plus a ```` ```json ```` fence
+  is still accepted.
+- **`output_not_json`.** A prose reply fails the task with `retryable: true`, the
+  raw text is still persisted (a failure you cannot read is undiagnosable), and
+  `structured` stays absent.
+- **`output_schema_invalid`.** Valid JSON that violates the schema fails with at
+  least two validator errors and the offending JSON paths recorded.
+- **The instruction reaches the worker.** A profile that fails whenever the prompt
+  contains `OUTPUT CONTRACT` fails with a schema and succeeds without one — proving
+  the block is really injected rather than merely noted in metadata.
+- **`output_schema_too_large`.** A schema over 16 KiB is refused at submit with no
+  worker spawned.
+- **Latest-report-wins.** Three usage reports carrying running totals
+  (100/200/300 input tokens) roll up to 300, not 600 — summing would
+  multiply-count a cumulative counter.
+- **Cost is a delta.** Two tasks on the *same* worker: the second reports 0.03, not
+  the worker's cumulative 0.06.
+- **`usage_summary`.** Aggregates tokens across tasks, keeps USD and CNY in
+  separate buckets (never sums across currencies), filters by `profile`, and a
+  future `since` cutoff selects nothing.
 
 ## `test/remote.test.ts` — 18 cases
 
@@ -160,7 +194,12 @@ Honest limits of the evidence above — these are not covered by the suite yet:
   rather than as a documented multi-writer contract.
 - **Concurrent editors on one repo.** Worktree isolation is verified, but two
   workers editing the *same* worktree concurrently is not.
-- **Cost and usage.** ACP `usage_update` events are not yet rolled up or asserted.
+- **Cost and usage are only as good as the adapter.** The roll-up is exercised
+  against the mock's usage reports and the ACP `usage_update` mapping is
+  type-checked against `acpx`, but no real adapter's cost figure has been asserted
+  end-to-end here — and adapters differ in what they report (Claude Code attaches a
+  per-turn breakdown; others send only a cumulative cost, or nothing). Missing
+  fields therefore mean "unknown", never zero.
 - **Long-running soak.** Queueing and fairness are tested as unit scenarios, not
   as a multi-hour soak.
 - **Diff handoffs are single-host.** A remote successor is refused rather than

@@ -17,6 +17,15 @@ export {
   writeHandoffSidecar,
 } from "./handoff.js";
 export type { RedactionReport, DiffCapture } from "./handoff.js";
+export {
+  MAX_SCHEMA_BYTES,
+  extractJson,
+  validateValue,
+  checkSchemaSize,
+  checkAgainstContract,
+  buildContractInstruction,
+} from "./contract.js";
+export type { ContractCheck, ContractFailure, ContractFailureCode } from "./contract.js";
 export { createMcpServer, runMcpServer } from "./mcp/server.js";
 export { readSkill, skillPath, skillResourceUri, findPackageRoot, SKILL_LANGS } from "./skill.js";
 export type { SkillLang, SkillLoadResult } from "./skill.js";

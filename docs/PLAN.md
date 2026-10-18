@@ -367,11 +367,23 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
      `handoff_base_requires_worktree`，前驱工作树已消失/跨仓拒 `handoff_base_unavailable`。
    - ✅ 远程后继：diff/snapshot 是 master 本地文件，远程 worker 看不到，受理期以 `handoff_artifact_unavailable` 拒绝
      （而不是给一个读不到的路径）。daemon 侧 artifact 传输留待需要时再做。
-5. **结构化结果契约**：每任务 JSON 输出 schema + 从 ACP `usage_update` 汇总成本/用量。
+5. ~~**结构化结果契约**~~ ✅ 已落地：`task_submit`/`dispatch_task` 的 `outputSchema`（JSON Schema，draft-07 语义，
+   经 ajv 校验）在 run 时作为 `OUTPUT CONTRACT (enforced)` 区块追加到提示词末尾（瞬态，不落库），结束后解析
+   （整段 → 代码围栏 → 首个平衡 `{…}`/`[…]`）并校验：解析不出 → `output_not_json`，违反 schema →
+   `output_schema_invalid`（最多 10 条错误带 JSON 路径，进 `metadata.outputContract.errors`），二者都**失败任务但保留原文**
+   且标 `retryable`；schema 序列化 >16 KiB 在受理期以 `output_schema_too_large` 拒绝（它是提示词负载）。
+   成功时解析值落 `structured` 列，`task_result` 直接返回。
+   ~~成本/用量汇总~~ ✅ 已落地：ACP `usage_update` 在驱动层映射为 `usage` worker 事件；任务层**以最新上报覆盖**而非累加
+   （ACP 报的是会话当前状态：token 是按回合总量、cost 是累计值），token 落 `usage` 列并即时持久化（超时/取消也留痕）；
+   **成本按增量归属**——回合开始时记住该 worker 的累计 cost 基线，只把差值算给本任务，复用 worker 不会重复计费；
+   计数器倒退视为适配器重启，按本回合独立数字处理。`usage_summary` 跨任务聚合（`profile`/`since` 过滤），
+   **成本按币种分组、绝不跨币种相加**。
+   - 偏差说明：schema 本身不落库（只存 `structured` 与 `outputContract` 判定）——它是提交者的输入，重放时由调用方提供；
+     避免每条任务记录被 16 KiB schema 撑大。`$schema` 声明其他草案时被忽略而非报错。
 6. ~~**递归守卫**~~ ✅ 已落地：`limits.maxDelegationDepth`（默认 8）+ `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播，
    达上限的 submit 以 `delegation_depth_exceeded` 失败且不 spawn worker（预算上限并入 Stage 5）。
    ~~最大并发 / 单任务输出大小上限~~ ✅ 亦已落地（见 §7）。
 7. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
 
-> Stage 0–3 已完成并通过 72 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、自托管 master 技能，以及跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree）。
-> 下一步优先远程真实双机 TLS 部署与 Stage 5 进阶调度（DAG 依赖、重试、预算）。
+> Stage 0–3 已完成并通过 82 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree，以及结构化结果契约 + token/成本汇总）。
+> 下一步优先远程真实双机 TLS 部署、Stage 5 进阶调度（DAG 依赖、重试、审批预算）与可选 Web 控制台。

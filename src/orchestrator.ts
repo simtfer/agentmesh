@@ -9,6 +9,7 @@ import type {
   TaskStatus,
   TaskStore,
   TaskSubmitInput,
+  TaskUsage,
   WorkerProfile,
 } from "./types.js";
 import { DEFAULT_MAX_DELEGATION_DEPTH, DELEGATION_DEPTH_ENV } from "./types.js";
@@ -50,6 +51,8 @@ export interface DispatchInput {
   deadlineAt?: number;
   /** Cross-worker handoff (Phase 1): inject a predecessor's result as untrusted context. */
   handoff?: HandoffSpec;
+  /** Structured result contract: JSON Schema the final answer must satisfy. */
+  outputSchema?: Record<string, unknown>;
   /** live task-event stream (also persisted to the store) */
   onEvent?: (ev: TaskEvent) => void;
 }
@@ -60,6 +63,10 @@ export interface DispatchResult {
   profile: string;
   status: "completed" | "cancelled" | "failed";
   text: string;
+  /** parsed JSON result when an `outputSchema` contract was satisfied */
+  structured?: unknown;
+  /** token/cost roll-up reported by the worker, when it reports any */
+  usage?: TaskUsage;
   stopReason?: string;
   cwd: string;
   worktree?: string;
@@ -234,6 +241,11 @@ export class Orchestrator {
     return this.tasks.schedulerStats();
   }
 
+  /** Token/cost roll-up across tasks, optionally narrowed by profile and start time. */
+  usageSummary(filter?: { profile?: string; since?: number }) {
+    return this.tasks.usageSummary(filter);
+  }
+
   waitTask(taskId: string, timeoutMs?: number): Promise<TaskRecord | undefined> {
     return this.tasks.wait(taskId, timeoutMs);
   }
@@ -267,6 +279,7 @@ export class Orchestrator {
         deadlineMs: input.deadlineMs,
         deadlineAt: input.deadlineAt,
         handoff: input.handoff,
+        outputSchema: input.outputSchema,
       },
       { onEvent: input.onEvent },
     );
@@ -288,6 +301,8 @@ export class Orchestrator {
       status,
       text: rec?.text ?? "",
       stopReason: rec?.stopReason,
+      ...(rec?.structured !== undefined ? { structured: rec.structured } : {}),
+      ...(rec?.usage ? { usage: rec.usage } : {}),
       cwd: wrec?.cwd ?? input.cwd ?? this.baseCwd,
       worktree: wrec?.worktree?.path,
       error:

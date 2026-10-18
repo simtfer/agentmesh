@@ -30,6 +30,7 @@ anything else, with the same code.
 - [MCP tools exposed to the master](#mcp-tools-exposed-to-the-master)
 - [Master skill (self-hosted)](#master-skill-self-hosted)
 - [Cross-worker handoff](#cross-worker-handoff)
+- [Structured results and cost](#structured-results-and-cost)
 - [Attach a real master](#attach-a-real-master)
 - [CLI](#cli)
 - [Remote Worker Daemon (cross-machine workers)](#remote-worker-daemon-cross-machine-workers)
@@ -77,7 +78,8 @@ Working and verified end-to-end: an **8-state persistent task machine** (SQLite)
 **human-in-the-loop approval flow** for worker permission/elicitation requests, a
 **bounded, weighted-fair scheduler** (queue TTLs, per-task deadlines, opt-in
 profile weights) for parallel fan-out, **cross-worker handoff** (result text,
-redacted diff sidecars, predecessor end-state worktrees), a
+redacted diff sidecars, predecessor end-state worktrees), **enforced JSON result
+contracts** with **token/cost roll-up**, a
 self-hosted **master delegation skill**, and a **remote Worker Daemon** for
 cross-machine workers over an authenticated, TLS-capable channel — driven against
 **real local OpenCode and Pi agents** as well as deterministic mocks. See
@@ -209,14 +211,15 @@ Cancelling or timing out a task auto-resolves its pending approvals.
 | `agent_inspect` | one worker's status + recent event log |
 | `spawn_worker` | start a worker (optionally in a git worktree) |
 | `kill_worker` | close a worker and clean its worktree |
-| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call); `deadlineMs`/`deadlineAt` bound queue wait + execution; optional `handoff` chains onto a finished task |
+| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call); `deadlineMs`/`deadlineAt` bound queue wait + execution; optional `handoff` chains onto a finished task; `outputSchema` enforces a JSON result contract |
 | `task_status` | current status of a task |
 | `task_wait` | block until terminal **or** `waiting` (needs approval) |
-| `task_result` | final text / status / error of a task |
+| `task_result` | final text / status / error of a task, plus `structured` (contract result), `usage` (tokens/cost) and `contract` (verdict) |
 | `task_events` | persisted event log after a sequence number |
 | `task_cancel` | request cancellation (settles once the worker confirms) |
 | `list_tasks` | list tasks, optionally filtered by status |
 | `scheduler_status` | running vs queued counts, configured caps (`maxQueuedTasks`, `queueTtlMs`), the queue in dispatch order, and per-entry weight / wait / time-to-expiry |
+| `usage_summary` | token/cost roll-up across tasks (`profile`, `since` filters), costs grouped by currency |
 | `pending_approvals` | approval/elicitation requests blocking a `waiting` task |
 | `task_approve` | resolve a permission request (allow/deny/cancel) |
 | `task_respond` | answer an elicitation request |
@@ -310,6 +313,77 @@ Two independent axes:
 > Diff handoffs and predecessor snapshots assume the successor runs on the same
 > host as the master. A `driver: remote` successor can see neither artifact, so
 > agentmesh refuses the combination rather than handing it a path it cannot read.
+
+## Structured results and cost
+
+Free-form prose is fine for a human reader and useless for a program. Two opt-in
+features make a fan-out machine-consumable: an enforced **JSON result contract**
+and a **token/cost roll-up**.
+
+### Result contracts
+
+```jsonc
+{
+  "task": "Extract the failing test names as JSON.",
+  "profile": "pi",
+  "outputSchema": {
+    "type": "object",
+    "required": ["tests"],
+    "properties": { "tests": { "type": "array", "items": { "type": "string" } } },
+    "additionalProperties": false
+  }
+}
+```
+
+The schema is appended to the worker's prompt as a `OUTPUT CONTRACT (enforced)`
+block — last, so it reads as the final formatting rule — asking for one raw JSON
+value and nothing else. When the turn finishes, agentmesh parses the reply and
+validates it:
+
+- **Parsing is tolerant, validation is not.** Agents fence or pad their JSON even
+  when told not to, so the parser tries the whole reply, then a ```` ```json ````
+  block, then the first balanced `{…}` / `[…]` region. Nothing parseable →
+  `output_not_json`.
+- **A violation fails the task.** `output_schema_invalid` carries up to ten
+  validator errors with their JSON paths in `error.message` and
+  `metadata.outputContract.errors`. The offending text is still stored, because a
+  failure you cannot see is worse than one you can.
+- **`structured` is the payoff.** On success `task_result` returns the parsed value
+  in `structured` (and `task_status` carries it on the record), so a master can
+  read a list, a table or a boolean verdict without re-parsing prose.
+- **The schema is prompt, not data.** It must serialize to ≤ 16 KiB
+  (`output_schema_too_large` otherwise) and it is never persisted on the task —
+  only the parsed value and a compact `metadata.outputContract` verdict.
+- Keywords are evaluated with **draft-07 semantics** (ajv); a `$schema` naming
+  another draft is ignored rather than treated as a hard error.
+
+### Cost and usage roll-up
+
+Workers that report usage (ACP `usage_update`, e.g. Claude Code) feed a per-task
+record in `usage`:
+
+```jsonc
+{
+  "inputTokens": 1200, "outputTokens": 340, "cachedReadTokens": 800,
+  "cost": { "amount": 0.0123, "currency": "USD" },
+  "contextUsed": 12000, "contextSize": 200000, "reports": 4
+}
+```
+
+Two decisions matter here:
+
+- **Latest report wins, not the sum.** ACP reports the *current state* of the
+  session — token counts are per-turn totals and cost is cumulative — so folding
+  every report in by addition would multiply-count. Each new report replaces the
+  previous one.
+- **Cost is a delta.** Reusing a worker via `workerId` means its cumulative cost
+  already includes earlier tasks; agentmesh remembers the baseline at turn start
+  and attributes only the difference to this task. (A counter that goes backwards
+  — an adapter restart — is treated as a per-turn figure instead.)
+
+`usage_summary` aggregates across tasks, filtered by `profile` and `since`.
+Costs are grouped by currency and never summed across currencies. Absent fields
+mean "the agent never reported it", not zero — adapters differ in what they emit.
 
 ## Attach a real master
 
@@ -476,6 +550,9 @@ Every failure lands on the task record (`error.code`) *and* the event log, so
 | `handoff_base_requires_worktree` | `base: "predecessor"` without a worktree | pass `worktree: true` or enable it on the profile |
 | `handoff_base_unavailable` | the predecessor's checkout is gone or in another repo | keep its worker alive until the successor starts |
 | `handoff_artifact_unavailable` | a `diff`/`predecessor` handoff targets a remote worker, or the checkout vanished | run the successor locally, or use `inject: "result"` |
+| `output_not_json` | `outputSchema` was set but the reply contains no parseable JSON | restate the contract in the task ("reply with JSON only"); `retryable`, so re-running is reasonable |
+| `output_schema_invalid` | the reply parsed but violates the schema | read `metadata.outputContract.errors` for the offending paths — usually one field the prompt never pinned down |
+| `output_schema_too_large` | the schema exceeds 16 KiB | trim descriptions/examples; the schema goes into the prompt |
 
 Symptoms that aren't error codes:
 
@@ -502,6 +579,7 @@ src/
   statemachine.ts      8-state transitions + terminal/legality guards
   worktree.ts          git-worktree isolation for parallel workers
   handoff.ts           diff capture, secret redaction, end-state snapshots, sidecars
+  contract.ts          JSON result contracts: extraction, ajv validation, prompt block
   registry.ts          worker lifecycle + bounded event log
   approvals.ts         ApprovalBroker: bridges permission/elicitation to the master
   tasks.ts             TaskManager: async 8-state lifecycle, timeout/cancel, approvals, handoff
@@ -519,7 +597,7 @@ src/
     daemon.ts          WorkerDaemon: HTTP+WS shim wrapping a local Orchestrator
     client.ts          RemoteWorkerDriver: a remote profile as a normal WorkerDriver
     audit.ts           append-only NDJSON audit log; secrets reduced to a fingerprint
-  mcp/server.ts        exposes the orchestrator as 17 MCP tools over stdio
+  mcp/server.ts        exposes the orchestrator as 18 MCP tools over stdio
   skill.ts             loads the self-hosted master playbook from skills/ (root resolver)
   cli.ts               demo | list | mcp | dispatch | submit | tasks | daemon
 skills/
@@ -542,14 +620,15 @@ Swap the two and it still works.
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 72 tests, offline, no API cost, ~22s
+npm test            # 82 tests, offline, no API cost, ~22s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **72/72** across five files — lifecycle, persistence and guards (32),
-handoff artifacts (12), remote daemon (18), orchestrator (6), master skill (4).
+`npm test` is **82/82** across six files — lifecycle, persistence and guards (32),
+handoff artifacts (12), result contracts and usage (10), remote daemon (18),
+orchestrator (6), master skill (4).
 Every case drives a public surface (Orchestrator, MCP tools, or the daemon's
 HTTP/WS endpoints) and asserts the resulting task record, not a mock's internal
 calls.
@@ -583,11 +662,19 @@ Done:
   file instead of inlining the patch; and start the successor's worktree from a
   snapshot of the predecessor's end state. Injected artifacts are untrusted data
   under a byte cap, and the stored prompt stays original.
+- ✅ Structured result contracts (`outputSchema`, enforced — a violation fails the
+  task) and token/cost roll-up from ACP `usage_update` events, per task and
+  aggregated through `usage_summary`.
 
 Next:
 
-- Structured result contracts (JSON output schema per task) + cost/usage roll-up
-  from ACP `usage_update` events.
+- **Remote production hardening:** boot-time start, log rotation, firewall rules,
+  and a real two-host TLS deployment recipe (the loopback path is verified; two
+  machines are not).
+- **DAG dependencies** (`task B waits for A *and* C`) and configurable retries —
+  the contract codes are already marked `retryable` where a retry is meaningful.
+- **Approval budgets** — cap how many `waiting` tasks a fan-out may open before it
+  must stop and ask.
 
 Design notes, rejected alternatives and the staged build-up behind these
 decisions: [docs/PLAN.md](docs/PLAN.md).

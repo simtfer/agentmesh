@@ -24,7 +24,23 @@ import {
   snapshotWorkingTree,
   writeHandoffSidecar,
 } from "./handoff.js";
+import { buildContractInstruction, checkAgainstContract, checkSchemaSize } from "./contract.js";
+import type { TaskUsage } from "./types.js";
 import path from "node:path";
+
+/** Token fields a worker's usage report may carry; each is "absent = unknown". */
+const TOKEN_KEYS = [
+  "inputTokens",
+  "outputTokens",
+  "cachedReadTokens",
+  "cachedWriteTokens",
+  "thoughtTokens",
+  "totalTokens",
+] as const;
+
+function numeric(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
 
 export interface WorkerProvider {
   spawnWorker(
@@ -53,6 +69,14 @@ interface LiveTask {
   waiting: Promise<TaskRecord>;
   resolveWaiting: (r: TaskRecord) => void;
   onEvent?: (ev: TaskEvent) => void;
+  /** usage roll-up accumulated from the worker's `usage` events */
+  usage?: TaskUsage;
+  /**
+   * The worker's cumulative session cost at the moment this turn started. The
+   * task's cost is reported as a delta against it, so a reused worker does not
+   * bill this task for everything it ran before.
+   */
+  costBaseline?: number;
 }
 
 /**
@@ -196,6 +220,11 @@ export class TaskManager {
   private baseRepo: string;
   private profileWorktree: (profile: string) => boolean;
   private profileIsRemote: (profile: string) => boolean;
+  /**
+   * Last cumulative session cost reported per worker. Used as the baseline for
+   * the next turn on that worker so per-task cost is a delta, never a re-bill.
+   */
+  private costByWorker = new Map<string, number>();
   /** true once a profile with a non-default weight joins the queue */
   private weighted = false;
   /** per-profile last finish tag (the WFQ backlog clock) */
@@ -316,6 +345,13 @@ export class TaskManager {
         "deadline_exceeded",
         `deadline ${new Date(deadlineAt).toISOString()} had already passed when the task was submitted`,
       );
+    }
+
+    // The contract is injected into the prompt, so an oversized schema is prompt
+    // bloat, not data: refuse before it ever reaches a worker.
+    if (input.outputSchema) {
+      const tooLarge = checkSchemaSize(input.outputSchema);
+      if (tooLarge) return this.refuse(taskId, tooLarge.code, tooLarge.message);
     }
 
     // Cross-worker handoff admission (Phase 1). Validate the predecessor BEFORE
@@ -846,7 +882,18 @@ export class TaskManager {
       // be augmented with a predecessor's result. This is ephemeral — the stored
       // `prompt` stays the user's original — and the upstream artifact is wrapped
       // as untrusted data and byte-capped. No-op when the task has no handoff.
-      const effectivePrompt = await this.applyHandoff(taskId, input);
+      const handedOff = await this.applyHandoff(taskId, input);
+
+      // Structured result contract: appended last so it is the closest thing to
+      // the task and the worker reads it as the final formatting rule. Also
+      // ephemeral — the stored prompt never carries the schema.
+      const effectivePrompt = input.outputSchema
+        ? `${handedOff}\n\n${buildContractInstruction(input.outputSchema)}`
+        : handedOff;
+
+      // Where the worker's cumulative cost stood before this turn, so the cost
+      // reported for this task is a delta rather than the session total.
+      live.costBaseline = this.costByWorker.get(workerId) ?? 0;
 
       const turn = await wrec.handle.runTurn(effectivePrompt, {
         signal: live.controller.signal,
@@ -886,12 +933,46 @@ export class TaskManager {
             { kind: "status", truncated: true, maxOutputBytes: this.maxOutputBytes },
           );
         }
-        this.setState(taskId, "succeeded", {
-          text: capped.text,
-          stopReason: turn.stopReason,
-          finishedAt: Date.now(),
-          ...(capped.truncated ? { outputTruncated: true } : {}),
-        });
+
+        // Enforce the structured result contract, if any. A contract that is not
+        // checked is a comment: a reply that does not satisfy it fails the task,
+        // with the offending text kept for debugging.
+        const contract = input.outputSchema
+          ? checkAgainstContract(input.outputSchema, capped.text)
+          : undefined;
+        const contractMeta = contract
+          ? contract.ok
+            ? { status: "ok" }
+            : { status: "violated", code: contract.failure!.code, errors: contract.failure!.errors }
+          : undefined;
+        const metadata = contractMeta
+          ? { ...(this.store.getTask(taskId)?.metadata ?? {}), outputContract: contractMeta }
+          : undefined;
+
+        if (contract && !contract.ok) {
+          const failure = contract.failure!;
+          this.append(taskId, "output", failure.message, {
+            kind: "contract",
+            code: failure.code,
+            ...(failure.errors ? { errors: failure.errors } : {}),
+          });
+          this.setState(taskId, "failed", {
+            text: capped.text,
+            stopReason: turn.stopReason,
+            finishedAt: Date.now(),
+            ...(metadata ? { metadata } : {}),
+            error: { code: failure.code, message: failure.message, retryable: true },
+          });
+        } else {
+          this.setState(taskId, "succeeded", {
+            text: capped.text,
+            stopReason: turn.stopReason,
+            finishedAt: Date.now(),
+            ...(metadata ? { metadata } : {}),
+            ...(contract && contract.ok ? { structured: contract.value } : {}),
+            ...(capped.truncated ? { outputTruncated: true } : {}),
+          });
+        }
       } else if (turn.status === "cancelled") {
         this.setState(taskId, "cancelled", { finishedAt: Date.now() });
       } else {
@@ -949,6 +1030,53 @@ export class TaskManager {
       ...(subKind !== undefined ? { subKind } : {}),
       ...rest,
     });
+    if (ev.type === "usage") this.rollUpUsage(taskId, workerId, ev.data);
+  }
+
+  /**
+   * Fold one usage report into the task's running totals.
+   *
+   * ACP reports usage as the *current state* of the session, not as an increment:
+   * token counts are per-turn totals and `cost` is the cumulative session cost.
+   * So each report replaces the previous one instead of adding to it — summing
+   * would multiply-count — and the task's cost is the delta against the worker's
+   * cumulative cost when this turn began.
+   */
+  private rollUpUsage(taskId: string, workerId: string, data: Record<string, unknown> | undefined): void {
+    const live = this.live.get(taskId);
+    if (!live) return; // settled (or not this manager's): the event row is enough
+
+    const usage: TaskUsage = { ...(live.usage ?? {}) };
+    const breakdown = data?.breakdown as Record<string, unknown> | undefined;
+    for (const key of TOKEN_KEYS) {
+      const v = numeric(breakdown?.[key]);
+      if (v !== undefined) usage[key] = v;
+    }
+
+    const cost = data?.cost as { amount?: unknown; currency?: unknown } | undefined;
+    const amount = numeric(cost?.amount);
+    if (amount !== undefined) {
+      const baseline = live.costBaseline;
+      // A cost that went backwards means the adapter restarted its counter; in
+      // that case the reported figure *is* this turn's cost, not a delta.
+      const delta = baseline !== undefined && amount >= baseline ? amount - baseline : amount;
+      usage.cost = {
+        amount: delta,
+        ...(typeof cost?.currency === "string" ? { currency: cost.currency } : {}),
+      };
+      this.costByWorker.set(workerId, amount);
+    }
+
+    const contextUsed = numeric(data?.contextUsed);
+    if (contextUsed !== undefined) usage.contextUsed = contextUsed;
+    const contextSize = numeric(data?.contextSize);
+    if (contextSize !== undefined) usage.contextSize = contextSize;
+
+    usage.reports = (usage.reports ?? 0) + 1;
+    live.usage = usage;
+    // Persist immediately: a task that times out or is cancelled mid-turn should
+    // still report what it already spent.
+    this.store.updateTask(taskId, { usage });
   }
 
   private async onPermission(taskId: string, req: PermissionRequest): Promise<PermissionDecision> {
@@ -1034,6 +1162,65 @@ export class TaskManager {
 
   listTasks(filter?: { status?: TaskStatus; limit?: number }): TaskRecord[] {
     return this.store.listTasks(filter);
+  }
+
+  /**
+   * Aggregate token/cost across tasks, optionally narrowed by profile and start
+   * time. Costs are grouped by currency rather than summed across them — adding
+   * USD to CNY would be a lie.
+   *
+   * This walks the task table (there is no usage index), which is fine at the
+   * scale a single master produces; a long-lived deployment with tens of
+   * thousands of rows would want a summary table instead.
+   */
+  usageSummary(filter?: { profile?: string; since?: number }): {
+    tasks: number;
+    reporting: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedReadTokens: number;
+    cachedWriteTokens: number;
+    thoughtTokens: number;
+    totalTokens: number;
+    cost: Array<{ currency: string; amount: number }>;
+  } {
+    const totals = {
+      tasks: 0,
+      reporting: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      thoughtTokens: 0,
+      totalTokens: 0,
+    };
+    const cost = new Map<string, number>();
+
+    for (const t of this.store.listTasks()) {
+      if (filter?.profile && t.profile !== filter.profile) continue;
+      if (filter?.since !== undefined && t.createdAt < filter.since) continue;
+      totals.tasks++;
+      const u = t.usage;
+      if (!u) continue;
+      totals.reporting++;
+      totals.inputTokens += u.inputTokens ?? 0;
+      totals.outputTokens += u.outputTokens ?? 0;
+      totals.cachedReadTokens += u.cachedReadTokens ?? 0;
+      totals.cachedWriteTokens += u.cachedWriteTokens ?? 0;
+      totals.thoughtTokens += u.thoughtTokens ?? 0;
+      totals.totalTokens += u.totalTokens ?? 0;
+      if (u.cost) {
+        const cur = u.cost.currency ?? "unknown";
+        cost.set(cur, (cost.get(cur) ?? 0) + u.cost.amount);
+      }
+    }
+
+    return {
+      ...totals,
+      cost: [...cost.entries()]
+        .map(([currency, amount]) => ({ currency, amount }))
+        .sort((a, b) => a.currency.localeCompare(b.currency)),
+    };
   }
 
   pendingApprovals(taskId?: string) {

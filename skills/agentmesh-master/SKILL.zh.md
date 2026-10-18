@@ -85,6 +85,8 @@ agent_list ─▶ 规划/拆解 ─▶ scheduler_status ─▶ task_submit（×N
 | 停掉一个任务 | `task_cancel` |
 | 看什么卡住了 `waiting` 任务 | `pending_approvals` |
 | 解决权限请求 | `task_approve` |
+| 要机器可读的结果而不是散文 | `task_submit` 带 `outputSchema` → 从 `task_result` 的 `structured` 读 |
+| 看一次扇出花了多少 | `usage_summary`（`profile`、`since`） |
 | 回答 elicitation | `task_respond` |
 | 把 B 接在已完成 A 的产物上 | `task_submit` 的 `handoff`（`inject`、`base`） |
 

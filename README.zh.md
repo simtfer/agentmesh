@@ -26,6 +26,7 @@
 - [暴露给 master 的 MCP 工具](#暴露给-master-的-mcp-工具)
 - [自托管的 master 技能](#自托管的-master-技能)
 - [跨 Worker 交接](#跨-worker-交接)
+- [结构化结果与成本](#结构化结果与成本)
 - [接入真实的 master](#接入真实的-master)
 - [命令行](#命令行)
 - [远程 Worker Daemon](#远程-worker-daemon)
@@ -54,7 +55,7 @@
 
 ## 当前状态
 
-已实现并做过端到端验证：**8 态持久化任务机**（SQLite）、**异步任务生命周期**（`task_submit` / `task_wait` / `task_result`……）、面向 worker 权限/交互请求的**人在环路审批流**、用于并行扇出的**有界、加权公平调度器**（队列 TTL、每任务截止时间、可选 profile 权重）、**跨 Worker 交接**（结果注入、脱敏 diff 旁挂、前驱末态 worktree）、自托管的 **master 委派技能**，以及让 worker 跨机器运行的**远程 Worker Daemon**（带认证、可走 TLS）——驱动对象既有**本机真实的 OpenCode 和 Pi**，也有确定性的 mock。详见[验证](#验证)。
+已实现并做过端到端验证：**8 态持久化任务机**（SQLite）、**异步任务生命周期**（`task_submit` / `task_wait` / `task_result`……）、面向 worker 权限/交互请求的**人在环路审批流**、用于并行扇出的**有界、加权公平调度器**（队列 TTL、每任务截止时间、可选 profile 权重）、**跨 Worker 交接**（结果注入、脱敏 diff 旁挂、前驱末态 worktree）、**强制的 JSON 结果契约**与 **token/成本汇总**、自托管的 **master 委派技能**，以及让 worker 跨机器运行的**远程 Worker Daemon**（带认证、可走 TLS）——驱动对象既有**本机真实的 OpenCode 和 Pi**，也有确定性的 mock。详见[验证](#验证)。
 
 ## 安装
 
@@ -161,14 +162,15 @@ worker 撞上高风险工具（ACP permission request）或需要补充输入（
 | `agent_inspect` | 单个 worker 的状态与最近事件日志 |
 | `spawn_worker` | 启动一个 worker（可选在 git worktree 中） |
 | `kill_worker` | 关闭 worker 并清理它的 worktree |
-| `task_submit` | **提交任务，立刻返回 `taskId`**（异步主动作）；`deadlineMs`/`deadlineAt` 约束排队 + 执行总时长；可选 `handoff` 接在一个已完成任务之后 |
+| `task_submit` | **提交任务，立刻返回 `taskId`**（异步主动作）；`deadlineMs`/`deadlineAt` 约束排队 + 执行总时长；可选 `handoff` 接在一个已完成任务之后；`outputSchema` 强制 JSON 结果契约 |
 | `task_status` | 某个任务的当前状态 |
 | `task_wait` | 阻塞到终态**或** `waiting`（需要审批） |
-| `task_result` | 任务的最终文本 / 状态 / 错误 |
+| `task_result` | 任务的最终文本 / 状态 / 错误，外加 `structured`（契约结果）、`usage`（token/成本）与 `contract`（判定） |
 | `task_events` | 按序号翻取持久化事件日志 |
 | `task_cancel` | 请求取消（worker 确认后才结算） |
 | `list_tasks` | 列出任务，可按状态过滤 |
 | `scheduler_status` | 运行/排队计数、已配置上限（`maxQueuedTasks`、`queueTtlMs`）、按派发顺序排列的队列，以及每项的权重 / 等待时长 / 距过期时间 |
+| `usage_summary` | 跨任务汇总 token/成本（可按 `profile`、`since` 过滤），成本按币种分组 |
 | `pending_approvals` | 阻塞某个 `waiting` 任务的审批/elicitation 请求 |
 | `task_approve` | 处理权限请求（允许/拒绝/取消） |
 | `task_respond` | 回答 elicitation 请求 |
@@ -216,6 +218,52 @@ agentmesh 还**自带 master 技能**：`skills/agentmesh-master/` 下的委派�
 - **字节上限。** `handoff.maxBytes`（缺省回落到 `limits.maxHandoffBytes`，默认 256 KiB），在 UTF-8 边界截断并标 `truncated`。
 
 > diff 交接与前驱快照假设后继与 master 在同一台机器上。`driver: remote` 的后继看不到这两类产物，所以 agentmesh 直接拒绝这种组合，而不是给它一个读不到的路径。
+
+## 结构化结果与成本
+
+自由文本对人友好，对程序无用。两个可选能力让扇出结果可以**被机器消费**：强制的 **JSON 结果契约**，以及 **token/成本汇总**。
+
+### 结果契约
+
+```jsonc
+{
+  "task": "把失败的测试名以 JSON 返回。",
+  "profile": "pi",
+  "outputSchema": {
+    "type": "object",
+    "required": ["tests"],
+    "properties": { "tests": { "type": "array", "items": { "type": "string" } } },
+    "additionalProperties": false
+  }
+}
+```
+
+schema 会作为 `OUTPUT CONTRACT (enforced)` 区块追加到 worker 提示词**末尾**——放在最后，让它读起来像最终格式要求——要求只回一个裸 JSON 值。回合结束后，agentmesh 解析回复并校验：
+
+- **解析宽容，校验不宽容。** 即便明确要求，agent 仍会加代码围栏或前后废话，所以解析按序尝试：整段回复 → ```` ```json ```` 围栏块 → 文本里第一个平衡的 `{…}` / `[…]` 区域。什么都解析不出来 → `output_not_json`。
+- **违反契约 = 任务失败。** `output_schema_invalid` 会把最多 10 条校验错误及其 JSON 路径放进 `error.message` 与 `metadata.outputContract.errors`。原始文本仍然保存——看不见的失败比看得见的更糟。
+- **`structured` 才是收益。** 成功时 `task_result` 在 `structured` 里返回解析后的值（`task_status` 的记录上也带），master 可以直接读一个列表、一张表或一个布尔裁决，不用再解析散文。
+- **schema 是提示词，不是数据。** 序列化后必须 ≤ 16 KiB（否则 `output_schema_too_large`），且**不落库**——只存解析后的值与一份精简的 `metadata.outputContract` 判定。
+- 关键字按 **draft-07 语义**求值（ajv）；`$schema` 指向其他草案时会被忽略，而不是当作错误。
+
+### 成本与用量汇总
+
+会上报用量的 worker（ACP `usage_update`，例如 Claude Code）会为任务留下 `usage` 记录：
+
+```jsonc
+{
+  "inputTokens": 1200, "outputTokens": 340, "cachedReadTokens": 800,
+  "cost": { "amount": 0.0123, "currency": "USD" },
+  "contextUsed": 12000, "contextSize": 200000, "reports": 4
+}
+```
+
+这里有两个关键决定：
+
+- **最新一次上报胜出，而不是累加。** ACP 报的是会话**当前状态**——token 是按回合的总量、成本是累计值——逐条累加会重复计数。每条新上报替换上一条。
+- **成本是增量。** 通过 `workerId` 复用 worker 时，它的累计成本已经包含之前的任务；agentmesh 在回合开始时记住基线，只把差值算到本任务头上。（计数器倒退——适配器重启——则视为本回合的独立数字。）
+
+`usage_summary` 跨任务汇总，可按 `profile` 与 `since` 过滤。成本按币种分组，**绝不跨币种相加**。字段缺失表示「agent 没上报」，不是零——各适配器上报的内容并不一致。
 
 ## 接入真实的 master
 
@@ -310,6 +358,9 @@ master (machine A)                              worker daemon (machine B)
 | `handoff_base_requires_worktree` | 用了 `base: "predecessor"` 但没开 worktree | 提交时传 `worktree: true`，或在 profile 上开启 |
 | `handoff_base_unavailable` | 前驱的工作树已消失，或不在同一个仓库 | 在先继任任务启动前别杀掉前驱 worker |
 | `handoff_artifact_unavailable` | 对远程 worker 用了 `diff`/`predecessor` 交接，或工作树已不存在 | 让后继在本机跑，或改用 `inject: "result"` |
+| `output_not_json` | 设了 `outputSchema`，但回复里没有可解析的 JSON | 在任务里重申契约（「只回 JSON」）；该错误 `retryable`，重跑通常有效 |
+| `output_schema_invalid` | 回复能解析，但违反 schema | 看 `metadata.outputContract.errors` 里的出错路径——通常是某个字段提示词没说清 |
+| `output_schema_too_large` | schema 超过 16 KiB | 删掉冗余的 description/示例；schema 是要进提示词的 |
 
 不是错误码的常见症状：
 
@@ -328,6 +379,7 @@ src/
   statemachine.ts      8 态转移 + 终态/合法性守卫
   worktree.ts          并行 worker 的 git worktree 隔离
   handoff.ts           diff 捕获、密钥脱敏、末态快照、旁挂文件
+  contract.ts          JSON 结果契约：抽取、ajv 校验、提示词区块
   registry.ts          worker 生命周期 + 有界事件日志
   approvals.ts         ApprovalBroker：把权限/elicitation 桥接给 master
   tasks.ts             TaskManager：异步 8 态生命周期、超时/取消、审批、交接
@@ -345,7 +397,7 @@ src/
     daemon.ts          WorkerDaemon：包住本地 Orchestrator 的 HTTP+WS 外壳
     client.ts          RemoteWorkerDriver：把远程 profile 当普通 WorkerDriver 用
     audit.ts           追加写 NDJSON 审计日志；密钥降为指纹
-  mcp/server.ts        把 orchestrator 暴露为 17 个 MCP 工具（stdio）
+  mcp/server.ts        把 orchestrator 暴露为 18 个 MCP 工具（stdio）
   skill.ts             从 skills/ 加载自托管 master 手册（包根解析器）
   cli.ts               demo | list | mcp | dispatch | submit | tasks | daemon
 skills/
@@ -366,13 +418,13 @@ docs/
 
 ```bash
 npm run typecheck   # tsc --noEmit，干净
-npm test            # 72 个测试，全离线，无 API 费用，约 22 秒
+npm test            # 82 个测试，全离线，无 API 费用，约 22 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **72/72**，分五个文件——生命周期、持久化与守卫（32），交接产物（12），远程 daemon（18），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
+`npm test` 为 **82/82**，分六个文件——生命周期、持久化与守卫（32），交接产物（12），结果契约与用量（10），远程 daemon（18），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
 
 最近一次在 Windows + Node v22.22 上运行。真实的 OpenCode 与 Pi worker 也已端到端跑通（`npm run real`：两者都到达 `succeeded`，共持久化 2 个任务 / 27 条事件）。
 
@@ -392,10 +444,13 @@ npm run real        # 本机真实的 opencode + pi（两者都需已安装并�
 - ✅ 队列 TTL + 每任务截止时间（`deadlineMs` / `deadlineAt`，覆盖排队等待 + 执行）与跨 profile 加权公平（用 `weight` 选择性开启）。
 - ✅ 自托管 master 技能：委派手册随仓库发布，并通过 MCP（`master_playbook` 工具 + 资源）提供，master 默认就能委派得体，无需任何复制粘贴。
 - ✅ 跨 Worker 交接（Phase 1–3）：把任务接在已完成前驱的 `result` 上；把前驱的工作树 `diff` 作为脱敏旁挂文件交接，而不是把补丁塞进 prompt；让后继的 worktree 从前驱末态的快照分叉。注入的产物一律按不可信数据、受字节上限约束，存储的 prompt 保持原样。
+- ✅ 结构化结果契约（`outputSchema`，强制生效——违约即失败）与从 ACP `usage_update` 事件汇总的 token/成本，按任务记录并经 `usage_summary` 聚合。
 
 接下来：
 
-- 结构化结果契约（每任务的 JSON 输出 schema）+ 从 ACP `usage_update` 事件汇总成本/用量。
+- **远程生产化补强**：开机启动、日志轮转、防火墙，以及真实的双机 TLS 部署样例（loopback 路径已验证，双机还没有）。
+- **DAG 依赖**（任务 B 同时等 A 和 C）与可配置重试——契约类错误码已经标了 `retryable`，重试是有意义的。
+- **审批预算**——限制一次扇出最多能挂起多少个 `waiting` 任务，超了就必须停下来问人。
 
 这些决定背后的设计笔记、被否决的替代方案与分阶段构建过程：[docs/PLAN.md](docs/PLAN.md)（英文）。
 

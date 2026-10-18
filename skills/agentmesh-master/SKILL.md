@@ -105,6 +105,8 @@ agent_list ─▶ plan/decompose ─▶ scheduler_status ─▶ task_submit (×N
 | Resolve a permission request | `task_approve` |
 | Answer an elicitation | `task_respond` |
 | Chain B onto A's finished output | `task_submit` with `handoff` (`inject`, `base`) |
+| Get machine-readable output instead of prose | `task_submit` with `outputSchema` → read `structured` from `task_result` |
+| See what a fan-out cost | `usage_summary` (`profile`, `since`) |
 
 ## Writing a good subtask prompt
 

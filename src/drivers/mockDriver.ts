@@ -11,12 +11,21 @@ import path from "node:path";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Drop undefined entries so an absent field stays absent instead of becoming 0. */
+function stripUndefined(obj: Record<string, number | undefined>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(obj)) if (v !== undefined) out[k] = v;
+  return out;
+}
+
 /**
  * Deterministic in-process worker. No network, no API keys, no cost.
  * Used for the demo, tests, and as a stand-in while wiring up real agents.
  */
 class MockWorkerHandle implements WorkerHandle {
   private cancelled = false;
+  /** Running session cost, mirroring how ACP reports cost as a cumulative figure. */
+  private spent = 0;
   constructor(
     readonly id: string,
     readonly profile: string,
@@ -98,6 +107,43 @@ class MockWorkerHandle implements WorkerHandle {
       `[${this.profileName}] done in ${this.cwd}: "${text.slice(0, 80)}${
         text.length > 80 ? "…" : ""
       }"`;
+
+    // Optional usage reports so token/cost roll-up has something deterministic to
+    // roll up. Each report scales the previous one, i.e. it carries the running
+    // totals — the same "cumulative, last one wins" shape real adapters send, so
+    // a test can tell a correct roll-up from a naive sum.
+    const u = this.behavior.usage;
+    if (u) {
+      const reports = Math.max(1, Math.trunc(u.reports ?? 1));
+      for (let i = 1; i <= reports; i++) {
+        const breakdown = stripUndefined({
+          inputTokens: u.inputTokens === undefined ? undefined : u.inputTokens * i,
+          outputTokens: u.outputTokens === undefined ? undefined : u.outputTokens * i,
+          cachedReadTokens: u.cachedReadTokens === undefined ? undefined : u.cachedReadTokens * i,
+          cachedWriteTokens: u.cachedWriteTokens === undefined ? undefined : u.cachedWriteTokens * i,
+          thoughtTokens: u.thoughtTokens === undefined ? undefined : u.thoughtTokens * i,
+          totalTokens: u.totalTokens === undefined ? undefined : u.totalTokens * i,
+        });
+        let cost: { amount: number; currency?: string } | undefined;
+        if (u.cost) {
+          // Cumulative, like ACP's session cost: it grows across the reports of a
+          // turn *and* across turns on the same worker, which is exactly what makes
+          // delta accounting (task cost, not session cost) testable.
+          this.spent += u.cost.amount;
+          cost = { amount: this.spent, ...(u.cost.currency ? { currency: u.cost.currency } : {}) };
+        }
+        emit({
+          type: "usage",
+          text: `usage report ${i}/${reports}`,
+          data: {
+            ...(Object.keys(breakdown).length > 0 ? { breakdown } : {}),
+            ...(cost ? { cost } : {}),
+            ...(u.contextUsed !== undefined ? { contextUsed: u.contextUsed } : {}),
+            ...(u.contextSize !== undefined ? { contextSize: u.contextSize } : {}),
+          },
+        });
+      }
+    }
 
     await sleep(Math.min(this.behavior.delayMs ?? 20, 50));
     emit({ type: "text", text: reply });

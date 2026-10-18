@@ -14,6 +14,7 @@ export type WorkerEventType =
   | "text"
   | "tool"
   | "status"
+  | "usage"
   | "error"
   | "done"
   | "close";
@@ -107,6 +108,23 @@ export interface MockBehavior {
    * without a real agent that edits files.
    */
   writeFiles?: Record<string, string>;
+  /**
+   * Deterministic usage reports for token/cost roll-up tests. Each of `reports`
+   * events carries the running total (report i = i × the configured value), so a
+   * correct "latest report wins" roll-up is distinguishable from a naive sum.
+   */
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedReadTokens?: number;
+    cachedWriteTokens?: number;
+    thoughtTokens?: number;
+    totalTokens?: number;
+    cost?: { amount: number; currency?: string };
+    contextUsed?: number;
+    contextSize?: number;
+    reports?: number;
+  };
 }
 
 /** Settings for a `driver: "remote"` profile (a worker that lives on a daemon). */
@@ -350,6 +368,30 @@ export interface TaskEvent {
   data?: Record<string, unknown>;
 }
 
+/**
+ * Token/cost accounting for one task, rolled up from the worker's usage reports.
+ *
+ * Every field is optional and an absent field means "the agent never told us",
+ * not zero — adapters differ in what they report. Token counts are the latest
+ * report for the task (ACP reports per-turn totals, so summing every update
+ * would double count). `cost` is the *delta* of the worker's cumulative session
+ * cost across the task, so reusing a worker never bills an earlier task twice.
+ */
+export interface TaskUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
+  thoughtTokens?: number;
+  totalTokens?: number;
+  cost?: { amount: number; currency?: string };
+  /** Context-window occupancy at the last report — not a token spend. */
+  contextUsed?: number;
+  contextSize?: number;
+  /** How many usage reports the worker sent; absent/0 = it reported nothing. */
+  reports?: number;
+}
+
 export interface TaskRecord {
   taskId: string;
   profile: string;
@@ -372,6 +414,15 @@ export interface TaskRecord {
   finishedAt?: number;
   /** final assistant text (may be truncated by output limits) */
   text?: string;
+  /**
+   * Parsed JSON result when the task ran under an `outputSchema` contract and
+   * satisfied it. Absent means "no contract" or "contract not satisfied" — the
+   * latter always fails the task, so a `succeeded` task with a contract always
+   * carries this.
+   */
+  structured?: unknown;
+  /** token/cost roll-up reported by the worker during this task */
+  usage?: TaskUsage;
   /** true when `text` was clipped by `limits.maxOutputBytes` */
   outputTruncated?: boolean;
   stopReason?: string;
@@ -399,6 +450,14 @@ export interface TaskSubmitInput {
   metadata?: Record<string, unknown>;
   /** Cross-worker handoff (Phase 1): inject a predecessor's result as untrusted context. */
   handoff?: HandoffSpec;
+  /**
+   * Structured result contract: a JSON Schema (draft-07 keywords) the task's
+   * final answer must satisfy. Enforced — a reply that is not parseable JSON or
+   * does not validate settles the task `failed` (`output_not_json` /
+   * `output_schema_invalid`) with the offending text still persisted. The schema
+   * is never stored on the task; the parsed value is (`structured`).
+   */
+  outputSchema?: Record<string, unknown>;
 }
 
 /** Persistence for tasks + events. Implementations: memory (tests) and SQLite. */

@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   startedAt INTEGER,
   finishedAt INTEGER,
   text TEXT,
+  structured TEXT,
+  usage TEXT,
   stopReason TEXT,
   waitingReason TEXT,
   errorCode TEXT,
@@ -46,6 +48,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_idem ON tasks(idempotencyKey);
 /** Columns added after the first release; `CREATE TABLE IF NOT EXISTS` won't add them. */
 const ADDED_COLUMNS: Array<{ table: string; column: string; decl: string }> = [
   { table: "tasks", column: "deadlineAt", decl: "INTEGER" },
+  { table: "tasks", column: "structured", decl: "TEXT" },
+  { table: "tasks", column: "usage", decl: "TEXT" },
 ];
 
 type Row = Record<string, unknown>;
@@ -76,6 +80,14 @@ function rowToTask(r: Row): TaskRecord {
   rec.startedAt = num(r.startedAt);
   rec.finishedAt = num(r.finishedAt);
   rec.text = str(r.text);
+  // `structured` is arbitrary JSON — including a literal `null`, which a contract
+  // may legitimately allow. Only a NULL column means "no structured result".
+  if (r.structured != null) {
+    try { rec.structured = JSON.parse(String(r.structured)); } catch { /* ignore */ }
+  }
+  if (r.usage != null) {
+    try { rec.usage = JSON.parse(String(r.usage)) as TaskRecord["usage"]; } catch { /* ignore */ }
+  }
   rec.stopReason = str(r.stopReason);
   rec.waitingReason = str(r.waitingReason);
   if (r.errorMessage != null) {
@@ -141,15 +153,18 @@ export class SqliteTaskStore implements TaskStore {
       .prepare(
         `INSERT INTO tasks (taskId, profile, workerId, prompt, workingDirectory, status,
           sessionId, idempotencyKey, timeoutMs, deadlineAt, createdAt, updatedAt, startedAt,
-          finishedAt, text, stopReason, waitingReason, errorCode, errorMessage, errorRetryable,
-          metadata)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          finishedAt, text, structured, usage, stopReason, waitingReason, errorCode, errorMessage,
+          errorRetryable, metadata)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         rec.taskId, rec.profile, rec.workerId ?? null, rec.prompt, rec.workingDirectory, rec.status,
         rec.sessionId ?? null, rec.idempotencyKey ?? null, rec.timeoutMs, rec.deadlineAt ?? null,
         rec.createdAt, rec.updatedAt,
-        rec.startedAt ?? null, rec.finishedAt ?? null, rec.text ?? null, rec.stopReason ?? null,
+        rec.startedAt ?? null, rec.finishedAt ?? null, rec.text ?? null,
+        rec.structured === undefined ? null : JSON.stringify(rec.structured),
+        rec.usage ? JSON.stringify(rec.usage) : null,
+        rec.stopReason ?? null,
         rec.waitingReason ?? null, rec.error?.code ?? null, rec.error?.message ?? null,
         rec.error ? (rec.error.retryable ? 1 : 0) : null,
         rec.metadata ? JSON.stringify(rec.metadata) : null,
@@ -164,15 +179,18 @@ export class SqliteTaskStore implements TaskStore {
       .prepare(
         `UPDATE tasks SET profile=?, workerId=?, prompt=?, workingDirectory=?, status=?,
           sessionId=?, idempotencyKey=?, timeoutMs=?, deadlineAt=?, createdAt=?, updatedAt=?,
-          startedAt=?, finishedAt=?, text=?, stopReason=?, waitingReason=?, errorCode=?,
-          errorMessage=?, errorRetryable=?, metadata=?
+          startedAt=?, finishedAt=?, text=?, structured=?, usage=?, stopReason=?, waitingReason=?,
+          errorCode=?, errorMessage=?, errorRetryable=?, metadata=?
          WHERE taskId=?`,
       )
       .run(
         next.profile, next.workerId ?? null, next.prompt, next.workingDirectory, next.status,
         next.sessionId ?? null, next.idempotencyKey ?? null, next.timeoutMs, next.deadlineAt ?? null,
         next.createdAt, next.updatedAt,
-        next.startedAt ?? null, next.finishedAt ?? null, next.text ?? null, next.stopReason ?? null,
+        next.startedAt ?? null, next.finishedAt ?? null, next.text ?? null,
+        next.structured === undefined ? null : JSON.stringify(next.structured),
+        next.usage ? JSON.stringify(next.usage) : null,
+        next.stopReason ?? null,
         next.waitingReason ?? null, next.error?.code ?? null, next.error?.message ?? null,
         next.error ? (next.error.retryable ? 1 : 0) : null,
         next.metadata ? JSON.stringify(next.metadata) : null,

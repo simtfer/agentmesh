@@ -119,9 +119,10 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         deadlineAt: z.number().int().positive().optional(),
         idempotencyKey: z.string().optional(),
         handoff: handoffSchema.optional(),
+        outputSchema: z.record(z.unknown()).optional(),
       },
     },
-    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, deadlineMs, deadlineAt, idempotencyKey, handoff }) =>
+    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, deadlineMs, deadlineAt, idempotencyKey, handoff, outputSchema }) =>
       orch.submitTask({
         prompt,
         profile,
@@ -133,6 +134,7 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         deadlineAt,
         idempotencyKey,
         handoff,
+        outputSchema,
       }),
     ),
   );
@@ -180,9 +182,14 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         taskId: t.taskId,
         status: t.status,
         text: t.text,
+        // Present only when the task ran under an `outputSchema` contract and
+        // satisfied it — a violated contract fails the task instead.
+        structured: t.structured,
         stopReason: t.stopReason,
         error: t.error,
         workerId: t.workerId,
+        usage: t.usage,
+        contract: t.metadata?.outputContract,
       };
     }),
   );
@@ -234,6 +241,20 @@ export function createMcpServer(orch: Orchestrator): McpServer {
       inputSchema: {},
     },
     wrap(() => orch.schedulerStatus()),
+  );
+
+  server.registerTool(
+    "usage_summary",
+    {
+      title: "Token and cost roll-up",
+      description:
+        "Roll up token usage and cost across tasks, optionally filtered by profile and start time. Only tasks whose worker reported usage are counted in `reporting`; costs are grouped by currency and never summed across currencies. Use it to see what a fan-out actually cost before launching another.",
+      inputSchema: {
+        profile: z.string().optional(),
+        since: z.number().int().positive().optional(),
+      },
+    },
+    wrap(({ profile, since }) => orch.usageSummary({ profile, since })),
   );
 
   /* --------------------------- approvals -------------------------- */
@@ -292,10 +313,11 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         worktree: z.boolean().optional(),
         deadlineMs: z.number().int().positive().optional(),
         handoff: handoffSchema.optional(),
+        outputSchema: z.record(z.unknown()).optional(),
       },
     },
-    wrap(async ({ task, workerId, profile, cwd, worktree, deadlineMs, handoff }) => {
-      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, deadlineMs, handoff });
+    wrap(async ({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema }) => {
+      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema });
       return r;
     }),
   );
