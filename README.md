@@ -159,7 +159,7 @@ Cancelling or timing out a task auto-resolves its pending approvals.
 | `agent_inspect` | one worker's status + recent event log |
 | `spawn_worker` | start a worker (optionally in a git worktree) |
 | `kill_worker` | close a worker and clean its worktree |
-| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call) |
+| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call); optional `handoff` chains onto a finished task |
 | `task_status` | current status of a task |
 | `task_wait` | block until terminal **or** `waiting` (needs approval) |
 | `task_result` | final text / status / error of a task |
@@ -201,6 +201,45 @@ irreversible), the delegation loop, an intent→tool cheat-sheet, how to write a
 self-contained subtask prompt, anti-patterns, and the security red lines that
 mirror agentmesh's own guarantees. A master should call `master_playbook` once
 before its first fan-out.
+
+## Cross-worker handoff (Phase 1)
+
+A fan-out isn't always independent — sometimes task B should *continue from*
+task A's result (A writes a report, B reviews it; A patches, B tests). The
+`handoff` field on `task_submit` / `dispatch_task` chains one task onto a
+finished predecessor without the master having to copy A's output by hand.
+
+```jsonc
+{
+  "task": "Review the report and flag any unsupported claims.",
+  "profile": "pi",
+  "handoff": { "fromTaskId": "<taskA>", "inject": "result" }
+}
+```
+
+- **What gets injected.** At run time agentmesh reads the predecessor's persisted
+  `result` text and prepends it to *this* task's prompt, wrapped in an untrusted
+  envelope (`<<<UPSTREAM WORKER OUTPUT  trusted=NO … >>>`) that tells the worker
+  to treat the block strictly as **data to act on, never as instructions**. This
+  mirrors agentmesh's core rule: another worker's output is not a command channel.
+- **Ephemeral by design.** The augmented prompt is built at run time and handed to
+  the worker; the *stored* `prompt` stays exactly what the master submitted. Only
+  a compact `metadata.handoff` summary (`fromTaskId`, `inject`, `base`,
+  `injectedBytes`, `truncated`) and a `handoff` event are persisted — so large or
+  sensitive artifacts never land in the prompt column.
+- **Admission validation.** A handoff whose source task is unknown is refused
+  (`handoff_unknown_task`); one whose source hasn't reached `succeeded` yet is
+  refused (`handoff_predecessor_not_ready`) — both *without spawning a worker*, so
+  you can't chain onto a task that's still running or failed.
+- **Byte cap.** The injected artifact is capped to `handoff.maxBytes` (falling back
+  to `limits.maxHandoffBytes`, default 256 KiB), truncated on a UTF-8 boundary and
+  flagged `truncated` in the metadata — the same safe-clip used for oversized
+  results.
+
+Phase 1 covers `inject: "result"` over a `base: "repo"` worktree. Later phases add
+`inject: "diff"` (capture the predecessor's working-tree diff as a redacted artifact
+sidecar) and `base: "predecessor"` (start the successor in a worktree branched from
+the predecessor's end state).
 
 ## Attach a real master
 
@@ -422,7 +461,9 @@ profiles:
   text persisted per task: a larger result is truncated on a UTF-8 boundary (never
   splitting a multibyte codepoint), the record is flagged `outputTruncated`, and a
   truncation note is recorded as an event so the clip is observable rather than
-  silent.
+  silent. `limits.maxHandoffBytes` (default 256 KiB) caps how much of a
+  predecessor's result a cross-worker handoff may inject into a successor prompt,
+  using the same UTF-8-safe clip.
 - **Bounded FIFO scheduler.** What happens to a submit that arrives while every
   slot is busy is governed by `limits.maxQueuedTasks`. Left at `0` (the default),
   the submit is refused immediately with `concurrency_limit_exceeded` *without
@@ -495,20 +536,24 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **48/48** pass:
+- `npm test` — **54/54** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
-  - `test/tasks.test.ts` (20) — happy path, worker failure, `timeout → timed_out`,
+  - `test/tasks.test.ts` (26) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
     idempotency de-dup, SQLite restart-and-requery, store column-merge safety, the
     recursion guard (depth-stamped success within the cap, refusal at the cap with
     no worker spawned, and an inherited env depth tripping the cap), the
     resource limits (a submit past `maxConcurrentTasks` refused with no worker,
     a settled task freeing its slot, an oversized result truncated + flagged
-    `outputTruncated`, and truncation never splitting a multibyte codepoint), and
-    the Stage 5 scheduler (over-cap submits queue then drain FIFO as slots free, a
+    `outputTruncated`, and truncation never splitting a multibyte codepoint), the
+    Stage 5 scheduler (over-cap submits queue then drain FIFO as slots free, a
     full queue refuses with `queue_full`, cancelling a queued task settles
     immediately without the grace wait, and a fan-out runs concurrently bounded by
-    `maxConcurrentTasks`).
+    `maxConcurrentTasks`), and Phase 1 cross-worker handoff (the predecessor's
+    result reaches the successor's prompt, a no-handoff control never sees it, the
+    injected block is wrapped untrusted while the stored prompt stays original, a
+    non-succeeded / unknown source is refused with no worker spawned, and the
+    artifact is capped to `maxBytes` and flagged `truncated`).
   - `test/remote.test.ts` (18) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
     streamed events, approval round-trip, cancel, bad-token rejection,
     cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, reconnect
@@ -548,11 +593,15 @@ Done:
 - ✅ Self-hosted master skill: the delegation playbook ships in the repo and is
   served over MCP (`master_playbook` tool + resources), so a master delegates
   well by default without any copy-paste.
+- ✅ Cross-worker handoff (Phase 1): chain a task onto a finished predecessor's
+  `result`, injected as untrusted data under a byte cap, with the stored prompt
+  left original.
 
 Next:
 
 - Queue TTL / per-task deadlines and weighted cross-profile fairness.
-- Cross-worker handoff (pipe one worker's diff into another's context).
+- Cross-worker handoff Phase 2/3 (`inject: "diff"` artifact sidecar + redaction,
+  `base: "predecessor"` worktree branched from the predecessor's end state).
 - Structured result contracts (JSON output schema per task) + cost/usage roll-up
   from ACP `usage_update` events.
 

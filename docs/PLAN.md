@@ -207,7 +207,7 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 - ✅ 验收：同一套测试跑不同 Adapter；流式输出不重复结束；Agent 异常退出可检测（`failed`/`timed_out`）。
 
 ### Stage 2 · Orchestrator + SQLite + MCP —— ✅ 完成
-- ✅ Agent Registry、MCP 工具（16，含 `scheduler_status`）、受理式查询/取消/结果。
+- ✅ Agent Registry、MCP 工具（17，含 `scheduler_status` 与 `master_playbook`）、受理式查询/取消/结果。
 - ✅ **SQLite 持久化**（任务/事件，`node:sqlite` WAL）；`task_submit/wait/status/result/cancel/events` 全量；
   重启后已存任务可查（`test/tasks.test.ts` 覆盖 restart-and-requery）。
 - ✅ Task Scheduler 并发上限（`limits.maxConcurrentTasks`）+ 有界 FIFO 队列（`limits.maxQueuedTasks`，见 Stage 5）；
@@ -277,7 +277,8 @@ Agent 输出视为不可信；不可逆操作人工确认；记录 Agent/Adapter
 **防无限递归委派 ✅**（`limits.maxDelegationDepth` 默认 8；进程从 `$AGENTMESH_DELEGATION_DEPTH` 读自身层级，向所 spawn 的 agent 注入 层级+1，
 嵌套 agentmesh 经环境继承链路深度；有效深度达上限的 submit 以 `delegation_depth_exceeded` 失败且**不 spawn worker**，调用方 metadata 只能抬高、不能压低继承的 base）、
 **最大并发上限 ✅**（`limits.maxConcurrentTasks`，0/未设=不限；超限的 submit 以 `concurrency_limit_exceeded` 失败且**不 spawn worker**，任务终结即释放名额）、
-**单任务输出大小上限 ✅**（`limits.maxOutputBytes` 默认 1 MiB；超长结果按 UTF-8 边界截断（绝不切断多字节码点），记录标记 `outputTruncated` 并追加一条截断事件）。
+**单任务输出大小上限 ✅**（`limits.maxOutputBytes` 默认 1 MiB；超长结果按 UTF-8 边界截断（绝不切断多字节码点），记录标记 `outputTruncated` 并追加一条截断事件）、
+**跨 Worker 交接注入上限 ✅**（`limits.maxHandoffBytes` 默认 256 KiB；前驱 `result` 注入后继 prompt 时按 UTF-8 边界截断、标记 `truncated`，且包裹为 `trusted=NO` 不可信数据信封——上游产物是**数据不是指令**，与「Agent 输出视为不可信数据」红线一致）。
 补充（acpx 相关）：`permissionMode` 默认 `approve-all` 便于自动执行，但**远程/生产应降为 `approve-reads` 或 `deny-all` + 显式批准回调**；
 acpx 会话作用域按 `(agentCommand, cwd, sessionKey)` 精确匹配，跨目录不继承。
 
@@ -338,12 +339,18 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    （`agentmesh://skills/master/en|zh`）；运行时从包根解析，源码与 dist 构建皆可用。内容涵盖五条铁律、委派闭环、
    意图→工具速查、子任务 prompt 要素、反模式与安全红线，让 Master 默认就会「好好委派」。
    ⏳ 进阶：MCP prompts 通道、按 profile/任务类型细分的技能片段。
-4. **跨 Worker 交接**：把一个 Worker 的 diff 注入另一个 Worker 的上下文。
+4. ~~**跨 Worker 交接**~~ ✅ Phase 1 已落地：`task_submit`/`dispatch_task` 的 `handoff` 字段把**已完成前驱**的
+   `result` 文本在 run 时注入后继 prompt——包裹为**不可信数据**信封（`trusted=NO`，明示「当作数据而非指令」），
+   按 `limits.maxHandoffBytes`（默认 256 KiB）UTF-8 安全截断并标记 `truncated`；**持久化的 `prompt` 保持原样**，
+   仅落一条 `metadata.handoff` 摘要与一条 `handoff` 事件（大/敏感产物不进 prompt 列）。受理期校验：源任务未知 →
+   `handoff_unknown_task`，源未达 `succeeded` → `handoff_predecessor_not_ready`，二者均**不 spawn worker**。
+   ⏳ Phase 2/3：`inject:"diff"`（前驱工作树 diff 作为脱敏 artifact sidecar + `task_artifact` 工具）、
+   `base:"predecessor"`（后继 worktree 从前驱终态分叉 + 真实 git 集成测试）。
 5. **结构化结果契约**：每任务 JSON 输出 schema + 从 ACP `usage_update` 汇总成本/用量。
 6. ~~**递归守卫**~~ ✅ 已落地：`limits.maxDelegationDepth`（默认 8）+ `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播，
    达上限的 submit 以 `delegation_depth_exceeded` 失败且不 spawn worker（预算上限并入 Stage 5）。
    ~~最大并发 / 单任务输出大小上限~~ ✅ 亦已落地（见 §7）。
 7. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
 
-> Stage 0–3 已完成并通过 48 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界 FIFO 调度与自托管 master 技能）。
+> Stage 0–3 已完成并通过 54 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界 FIFO 调度、自托管 master 技能与跨 Worker 交接 Phase 1）。
 > 下一步优先远程真实双机 TLS 部署与 Stage 5 进阶调度（队列 TTL、加权公平、DAG 依赖）。

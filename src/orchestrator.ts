@@ -1,6 +1,7 @@
 import path from "node:path";
 import type {
   ElicitationResponse,
+  HandoffSpec,
   MeshConfig,
   PermissionDecision,
   TaskEvent,
@@ -43,6 +44,8 @@ export interface DispatchInput {
   cwd?: string;
   worktree?: boolean;
   timeoutMs?: number;
+  /** Cross-worker handoff (Phase 1): inject a predecessor's result as untrusted context. */
+  handoff?: HandoffSpec;
   /** live task-event stream (also persisted to the store) */
   onEvent?: (ev: TaskEvent) => void;
 }
@@ -110,6 +113,7 @@ export class Orchestrator {
       maxConcurrentTasks: config.limits?.maxConcurrentTasks,
       maxOutputBytes: config.limits?.maxOutputBytes,
       maxQueuedTasks: config.limits?.maxQueuedTasks,
+      maxHandoffBytes: config.limits?.maxHandoffBytes,
     });
   }
 
@@ -239,6 +243,7 @@ export class Orchestrator {
         cwd: input.cwd,
         worktree: input.worktree,
         timeoutMs: input.timeoutMs,
+        handoff: input.handoff,
       },
       { onEvent: input.onEvent },
     );

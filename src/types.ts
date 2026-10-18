@@ -219,6 +219,12 @@ export interface MeshConfig {
      * tasks settle; only a full queue refuses (`queue_full`).
      */
     maxQueuedTasks?: number;
+    /**
+     * Cross-worker handoff (Phase 1). Cap on the upstream artifact bytes injected
+     * into a successor task's prompt. Larger artifacts are truncated on a UTF-8
+     * boundary and flagged in the task's `handoff` metadata. Default 256 KiB.
+     */
+    maxHandoffBytes?: number;
   };
 }
 
@@ -232,6 +238,27 @@ export const DELEGATION_DEPTH_ENV = "AGENTMESH_DELEGATION_DEPTH";
 
 /** Default cap on delegation depth when `limits.maxDelegationDepth` is unset. */
 export const DEFAULT_MAX_DELEGATION_DEPTH = 8;
+
+/** Default cap on injected handoff artifact bytes when `limits.maxHandoffBytes` is unset. */
+export const DEFAULT_MAX_HANDOFF_BYTES = 256 * 1024;
+
+/**
+ * Cross-worker handoff spec (Phase 1). Injects a predecessor task's output into
+ * this task's prompt as *untrusted context* — the successor reads it but does not
+ * continue on the predecessor's git branch. Phase 1 supports a single artifact
+ * (`result`, the predecessor's final text) and a single base (`repo`, a fresh
+ * worktree); `diff`/`predecessor` are reserved for later phases.
+ */
+export interface HandoffSpec {
+  /** The task whose output is handed off. Must be terminal and `succeeded`. */
+  fromTaskId: string;
+  /** What to inject. Phase 1: `"result"` only (predecessor's final text). */
+  inject?: "result";
+  /** Where the successor runs. Phase 1: `"repo"` only (fresh worktree, context injection). */
+  base?: "repo";
+  /** Per-task override of `limits.maxHandoffBytes`. */
+  maxBytes?: number;
+}
 
 export interface WorkerDriver {
   readonly kind: "acpx" | "mock" | "remote";
@@ -269,6 +296,7 @@ export type TaskEventType =
   | "accepted"
   | "queued"
   | "started"
+  | "handoff"
   | "output"
   | "waiting"
   | "resumed"
@@ -321,6 +349,8 @@ export interface TaskSubmitInput {
   timeoutMs?: number;
   idempotencyKey?: string;
   metadata?: Record<string, unknown>;
+  /** Cross-worker handoff (Phase 1): inject a predecessor's result as untrusted context. */
+  handoff?: HandoffSpec;
 }
 
 /** Persistence for tasks + events. Implementations: memory (tests) and SQLite. */

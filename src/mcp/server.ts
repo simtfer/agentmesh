@@ -24,6 +24,19 @@ const wrap =
   };
 
 /**
+ * Cross-worker handoff (Phase 1). Only `inject: "result"` and `base: "repo"` are
+ * supported today; the enums are narrow so a master asking for a not-yet-built
+ * mode (`diff` / `predecessor`) gets a clear schema error rather than a silent
+ * no-op. `maxBytes` optionally overrides `limits.maxHandoffBytes` per task.
+ */
+const handoffSchema = z.object({
+  fromTaskId: z.string(),
+  inject: z.enum(["result"]).optional(),
+  base: z.enum(["repo"]).optional(),
+  maxBytes: z.number().int().positive().optional(),
+});
+
+/**
  * Expose the orchestrator as MCP tools. Any MCP-capable agent (opencode, pi,
  * claude, ...) that connects becomes a "master" able to submit tasks to and
  * command heterogeneous workers — with zero changes to the master itself.
@@ -94,7 +107,7 @@ export function createMcpServer(orch: Orchestrator): McpServer {
     {
       title: "Submit a task (async)",
       description:
-        "Submit a task and return immediately with a taskId. The task runs in the background; poll task_status / task_wait, or stream task_events. Reuse a worker via workerId or spawn one from profile.",
+        "Submit a task and return immediately with a taskId. The task runs in the background; poll task_status / task_wait, or stream task_events. Reuse a worker via workerId or spawn one from profile. Optionally chain off a predecessor via `handoff` to inject its result as untrusted context.",
       inputSchema: {
         prompt: z.string(),
         profile: z.string().optional(),
@@ -103,10 +116,11 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         worktree: z.boolean().optional(),
         timeoutMs: z.number().int().positive().optional(),
         idempotencyKey: z.string().optional(),
+        handoff: handoffSchema.optional(),
       },
     },
-    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, idempotencyKey }) =>
-      orch.submitTask({ prompt, profile, workerId, cwd, worktree, timeoutMs, idempotencyKey }),
+    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, idempotencyKey, handoff }) =>
+      orch.submitTask({ prompt, profile, workerId, cwd, worktree, timeoutMs, idempotencyKey, handoff }),
     ),
   );
 
@@ -263,10 +277,11 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         profile: z.string().optional(),
         cwd: z.string().optional(),
         worktree: z.boolean().optional(),
+        handoff: handoffSchema.optional(),
       },
     },
-    wrap(async ({ task, workerId, profile, cwd, worktree }) => {
-      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree });
+    wrap(async ({ task, workerId, profile, cwd, worktree, handoff }) => {
+      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, handoff });
       return r;
     }),
   );

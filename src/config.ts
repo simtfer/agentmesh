@@ -73,6 +73,7 @@ const ConfigSchema = z.object({
       maxConcurrentTasks: z.number().int().nonnegative().optional(),
       maxOutputBytes: z.number().int().nonnegative().optional(),
       maxQueuedTasks: z.number().int().nonnegative().optional(),
+      maxHandoffBytes: z.number().int().nonnegative().optional(),
     })
     .optional(),
 });

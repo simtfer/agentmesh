@@ -483,5 +483,152 @@ test("fan-out up to the cap runs concurrently, bounded by maxConcurrentTasks", a
   }
 });
 
+/* --------------------- Phase 1: cross-worker handoff --------------------- */
+
+// A unique token used as a behavioural probe: the mock "tripwire" profile fails
+// iff it sees this token in the prompt it receives, so a fired tripwire is proof
+// the predecessor's result was actually injected into the successor's prompt.
+const TOKEN = "HANDOFF_TOKEN_42";
+
+const handoffConfig = parseConfig({
+  workdir: ".agentmesh-test",
+  limits: { maxHandoffBytes: 256 * 1024 },
+  profiles: [
+    { name: "echo", driver: "mock", mock: { delayMs: 1, toolCalls: 1 } },
+    { name: "tripwire", driver: "mock", mock: { delayMs: 1, failOn: TOKEN } },
+    { name: "slowhs", driver: "mock", mock: { delayMs: 40, toolCalls: 60 } },
+  ],
+});
+
+const hsOrch = () =>
+  new Orchestrator(handoffConfig, { baseCwd: process.cwd(), persist: false });
+
+test("handoff injects the predecessor result into the successor prompt", async () => {
+  const orch = hsOrch();
+  try {
+    // The mock echoes the first 80 chars of its prompt, so the predecessor's
+    // result text carries the token.
+    const pred = orch.submitTask({ profile: "echo", prompt: `please output ${TOKEN} verbatim` });
+    const predRec = await orch.waitTask(pred.taskId, 5000);
+    assert.equal(predRec?.status, "succeeded");
+    assert.ok((predRec?.text ?? "").includes(TOKEN), "predecessor result should carry the token");
+
+    // The tripwire successor fails iff it sees the token → proves injection.
+    const succ = orch.submitTask({
+      profile: "tripwire",
+      prompt: "do some unrelated work",
+      handoff: { fromTaskId: pred.taskId, inject: "result" },
+    });
+    const succRec = await orch.waitTask(succ.taskId, 5000);
+    assert.equal(succRec?.status, "failed");
+    assert.equal(succRec?.error?.code, "MOCK_FAIL", "tripwire fired → token reached the successor");
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("without handoff the same tripwire successor never sees the token", async () => {
+  const orch = hsOrch();
+  try {
+    const succ = orch.submitTask({ profile: "tripwire", prompt: "do some unrelated work" });
+    const rec = await orch.waitTask(succ.taskId, 5000);
+    assert.equal(rec?.status, "succeeded", "no handoff → no token → tripwire stays green");
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("handoff wraps the artifact as untrusted and keeps the stored prompt original", async () => {
+  const orch = hsOrch();
+  try {
+    const pred = orch.submitTask({ profile: "echo", prompt: "some upstream finding" });
+    await orch.waitTask(pred.taskId, 5000);
+
+    const succ = orch.submitTask({
+      profile: "echo",
+      prompt: "ORIGINAL_SUCCESSOR_PROMPT",
+      handoff: { fromTaskId: pred.taskId },
+    });
+    const rec = await orch.waitTask(succ.taskId, 5000);
+    assert.equal(rec?.status, "succeeded");
+    // The mock echoes the first 80 chars of the prompt it actually received, so
+    // the untrusted envelope (marker + trusted=NO) must be prepended.
+    assert.match(rec?.text ?? "", /<<<UPSTREAM WORKER OUTPUT/);
+    assert.match(rec?.text ?? "", /trusted=NO/);
+
+    // Decision #2: the persisted prompt stays the user's original — the envelope
+    // is ephemeral, so a large/secret-bearing artifact never lands in the store.
+    const stored = orch.taskStatus(succ.taskId);
+    assert.equal(stored?.prompt, "ORIGINAL_SUCCESSOR_PROMPT");
+    assert.ok(!(stored?.prompt ?? "").includes("UPSTREAM WORKER OUTPUT"));
+
+    // Observability: a `handoff` event + a compact metadata summary.
+    assert.ok(orch.taskEvents(succ.taskId).some((e) => e.type === "handoff"));
+    const ho = (stored?.metadata as Record<string, unknown>)?.handoff as Record<string, unknown>;
+    assert.equal(ho?.fromTaskId, pred.taskId);
+    assert.equal(ho?.inject, "result");
+    assert.equal(ho?.base, "repo");
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("handoff from a non-succeeded predecessor is refused without spawning", async () => {
+  const orch = hsOrch();
+  try {
+    const pred = orch.submitTask({ profile: "slowhs", prompt: "long running", timeoutMs: 30000 });
+    // Predecessor is still in flight (not `succeeded`) → successor refused fast.
+    const succ = orch.submitTask({
+      profile: "echo",
+      prompt: "chain attempt",
+      handoff: { fromTaskId: pred.taskId },
+    });
+    assert.equal(succ.status, "failed");
+    assert.equal(succ.error?.code, "handoff_predecessor_not_ready");
+    await orch.cancelTask(pred.taskId);
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("handoff from an unknown task is refused", async () => {
+  const orch = hsOrch();
+  try {
+    const succ = orch.submitTask({
+      profile: "echo",
+      prompt: "chain attempt",
+      handoff: { fromTaskId: "no-such-task" },
+    });
+    assert.equal(succ.status, "failed");
+    assert.equal(succ.error?.code, "handoff_unknown_task");
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("handoff artifact is capped to maxBytes and flagged truncated", async () => {
+  const orch = hsOrch();
+  try {
+    const pred = orch.submitTask({ profile: "echo", prompt: "x".repeat(200) });
+    const predRec = await orch.waitTask(pred.taskId, 5000);
+    assert.ok((predRec?.text ?? "").length > 40, "predecessor result should be sizable");
+
+    const succ = orch.submitTask({
+      profile: "echo",
+      prompt: "consume upstream",
+      handoff: { fromTaskId: pred.taskId, maxBytes: 16 },
+    });
+    const rec = await orch.waitTask(succ.taskId, 5000);
+    assert.equal(rec?.status, "succeeded");
+    const ho = (orch.taskStatus(succ.taskId)?.metadata as Record<string, unknown>)?.handoff as
+      | Record<string, unknown>
+      | undefined;
+    assert.equal(ho?.truncated, true);
+    assert.ok((ho?.injectedBytes as number) <= 16, `injected ${ho?.injectedBytes} must be <= 16`);
+  } finally {
+    await orch.shutdown();
+  }
+});
+
 
 

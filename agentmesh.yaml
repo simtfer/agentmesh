@@ -27,11 +27,18 @@ workdir: .agentmesh
 # automatically as running tasks settle, and only a submit that finds the queue
 # full too is refused (`queue_full`). A queued task can still be cancelled and
 # settles at once, without holding a worker.
+#
+# maxHandoffBytes caps how much of a finished predecessor's result a cross-worker
+# handoff (`task_submit` / `dispatch_task` with a `handoff` field) may inject into
+# the successor's prompt. The injected block is wrapped as untrusted data and
+# truncated on a UTF-8 boundary, so a large upstream artifact cannot bloat or
+# hijack the downstream prompt.
 # limits:
 #   maxDelegationDepth: 8        # default 8; lower it for tighter environments
 #   maxConcurrentTasks: 0        # 0/omitted = unlimited in-flight tasks
 #   maxQueuedTasks: 0            # 0/omitted = refuse over-cap; >0 = bounded FIFO queue
 #   maxOutputBytes: 1048576      # default 1 MiB of persisted result text/task
+#   maxHandoffBytes: 262144      # default 256 KiB of predecessor result injected per handoff
 
 defaults:
   # acpx permission mode for workers: deny-all | approve-reads | approve-all
