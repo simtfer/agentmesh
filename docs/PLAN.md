@@ -22,7 +22,10 @@
 
 3. **路线图前移**：Stage 0（协议可行性）已被 acpx + 真实 pi/opencode 冒烟覆盖，Stage 1（单机 Adapter）、
    Stage 2（8 态状态机 + SQLite + 受理式 MCP）、Stage 3（远程 Worker Daemon）均已**实现并验证**。
-   余下重点是 **Stage 5 并行调度** 与 **远程生产化补强**（重连对账、密钥轮换、双机 TLS 部署）。
+   **Stage 5 并行调度**已落地核心：有界 FIFO 队列 + 单一 queue owner（`limits.maxQueuedTasks` 开启排队，
+   `scheduler_status` 可观测），叠加此前的并发/输出/递归上限。余下重点是 **远程生产化补强**
+   （开机启动、日志轮转、防火墙、真实双机 TLS 部署样例）与 **Stage 5 的进阶调度**（队列 TTL/截止时间、
+   跨 profile 加权公平、DAG 依赖、重试、预算）。
 
 ---
 
@@ -204,10 +207,11 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 - ✅ 验收：同一套测试跑不同 Adapter；流式输出不重复结束；Agent 异常退出可检测（`failed`/`timed_out`）。
 
 ### Stage 2 · Orchestrator + SQLite + MCP —— ✅ 完成
-- ✅ Agent Registry、MCP 工具（15）、受理式查询/取消/结果。
+- ✅ Agent Registry、MCP 工具（16，含 `scheduler_status`）、受理式查询/取消/结果。
 - ✅ **SQLite 持久化**（任务/事件，`node:sqlite` WAL）；`task_submit/wait/status/result/cancel/events` 全量；
   重启后已存任务可查（`test/tasks.test.ts` 覆盖 restart-and-requery）。
-- ⏳ Task Scheduler 并发上限、结构化审计日志（Stage 5 随并行引入）。
+- ✅ Task Scheduler 并发上限（`limits.maxConcurrentTasks`）+ 有界 FIFO 队列（`limits.maxQueuedTasks`，见 Stage 5）；
+  结构化审计日志已在远程 daemon 控制平面落地（NDJSON，见 Stage 3）。
 - ✅ 验收：Master 经 MCP 调 Worker；可查状态取结果；**服务重启后任务仍可查询**。
 
 ### Stage 3 · 远程 Worker —— ✅ 已实现（loopback 验证）
@@ -249,8 +253,14 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 - ✅ demo 已证明“角色对称、由配置决定”（同一 Orchestrator，master 只是挂 MCP 的一方）。
 - ⏳ 用**真实** Agent 跑通四组合：OpenCode→Pi、OpenCode→OpenCode、Pi→OpenCode、Pi→Pi，端到端自动化测试。
 
-### Stage 5 · 并行与代码工作流 —— ⬜ 未开始
-- 并发限制、独立 git worktree（代码已备）、DAG 依赖、可配置重试、人工审批与预算、可选 Web 控制台。
+### Stage 5 · 并行与代码工作流 —— 🟡 核心已落地
+- ✅ **并发限制 + 有界 FIFO 调度**：`limits.maxConcurrentTasks` 限在跑任务数；`limits.maxQueuedTasks`
+  （默认 0 = 超限即拒 `concurrency_limit_exceeded`，向后兼容）>0 时开启真正排队——超限 submit 进 FIFO 队列，
+  随在跑任务结算由单一 queue owner（`pump()`）自动出队；队列也满才拒（`queue_full`）。排队任务不占 worker，
+  可即时取消（不等 cancel 宽限）。`scheduler_status` MCP 工具暴露 running/queued 计数、上限与队列顺序。
+- ✅ 独立 git worktree（代码已备）；失败/超时/取消路径均有测试（`test/tasks.test.ts` 的调度四例：
+  排队并 FIFO 出队、队满拒绝、取消排队任务即时结算、并发扇出受 `maxConcurrentTasks` 约束）。
+- ⏳ DAG 依赖、可配置重试、跨 profile 加权公平、队列 TTL/截止时间、人工审批预算、可选 Web 控制台。
 - 验收：多任务并发；同一工作目录不被多个写任务无保护同时改；失败/超时/取消路径均有测试。
 
 ---
@@ -258,9 +268,10 @@ acpx 侧对应：`permissionMode`（`deny-all|approve-reads|approve-all`）+ `on
 ## 7. 安全与可靠性（v1.0 §13 全保留 + 补充）
 
 远程认证 + TLS/可信通道；不向局域网暴露未保护的 ACP stdio 桥；工作目录白名单；命令/工具权限最小化；
-密钥从环境变量或安全凭证存储读取（**不入配置文件/版本库**）；结构化审计日志；超时/最大并发/输出大小限制；
-**防无限递归委派**（Master 也是 Agent，需深度/预算上限）；Agent 输出视为不可信；不可逆操作人工确认；
-记录 Agent/Adapter/协议版本。
+密钥从环境变量或安全凭证存储读取（**不入配置文件/版本库**）；结构化审计日志；超时/最大并发/输出大小限制
+（✅ `limits.maxConcurrentTasks` + 有界 FIFO 队列 `maxQueuedTasks` + `maxOutputBytes` 已落地）；
+**防无限递归委派**（Master 也是 Agent，需深度/预算上限；✅ 深度上限已落地，预算上限待 Stage 5 进阶）；
+Agent 输出视为不可信；不可逆操作人工确认；记录 Agent/Adapter/协议版本。
 
 **落地状态**：远程认证/TLS ✅、工作目录白名单 ✅、密钥仅存环境 ✅、零停机密钥轮换 ✅、结构化审计日志（NDJSON，密钥仅记指纹、不落不可信文本）✅、超时 ✅、
 **防无限递归委派 ✅**（`limits.maxDelegationDepth` 默认 8；进程从 `$AGENTMESH_DELEGATION_DEPTH` 读自身层级，向所 spawn 的 agent 注入 层级+1，
@@ -315,8 +326,10 @@ acpx 会话作用域按 `(agentCommand, cwd, sessionKey)` 精确匹配，跨目�
 
 Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向「跑得多、跑得稳、跑得像产品」：
 
-1. **Stage 5 · 并行与调度**：Task Scheduler 真实队列 owner + 公平调度；多 worktree 并行；失败/超时/取消路径的并发测试。
-   （§7 的**最大并发上限**与**单任务输出大小上限**已落地：`limits.maxConcurrentTasks` / `limits.maxOutputBytes`；Stage 5 在此之上做真正的排队与调度，而非当前的"超限即拒"。）
+1. ~~**Stage 5 · 并行与调度**~~ ✅ 核心已落地：有界 FIFO 队列 + 单一 queue owner（`limits.maxQueuedTasks`
+   >0 开启排队，`pump()` 随槽位释放自动出队；`scheduler_status` 可观测），叠加已有的 `maxConcurrentTasks` /
+   `maxOutputBytes` / 递归深度上限；多 worktree 并行代码已备；失败/超时/取消路径均有并发测试（`test/tasks.test.ts`）。
+   ⏳ 进阶：队列 TTL/截止时间、跨 profile 加权公平、DAG 依赖、可配置重试、预算上限。
 2. **远程生产化补强**：状态对账（`query`）、推送式续订（`attach` + orphan 宽限）、透明自动重连（`resume`）、
    **零停机密钥轮换**（多 token + `SIGHUP`/`reloadTokens()`）、**结构化审计日志**（NDJSON，密钥仅记指纹）均已落地。
    ⏳ 余下：开机启动/日志轮转、防火墙与部署样例；把 loopback 验证形态推向真实双机 TLS 部署。
@@ -328,5 +341,5 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    ~~最大并发 / 单任务输出大小上限~~ ✅ 亦已落地（见 §7）。
 7. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
 
-> Stage 0–3 已完成并通过 40 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫与资源上限）。
+> Stage 0–3 已完成并通过 44 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限与 Stage 5 有界 FIFO 调度）。
 > 下一步优先并行调度（真实队列 owner）与远程真实双机部署。

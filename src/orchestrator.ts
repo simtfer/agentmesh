@@ -109,6 +109,7 @@ export class Orchestrator {
       maxDelegationDepth: config.limits?.maxDelegationDepth ?? DEFAULT_MAX_DELEGATION_DEPTH,
       maxConcurrentTasks: config.limits?.maxConcurrentTasks,
       maxOutputBytes: config.limits?.maxOutputBytes,
+      maxQueuedTasks: config.limits?.maxQueuedTasks,
     });
   }
 
@@ -201,6 +202,11 @@ export class Orchestrator {
 
   listTasks(filter?: { status?: TaskStatus; limit?: number }): TaskRecord[] {
     return this.tasks.listTasks(filter);
+  }
+
+  /** Scheduler introspection: running/queued counts, caps, and the FIFO order. */
+  schedulerStatus() {
+    return this.tasks.schedulerStats();
   }
 
   waitTask(taskId: string, timeoutMs?: number): Promise<TaskRecord | undefined> {

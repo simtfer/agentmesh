@@ -16,13 +16,21 @@ workdir: .agentmesh
 # whose effective depth reaches the cap is refused without spawning a worker.
 #
 # Two further guards bound blast radius: maxConcurrentTasks caps how many tasks
-# may be in flight at once (a submit beyond the cap is refused, not queued, so a
-# fan-out burst cannot exhaust the host); maxOutputBytes caps the result text
-# persisted per task, truncating on a UTF-8 boundary and flagging the record
-# `outputTruncated` so a runaway agent cannot blow up the store.
+# may run at once; maxOutputBytes caps the result text persisted per task,
+# truncating on a UTF-8 boundary and flagging the record `outputTruncated` so a
+# runaway agent cannot blow up the store.
+#
+# What happens to a submit that arrives while all slots are busy depends on
+# maxQueuedTasks. Left at 0 (the default), the submit is refused immediately with
+# `concurrency_limit_exceeded` — back-pressure, no waiting. Set it >0 to enable
+# real scheduling: over-cap submits park in a bounded FIFO queue and drain
+# automatically as running tasks settle, and only a submit that finds the queue
+# full too is refused (`queue_full`). A queued task can still be cancelled and
+# settles at once, without holding a worker.
 # limits:
 #   maxDelegationDepth: 8        # default 8; lower it for tighter environments
 #   maxConcurrentTasks: 0        # 0/omitted = unlimited in-flight tasks
+#   maxQueuedTasks: 0            # 0/omitted = refuse over-cap; >0 = bounded FIFO queue
 #   maxOutputBytes: 1048576      # default 1 MiB of persisted result text/task
 
 defaults:

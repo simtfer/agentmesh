@@ -211,6 +211,14 @@ export interface MeshConfig {
      * truncated and the record is flagged `outputTruncated`. Default 1 MiB.
      */
     maxOutputBytes?: number;
+    /**
+     * Scheduler queue bound (Stage 5). How many tasks may *wait* in the FIFO
+     * queue for a free `maxConcurrentTasks` slot. 0/omitted = no queue, so a
+     * submit over the concurrency cap is refused immediately (fail-fast). >0 =
+     * real scheduling: over-cap submits stay `queued` and start FIFO as running
+     * tasks settle; only a full queue refuses (`queue_full`).
+     */
+    maxQueuedTasks?: number;
   };
 }
 
@@ -259,6 +267,7 @@ export const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatu
 
 export type TaskEventType =
   | "accepted"
+  | "queued"
   | "started"
   | "output"
   | "waiting"

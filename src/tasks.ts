@@ -27,6 +27,8 @@ interface LiveTask {
   workerId?: string;
   timer?: NodeJS.Timeout;
   abortReason?: "timeout" | "cancel";
+  /** the original submit input, retained so a queued task can be started later */
+  input: TaskSubmitInput;
   done: Promise<TaskRecord>;
   resolveDone: (r: TaskRecord) => void;
   /** Resolves each time the task newly enters `waiting`; re-armed on resume. */
@@ -50,14 +52,25 @@ export interface TaskManagerOptions {
   baseDelegationDepth?: number;
   maxDelegationDepth?: number;
   /**
-   * Resource limits (PLAN §7). `maxConcurrentTasks` caps how many non-terminal
-   * tasks may be in flight at once (0/undefined = unlimited); a submit beyond
-   * the cap is refused without spawning a worker. `maxOutputBytes` bounds the
-   * result text persisted per task, truncating (and flagging) anything larger so
-   * a runaway agent cannot blow up the store.
+   * Resource limits (PLAN §7). `maxConcurrentTasks` caps how many tasks may
+   * *run* at once (0/undefined = unlimited). `maxOutputBytes` bounds the result
+   * text persisted per task, truncating (and flagging) anything larger so a
+   * runaway agent cannot blow up the store.
    */
   maxConcurrentTasks?: number;
   maxOutputBytes?: number;
+  /**
+   * Scheduler bound (Stage 5). `maxQueuedTasks` caps how many tasks may *wait*
+   * in the FIFO queue for a free concurrency slot (0/undefined = no queue).
+   *
+   * Together the two knobs decide what happens when every slot is busy:
+   * - `maxQueuedTasks === 0` → a submit over the cap is refused immediately
+   *   (`concurrency_limit_exceeded`), preserving the fail-fast behaviour.
+   * - `maxQueuedTasks > 0` → the submit stays `queued` and is started later,
+   *   FIFO, as running tasks settle; only when the queue is *also* full is a
+   *   submit refused (`queue_full`).
+   */
+  maxQueuedTasks?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -86,6 +99,14 @@ function capText(
 
 export class TaskManager {
   private live = new Map<string, LiveTask>();
+  /**
+   * FIFO of taskIds admitted but not yet started, waiting for a free concurrency
+   * slot. This is the single source of truth for queue order; `pump()` drains it
+   * front-to-back so scheduling is fair (first submitted, first started).
+   */
+  private queue: string[] = [];
+  /** taskIds that have been handed to `run()` and not yet settled. */
+  private running = new Set<string>();
   private store: TaskStore;
   private approvals: ApprovalBroker;
   private provider: WorkerProvider;
@@ -95,6 +116,7 @@ export class TaskManager {
   private maxDelegationDepth: number;
   private maxConcurrentTasks: number;
   private maxOutputBytes: number;
+  private maxQueuedTasks: number;
 
   constructor(opts: TaskManagerOptions) {
     this.store = opts.store;
@@ -106,6 +128,7 @@ export class TaskManager {
     this.maxDelegationDepth = opts.maxDelegationDepth ?? DEFAULT_MAX_DELEGATION_DEPTH;
     this.maxConcurrentTasks = Math.max(0, Math.trunc(opts.maxConcurrentTasks ?? 0));
     this.maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+    this.maxQueuedTasks = Math.max(0, Math.trunc(opts.maxQueuedTasks ?? 0));
   }
 
   /* ------------------------------ submit ------------------------------ */
@@ -159,6 +182,7 @@ export class TaskManager {
     const waiting = new Promise<TaskRecord>((r) => (resolveWaiting = r));
     this.live.set(taskId, {
       controller: new AbortController(),
+      input,
       done,
       resolveDone,
       waiting,
@@ -180,25 +204,101 @@ export class TaskManager {
       );
     }
 
-    // Concurrency guard: bound in-flight tasks so a fan-out burst cannot exhaust
-    // the host. `this.live` holds exactly the non-terminal tasks (terminal ones
-    // are removed in run()'s finally), and the new task is already counted, so
-    // exceeding the cap means "strictly more than max". 0 = unlimited.
-    if (this.maxConcurrentTasks > 0 && this.live.size > this.maxConcurrentTasks) {
+    // Scheduler admission (Stage 5). A single queue owner decides, at the one
+    // choke point every submit passes through, whether to start now, wait in the
+    // bounded FIFO queue, or refuse. This replaces the old "over cap → refuse"
+    // with real fair scheduling while keeping that behaviour when no queue is
+    // configured (maxQueuedTasks === 0), so limits stay backward compatible.
+    const slotFree = this.maxConcurrentTasks <= 0 || this.running.size < this.maxConcurrentTasks;
+    if (slotFree) {
+      this.start(taskId);
+    } else if (this.maxQueuedTasks > 0 && this.queue.length < this.maxQueuedTasks) {
+      this.queue.push(taskId);
+      this.append(
+        taskId,
+        "queued",
+        `queued behind ${this.running.size} running task(s); position ${this.queue.length}/${this.maxQueuedTasks}`,
+        { kind: "status", queuePosition: this.queue.length, running: this.running.size },
+      );
+    } else {
+      // No slot and no queue room. Fail fast WITHOUT spawning a worker so a
+      // fan-out burst cannot exhaust the host.
+      const code = this.maxQueuedTasks > 0 ? "queue_full" : "concurrency_limit_exceeded";
+      const detail =
+        this.maxQueuedTasks > 0
+          ? `concurrency ${this.running.size}/${this.maxConcurrentTasks} busy and queue ${this.queue.length}/${this.maxQueuedTasks} full`
+          : `concurrency limit reached (${this.running.size}/${this.maxConcurrentTasks} running; no queue configured)`;
       return this.refuse(
         taskId,
-        "concurrency_limit_exceeded",
-        `concurrency limit reached (${this.maxConcurrentTasks} tasks in flight); ` +
-          `refusing to start another — retry once a running task settles`,
+        code,
+        `${detail}; refusing to start another — retry once a running task settles`,
       );
     }
 
+    return this.store.getTask(taskId)!;
+  }
+
+  /* ----------------------------- scheduler ---------------------------- */
+
+  /**
+   * Hand a task to `run()` and count it against the concurrency cap. `running`
+   * is updated synchronously so a burst of submits in the same tick sees an
+   * accurate in-flight count.
+   */
+  private start(taskId: string): void {
+    const live = this.live.get(taskId);
+    if (!live) return;
+    this.running.add(taskId);
     // fire and forget; errors are captured into the task record
-    void this.run(taskId, input).catch((err) => {
+    void this.run(taskId, live.input).catch((err) => {
       this.append(taskId, "failed", err instanceof Error ? err.message : String(err));
     });
+  }
 
-    return this.store.getTask(taskId)!;
+  /**
+   * The queue owner's drain loop: start queued tasks (FIFO) while a concurrency
+   * slot is free. Called after every settle so a freed slot is immediately
+   * offered to the longest-waiting task — that is the fairness guarantee.
+   */
+  private pump(): void {
+    while (
+      this.queue.length > 0 &&
+      (this.maxConcurrentTasks <= 0 || this.running.size < this.maxConcurrentTasks)
+    ) {
+      const next = this.queue.shift()!;
+      const live = this.live.get(next);
+      const rec = this.store.getTask(next);
+      // Skip anything cancelled/refused while it sat in the queue.
+      if (!live || !rec || isTerminal(rec.status)) continue;
+      this.start(next);
+    }
+  }
+
+  /** Remove a task from the wait queue; true if it was queued (not started). */
+  private dequeue(taskId: string): boolean {
+    const i = this.queue.indexOf(taskId);
+    if (i < 0) return false;
+    this.queue.splice(i, 1);
+    return true;
+  }
+
+  /** Snapshot of scheduler state for introspection (MCP `scheduler_status`). */
+  schedulerStats(): {
+    running: number;
+    queued: number;
+    maxConcurrentTasks: number;
+    maxQueuedTasks: number;
+    runningTaskIds: string[];
+    queuedTaskIds: string[];
+  } {
+    return {
+      running: this.running.size,
+      queued: this.queue.length,
+      maxConcurrentTasks: this.maxConcurrentTasks,
+      maxQueuedTasks: this.maxQueuedTasks,
+      runningTaskIds: [...this.running],
+      queuedTaskIds: [...this.queue],
+    };
   }
 
   /* ------------------------------- run -------------------------------- */
@@ -282,9 +382,14 @@ export class TaskManager {
     } finally {
       if (live.timer) clearTimeout(live.timer);
       this.approvals.cancelTask(taskId);
+      // Release the concurrency slot and offer it to the longest-waiting queued
+      // task. This is the single place a running task settles, so the queue
+      // always drains fairly (FIFO) as slots free up.
+      this.running.delete(taskId);
       const final = this.store.getTask(taskId)!;
       live.resolveDone(final);
       this.live.delete(taskId);
+      this.pump();
     }
   }
 
@@ -414,15 +519,32 @@ export class TaskManager {
     if (live) {
       live.abortReason = "cancel";
       this.approvals.cancelTask(taskId);
+      // Queued but never started: it holds no worker and `run()`'s finally (which
+      // resolves `done`) will never fire, so settle it here instead of waiting out
+      // the grace period. Dequeue first so `pump()` won't start it later.
+      if (!this.running.has(taskId) && this.dequeue(taskId)) {
+        this.setState(taskId, "cancelled", { finishedAt: Date.now() });
+        const final = this.store.getTask(taskId)!;
+        live.resolveDone(final);
+        this.live.delete(taskId);
+        return final;
+      }
       live.controller.abort();
       if (live.workerId) await this.provider.cancelWorkerTurn(live.workerId).catch(() => {});
       // Wait for the worker turn to settle so the caller observes a terminal
       // record. Bounded so a worker that ignores cancellation can't hang us.
+      // The timer handle is hoisted and cleared once `live.done` wins the race,
+      // otherwise it fires later against a store `shutdown()` has closed.
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
       const grace = new Promise<TaskRecord>((r) => {
-        const t = setTimeout(() => r(this.store.getTask(taskId)!), 5000);
-        if (t.unref) t.unref();
+        graceTimer = setTimeout(() => r(this.store.getTask(taskId)!), 5000);
+        if (graceTimer.unref) graceTimer.unref();
       });
-      await Promise.race([live.done, grace]);
+      try {
+        await Promise.race([live.done, grace]);
+      } finally {
+        if (graceTimer) clearTimeout(graceTimer);
+      }
     } else {
       // not live in this process (e.g. queued from a prior run) — settle directly
       this.setState(taskId, "cancelled", { finishedAt: Date.now() });
@@ -442,30 +564,38 @@ export class TaskManager {
     const live = this.live.get(taskId);
     const deadline = Date.now() + timeoutMs;
 
+    // Hoist the timer handle so EVERY exit path below can clear it. An
+    // `.unref()`'d timer that outlives this call would otherwise fire against a
+    // store that `shutdown()` has since closed → "database is not open".
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<TaskRecord | undefined>((resolve) => {
-      const t = setTimeout(
+      timer = setTimeout(
         () => resolve(this.store.getTask(taskId)),
         Math.max(0, deadline - Date.now()),
       );
-      if (t.unref) t.unref();
+      if (timer.unref) timer.unref();
     });
 
-    if (!live) {
-      // No live handle (e.g. after restart): poll the store for a terminal state.
-      if (isTerminal(cur0.status)) return cur0;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 200));
-        const r = this.store.getTask(taskId);
-        if (r && isTerminal(r.status)) return r;
+    try {
+      if (!live) {
+        // No live handle (e.g. after restart): poll the store for a terminal state.
+        if (isTerminal(cur0.status)) return cur0;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 200));
+          const r = this.store.getTask(taskId);
+          if (r && isTerminal(r.status)) return r;
+        }
+        return this.store.getTask(taskId);
       }
-      return this.store.getTask(taskId);
+
+      // Already waiting: safe to return now because approve()/respond() resume the
+      // task synchronously, so a post-decision wait never sees a stale `waiting`.
+      if (cur0.status === "waiting") return cur0;
+
+      return await Promise.race([live.done, live.waiting, timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-
-    // Already waiting: safe to return now because approve()/respond() resume the
-    // task synchronously, so a post-decision wait never sees a stale `waiting`.
-    if (cur0.status === "waiting") return cur0;
-
-    return Promise.race([live.done, live.waiting, timeoutPromise]);
   }
 
   /* ------------------------------ helpers ----------------------------- */

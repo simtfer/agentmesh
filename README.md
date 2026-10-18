@@ -166,6 +166,7 @@ Cancelling or timing out a task auto-resolves its pending approvals.
 | `task_events` | persisted event log after a sequence number |
 | `task_cancel` | request cancellation (settles once the worker confirms) |
 | `list_tasks` | list tasks, optionally filtered by status |
+| `scheduler_status` | running vs queued counts, configured caps, live FIFO queue order |
 | `pending_approvals` | approval/elicitation requests blocking a `waiting` task |
 | `task_approve` | resolve a permission request (allow/deny/cancel) |
 | `task_respond` | answer an elicitation request |
@@ -387,13 +388,24 @@ profiles:
   lower the inherited base.
 - **Resource limits.** Two further guards bound the blast radius of a busy or
   runaway master. `limits.maxConcurrentTasks` (default unlimited) caps how many
-  tasks may be in flight at once — a submit beyond the cap fails immediately with
-  `concurrency_limit_exceeded` *without spawning a worker* rather than queueing,
-  so a fan-out burst can't exhaust the host; a slot frees as soon as a task
-  settles. `limits.maxOutputBytes` (default 1 MiB) caps the result text persisted
-  per task: a larger result is truncated on a UTF-8 boundary (never splitting a
-  multibyte codepoint), the record is flagged `outputTruncated`, and a truncation
-  note is recorded as an event so the clip is observable rather than silent.
+  tasks may run at once. `limits.maxOutputBytes` (default 1 MiB) caps the result
+  text persisted per task: a larger result is truncated on a UTF-8 boundary (never
+  splitting a multibyte codepoint), the record is flagged `outputTruncated`, and a
+  truncation note is recorded as an event so the clip is observable rather than
+  silent.
+- **Bounded FIFO scheduler.** What happens to a submit that arrives while every
+  slot is busy is governed by `limits.maxQueuedTasks`. Left at `0` (the default),
+  the submit is refused immediately with `concurrency_limit_exceeded` *without
+  spawning a worker* — pure back-pressure, so a fan-out burst can't exhaust the
+  host. Set it `>0` to turn on real scheduling: over-cap submits park in a bounded
+  FIFO queue and drain automatically as running tasks settle, and only a submit
+  that finds the queue full too is refused (`queue_full`). A single queue owner
+  (`pump()`) advances the queue whenever a slot frees, so admission stays race-free
+  under a same-tick burst. A queued task holds no worker and can be cancelled — it
+  settles at once instead of waiting out the cancel grace period. The
+  `scheduler_status` MCP tool exposes running vs queued counts, the configured
+  caps, and the live queue order so a master can read back-pressure before
+  fanning out.
 
 ### Remote tests
 
@@ -436,7 +448,7 @@ src/
     security.ts        token compare, cwd whitelist, TLS load, safe-bind guard
     daemon.ts          WorkerDaemon: HTTP+WS shim wrapping a local Orchestrator
     client.ts          RemoteWorkerDriver: a remote profile as a normal WorkerDriver
-  mcp/server.ts        exposes the orchestrator as 15 MCP tools over stdio
+  mcp/server.ts        exposes the orchestrator as 16 MCP tools over stdio
   cli.ts               demo | list | mcp | dispatch | submit | tasks | daemon
 ```
 
@@ -449,16 +461,20 @@ Swap the two and it still works.
 Checked on this machine (Node v26, Windows):
 
 - `tsc --noEmit` — clean.
-- `npm test` — **40/40** pass:
+- `npm test` — **44/44** pass:
   - `test/orchestrator.test.ts` — spawn/dispatch, event streaming, worktree.
-  - `test/tasks.test.ts` (16) — happy path, worker failure, `timeout → timed_out`,
+  - `test/tasks.test.ts` (20) — happy path, worker failure, `timeout → timed_out`,
     `cancel → cancelled`, `waiting → approve → succeeded`, `reject → failed`,
     idempotency de-dup, SQLite restart-and-requery, store column-merge safety, the
     recursion guard (depth-stamped success within the cap, refusal at the cap with
-    no worker spawned, and an inherited env depth tripping the cap), and the
+    no worker spawned, and an inherited env depth tripping the cap), the
     resource limits (a submit past `maxConcurrentTasks` refused with no worker,
     a settled task freeing its slot, an oversized result truncated + flagged
-    `outputTruncated`, and truncation never splitting a multibyte codepoint).
+    `outputTruncated`, and truncation never splitting a multibyte codepoint), and
+    the Stage 5 scheduler (over-cap submits queue then drain FIFO as slots free, a
+    full queue refuses with `queue_full`, cancelling a queued task settles
+    immediately without the grace wait, and a fan-out runs concurrently bounded by
+    `maxConcurrentTasks`).
   - `test/remote.test.ts` (18) — loopback daemon ↔ `RemoteWorkerDriver`: dispatch +
     streamed events, approval round-trip, cancel, bad-token rejection,
     cwd-whitelist refusal, `/healthz` vs `/profiles` auth split, reconnect
@@ -488,10 +504,13 @@ Done:
 - ✅ Real ACP workers (OpenCode, Pi) verified end-to-end.
 - ✅ Remote Worker Daemon: run workers on other machines over an authenticated,
   TLS-capable channel (ACP stdio never crosses the network).
+- ✅ Recursion guard + resource limits (delegation depth, concurrency, output size).
+- ✅ Bounded FIFO scheduler: parallel fan-out with a single queue owner,
+  over-cap queueing, and `scheduler_status` introspection.
 
 Next:
 
-- Parallel fan-out across concurrent workers + a real queue owner.
+- Queue TTL / per-task deadlines and weighted cross-profile fairness.
 - Master-side prompt/skill pack so the master delegates well by default.
 - Cross-worker handoff (pipe one worker's diff into another's context).
 - Structured result contracts (JSON output schema per task) + cost/usage roll-up

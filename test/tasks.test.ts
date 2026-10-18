@@ -337,4 +337,151 @@ test("truncation never splits a multibyte codepoint", async () => {
   }
 });
 
+/* --------------------- Stage 5: parallel scheduling --------------------- */
+
+// A short-lived "hold" profile (~200ms/turn) keeps tasks running long enough to
+// observe the queue, without slowing the suite down.
+const hold = { delayMs: 25, toolCalls: 8 };
+
+const schedConfig = parseConfig({
+  workdir: ".agentmesh-test",
+  limits: { maxConcurrentTasks: 2, maxQueuedTasks: 5 },
+  profiles: [
+    { name: "hold", driver: "mock", mock: hold },
+    { name: "fast", driver: "mock", mock: { delayMs: 1, toolCalls: 1 } },
+  ],
+});
+
+const schedOrch = () =>
+  new Orchestrator(schedConfig, { baseCwd: process.cwd(), persist: false });
+
+test("over-cap submits queue (not refuse) and drain FIFO as slots free", async () => {
+  const orch = schedOrch();
+  try {
+    // Submit 4 synchronously: cap is 2, so 2 start and 2 wait in the queue.
+    const a = orch.submitTask({ profile: "hold", prompt: "a" });
+    const b = orch.submitTask({ profile: "hold", prompt: "b" });
+    const c = orch.submitTask({ profile: "hold", prompt: "c" });
+    const d = orch.submitTask({ profile: "hold", prompt: "d" });
+
+    assert.equal(a.status, "starting");
+    assert.equal(b.status, "starting");
+    assert.equal(c.status, "queued", "over-cap submit should queue, not refuse");
+    assert.equal(d.status, "queued");
+
+    // scheduler_status reflects the split immediately (no awaits yet).
+    const s = orch.schedulerStatus();
+    assert.equal(s.running, 2);
+    assert.equal(s.queued, 2);
+    assert.equal(s.maxConcurrentTasks, 2);
+    assert.equal(s.maxQueuedTasks, 5);
+    assert.deepEqual(s.queuedTaskIds, [c.taskId, d.taskId], "queue order is FIFO by submit");
+
+    // The queued tasks recorded their position for observability.
+    const cq = orch.taskEvents(c.taskId).find((e) => e.type === "queued");
+    assert.equal((cq?.data as Record<string, unknown>)?.queuePosition, 1);
+    const dq = orch.taskEvents(d.taskId).find((e) => e.type === "queued");
+    assert.equal((dq?.data as Record<string, unknown>)?.queuePosition, 2);
+
+    // All four eventually succeed — the queue drains as running tasks settle.
+    for (const t of [a, b, c, d]) {
+      const rec = await orch.waitTask(t.taskId, 8000);
+      assert.equal(rec?.status, "succeeded");
+    }
+    const end = orch.schedulerStatus();
+    assert.equal(end.running, 0);
+    assert.equal(end.queued, 0);
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("a submit with no slot AND a full queue is refused (queue_full)", async () => {
+  const orch = new Orchestrator(
+    parseConfig({
+      workdir: ".agentmesh-test",
+      limits: { maxConcurrentTasks: 1, maxQueuedTasks: 1 },
+      profiles: [{ name: "hold", driver: "mock", mock: hold }],
+    }),
+    { baseCwd: process.cwd(), persist: false },
+  );
+  try {
+    const a = orch.submitTask({ profile: "hold", prompt: "a" }); // runs (cap 1)
+    const b = orch.submitTask({ profile: "hold", prompt: "b" }); // queues (1/1)
+    assert.equal(a.status, "starting");
+    assert.equal(b.status, "queued");
+
+    const c = orch.submitTask({ profile: "hold", prompt: "c" }); // no slot, queue full
+    assert.equal(c.status, "failed");
+    assert.equal(c.error?.code, "queue_full");
+    assert.equal(c.workerId, undefined, "a refused task never spawns a worker");
+    assert.ok(!orch.taskEvents(c.taskId).some((e) => e.type === "started"));
+
+    await orch.waitTask(a.taskId, 8000);
+    await orch.waitTask(b.taskId, 8000);
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("cancelling a queued task settles immediately without the grace wait", async () => {
+  const orch = new Orchestrator(
+    parseConfig({
+      workdir: ".agentmesh-test",
+      limits: { maxConcurrentTasks: 1, maxQueuedTasks: 5 },
+      profiles: [{ name: "hold", driver: "mock", mock: hold }],
+    }),
+    { baseCwd: process.cwd(), persist: false },
+  );
+  try {
+    const a = orch.submitTask({ profile: "hold", prompt: "a" }); // runs
+    const b = orch.submitTask({ profile: "hold", prompt: "b" }); // queued
+    assert.equal(b.status, "queued");
+
+    const t0 = Date.now();
+    const cancelled = await orch.cancelTask(b.taskId);
+    const elapsed = Date.now() - t0;
+
+    assert.equal(cancelled?.status, "cancelled");
+    assert.equal(cancelled?.workerId, undefined, "a queued task never spawned a worker");
+    assert.ok(elapsed < 500, `queued cancel should be immediate, took ${elapsed}ms`);
+    // It left the queue, so the scheduler no longer counts it.
+    assert.equal(orch.schedulerStatus().queued, 0);
+
+    // The running task is unaffected and still completes.
+    const ra = await orch.waitTask(a.taskId, 8000);
+    assert.equal(ra?.status, "succeeded");
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+test("fan-out up to the cap runs concurrently, bounded by maxConcurrentTasks", async () => {
+  const orch = new Orchestrator(
+    parseConfig({
+      workdir: ".agentmesh-test",
+      limits: { maxConcurrentTasks: 3, maxQueuedTasks: 10 },
+      profiles: [{ name: "hold", driver: "mock", mock: hold }],
+    }),
+    { baseCwd: process.cwd(), persist: false },
+  );
+  try {
+    const subs = [1, 2, 3, 4, 5].map((n) =>
+      orch.submitTask({ profile: "hold", prompt: `t${n}` }),
+    );
+    // Exactly 3 run at once; the other 2 wait — never more than the cap.
+    const s = orch.schedulerStatus();
+    assert.equal(s.running, 3, "concurrency must not exceed the cap");
+    assert.equal(s.queued, 2);
+
+    for (const t of subs) {
+      const rec = await orch.waitTask(t.taskId, 8000);
+      assert.equal(rec?.status, "succeeded");
+    }
+  } finally {
+    await orch.shutdown();
+  }
+});
+
+
 

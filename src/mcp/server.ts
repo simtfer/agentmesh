@@ -197,6 +197,17 @@ export function createMcpServer(orch: Orchestrator): McpServer {
     wrap(({ status, limit }) => ({ tasks: orch.listTasks({ status, limit }) })),
   );
 
+  server.registerTool(
+    "scheduler_status",
+    {
+      title: "Scheduler status",
+      description:
+        "Introspect the task scheduler: how many tasks are running vs waiting in the FIFO queue, the configured concurrency/queue caps, and the current queue order. Useful to see backpressure before submitting a fan-out.",
+      inputSchema: {},
+    },
+    wrap(() => orch.schedulerStatus()),
+  );
+
   /* --------------------------- approvals -------------------------- */
 
   server.registerTool(
