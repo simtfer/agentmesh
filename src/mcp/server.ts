@@ -31,8 +31,8 @@ const wrap =
  */
 const handoffSchema = z.object({
   fromTaskId: z.string(),
-  inject: z.enum(["result"]).optional(),
-  base: z.enum(["repo"]).optional(),
+  inject: z.enum(["result", "diff"]).optional(),
+  base: z.enum(["repo", "predecessor"]).optional(),
   maxBytes: z.number().int().positive().optional(),
 });
 

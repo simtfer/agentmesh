@@ -25,14 +25,29 @@ export interface WorktreeInfo {
   baseRepo: string;
 }
 
+/** Absolute path of the repository's common git dir (shared by all its worktrees). */
+export async function gitCommonDir(dir: string): Promise<string | undefined> {
+  try {
+    const out = await git(["rev-parse", "--git-common-dir"], dir);
+    return path.resolve(dir, out);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Create an isolated git worktree so parallel workers never touch the same
  * files. Branch + path are derived from the worker id.
+ *
+ * `fromCommit` starts the branch at an arbitrary commit instead of the repo's
+ * HEAD — that is how handoff `base: "predecessor"` gives a successor the
+ * predecessor's exact end state (a snapshot commit built by `snapshotWorktree`).
  */
 export async function createWorktree(
   baseRepo: string,
   workerId: string,
   workdir: string,
+  opts: { fromCommit?: string } = {},
 ): Promise<WorktreeInfo> {
   if (!(await isGitRepo(baseRepo))) {
     throw new Error(
@@ -43,7 +58,9 @@ export async function createWorktree(
   const wtPath = path.join(workdir, "worktrees", workerId);
   await mkdir(path.dirname(wtPath), { recursive: true });
   // -B so re-spawning the same id reuses/resets the branch instead of erroring
-  await git(["worktree", "add", "-B", branch, wtPath], baseRepo);
+  const args = ["worktree", "add", "-B", branch, wtPath];
+  if (opts.fromCommit) args.push(opts.fromCommit);
+  await git(args, baseRepo);
   return { path: wtPath, branch, baseRepo };
 }
 

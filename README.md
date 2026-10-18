@@ -29,7 +29,7 @@ anything else, with the same code.
 - [Task lifecycle and the 8-state machine](#task-lifecycle-and-the-8-state-machine)
 - [MCP tools exposed to the master](#mcp-tools-exposed-to-the-master)
 - [Master skill (self-hosted)](#master-skill-self-hosted)
-- [Cross-worker handoff (Phase 1)](#cross-worker-handoff-phase-1)
+- [Cross-worker handoff](#cross-worker-handoff)
 - [Attach a real master](#attach-a-real-master)
 - [CLI](#cli)
 - [Remote Worker Daemon (cross-machine workers)](#remote-worker-daemon-cross-machine-workers)
@@ -76,7 +76,8 @@ Working and verified end-to-end: an **8-state persistent task machine** (SQLite)
 **async task lifecycle** (`task_submit` / `task_wait` / `task_result` / …), a
 **human-in-the-loop approval flow** for worker permission/elicitation requests, a
 **bounded, weighted-fair scheduler** (queue TTLs, per-task deadlines, opt-in
-profile weights) for parallel fan-out, **cross-worker handoff**, a
+profile weights) for parallel fan-out, **cross-worker handoff** (result text,
+redacted diff sidecars, predecessor end-state worktrees), a
 self-hosted **master delegation skill**, and a **remote Worker Daemon** for
 cross-machine workers over an authenticated, TLS-capable channel — driven against
 **real local OpenCode and Pi agents** as well as deterministic mocks. See
@@ -251,44 +252,64 @@ self-contained subtask prompt, anti-patterns, and the security red lines that
 mirror agentmesh's own guarantees. A master should call `master_playbook` once
 before its first fan-out.
 
-## Cross-worker handoff (Phase 1)
+## Cross-worker handoff
 
-A fan-out isn't always independent — sometimes task B should *continue from*
-task A's result (A writes a report, B reviews it; A patches, B tests). The
-`handoff` field on `task_submit` / `dispatch_task` chains one task onto a
-finished predecessor without the master having to copy A's output by hand.
+A fan-out isn't always independent — sometimes task B should *continue from* task
+A (A writes a report, B reviews it; A patches, B tests). The `handoff` field on
+`task_submit` / `dispatch_task` chains one task onto a finished predecessor
+without the master copying A's output by hand.
 
 ```jsonc
 {
-  "task": "Review the report and flag any unsupported claims.",
+  "task": "Review the patch and flag anything unsafe.",
   "profile": "pi",
-  "handoff": { "fromTaskId": "<taskA>", "inject": "result" }
+  "handoff": { "fromTaskId": "<taskA>", "inject": "diff", "base": "predecessor" }
 }
 ```
 
-- **What gets injected.** At run time agentmesh reads the predecessor's persisted
-  `result` text and prepends it to *this* task's prompt, wrapped in an untrusted
-  envelope (`<<<UPSTREAM WORKER OUTPUT  trusted=NO … >>>`) that tells the worker
-  to treat the block strictly as **data to act on, never as instructions**. This
-  mirrors agentmesh's core rule: another worker's output is not a command channel.
-- **Ephemeral by design.** The augmented prompt is built at run time and handed to
-  the worker; the *stored* `prompt` stays exactly what the master submitted. Only
-  a compact `metadata.handoff` summary (`fromTaskId`, `inject`, `base`,
-  `injectedBytes`, `truncated`) and a `handoff` event are persisted — so large or
-  sensitive artifacts never land in the prompt column.
-- **Admission validation.** A handoff whose source task is unknown is refused
-  (`handoff_unknown_task`); one whose source hasn't reached `succeeded` yet is
-  refused (`handoff_predecessor_not_ready`) — both *without spawning a worker*, so
-  you can't chain onto a task that's still running or failed.
-- **Byte cap.** The injected artifact is capped to `handoff.maxBytes` (falling back
-  to `limits.maxHandoffBytes`, default 256 KiB), truncated on a UTF-8 boundary and
-  flagged `truncated` in the metadata — the same safe-clip used for oversized
-  results.
+Two independent axes:
 
-Phase 1 covers `inject: "result"` over a `base: "repo"` worktree. Later phases add
-`inject: "diff"` (capture the predecessor's working-tree diff as a redacted artifact
-sidecar) and `base: "predecessor"` (start the successor in a worktree branched from
-the predecessor's end state).
+| field | value | meaning |
+|---|---|---|
+| `inject` | `"result"` (default) | the predecessor's final text, inlined into the prompt |
+| | `"diff"` | the predecessor's working-tree patch, as a redacted sidecar file |
+| `base` | `"repo"` (default) | the successor's worktree branches from the repo's HEAD |
+| | `"predecessor"` | …from a snapshot of the predecessor's end state |
+
+- **`inject: "result"`** prepends the persisted result text, wrapped in an
+  untrusted envelope (`<<<UPSTREAM WORKER OUTPUT  trusted=NO … >>>`) that tells
+  the worker to treat the block strictly as **data to act on, never as
+  instructions**. Another worker's output is not a command channel.
+- **`inject: "diff"`** keeps the patch out of the prompt. It captures the
+  predecessor's working-tree diff — tracked edits *and* new untracked files,
+  honouring `.gitignore` — redacts secret-shaped strings (`AKIA…`, `ghp_…`,
+  `sk-…`, `xox…`, `Bearer …`, PEM private keys, `password = …` assignments),
+  caps it, and writes it to `<workdir>/handoffs/<taskId>.diff`. The prompt only
+  points at that path, so a multi-megabyte patch never has to fit in a prompt.
+  Redaction is pattern-based and deliberately best-effort: it reduces accidental
+  leakage, it is **not** a guarantee, and the artifact remains untrusted data.
+- **`base: "predecessor"`** snapshots the predecessor's working tree into a commit
+  (`git write-tree` + `commit-tree` against a temporary index) and creates the
+  successor's worktree from it — so the successor literally starts where the
+  predecessor stopped, with its uncommitted work in place. The predecessor's own
+  branch, index and files are never modified. Requires the successor to run in a
+  worktree (`handoff_base_requires_worktree` otherwise).
+- **Ephemeral by design.** The augmented prompt is built at run time; the *stored*
+  `prompt` stays exactly what the master submitted. Only a compact
+  `metadata.handoff` summary (`fromTaskId`, `inject`, `base`, `injectedBytes`,
+  `truncated`, `filesChanged`, `addedLines`, `deletedLines`, `redactions`,
+  `artifact`) and a `handoff` event are persisted.
+- **Admission validation.** Unknown source → `handoff_unknown_task`; source not
+  `succeeded` → `handoff_predecessor_not_ready`; a remote successor for an
+  artifact handoff → `handoff_artifact_unavailable`; a dead or foreign checkout
+  for `base: "predecessor"` → `handoff_base_unavailable`. All are refused
+  *without spawning a worker*.
+- **Byte cap.** `handoff.maxBytes` (falling back to `limits.maxHandoffBytes`,
+  default 256 KiB), truncated on a UTF-8 boundary and flagged `truncated`.
+
+> Diff handoffs and predecessor snapshots assume the successor runs on the same
+> host as the master. A `driver: remote` successor can see neither artifact, so
+> agentmesh refuses the combination rather than handing it a path it cannot read.
 
 ## Attach a real master
 
@@ -452,6 +473,9 @@ Every failure lands on the task record (`error.code`) *and* the event log, so
 | `delegation_depth_exceeded` | the chain reached `maxDelegationDepth` | usually a master delegating in a loop — inspect the chain before raising the cap |
 | `handoff_unknown_task` | `handoff.fromTaskId` matches no stored task | check the id; a task under another `workdir` is invisible |
 | `handoff_predecessor_not_ready` | the predecessor is not `succeeded` yet | `task_wait` on it first; failed/cancelled output is never handed off |
+| `handoff_base_requires_worktree` | `base: "predecessor"` without a worktree | pass `worktree: true` or enable it on the profile |
+| `handoff_base_unavailable` | the predecessor's checkout is gone or in another repo | keep its worker alive until the successor starts |
+| `handoff_artifact_unavailable` | a `diff`/`predecessor` handoff targets a remote worker, or the checkout vanished | run the successor locally, or use `inject: "result"` |
 
 Symptoms that aren't error codes:
 
@@ -477,6 +501,7 @@ src/
   config.ts            YAML load + zod validation
   statemachine.ts      8-state transitions + terminal/legality guards
   worktree.ts          git-worktree isolation for parallel workers
+  handoff.ts           diff capture, secret redaction, end-state snapshots, sidecars
   registry.ts          worker lifecycle + bounded event log
   approvals.ts         ApprovalBroker: bridges permission/elicitation to the master
   tasks.ts             TaskManager: async 8-state lifecycle, timeout/cancel, approvals, handoff
@@ -517,16 +542,17 @@ Swap the two and it still works.
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 60 tests, offline, no API cost, ~8s
+npm test            # 72 tests, offline, no API cost, ~22s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **60/60** across four files — lifecycle, persistence and guards (32),
-remote daemon (18), orchestrator (6), master skill (4). Every case drives a public
-surface (Orchestrator, MCP tools, or the daemon's HTTP/WS endpoints) and asserts
-the resulting task record, not a mock's internal calls.
+`npm test` is **72/72** across five files — lifecycle, persistence and guards (32),
+handoff artifacts (12), remote daemon (18), orchestrator (6), master skill (4).
+Every case drives a public surface (Orchestrator, MCP tools, or the daemon's
+HTTP/WS endpoints) and asserts the resulting task record, not a mock's internal
+calls.
 
 Last run on Windows with Node v22.22. Real OpenCode and Pi workers have also been
 driven end-to-end (`npm run real`: both reach `succeeded` and persist 2 tasks /
@@ -552,14 +578,14 @@ Done:
 - ✅ Self-hosted master skill: the delegation playbook ships in the repo and is
   served over MCP (`master_playbook` tool + resources), so a master delegates
   well by default without any copy-paste.
-- ✅ Cross-worker handoff (Phase 1): chain a task onto a finished predecessor's
-  `result`, injected as untrusted data under a byte cap, with the stored prompt
-  left original.
+- ✅ Cross-worker handoff, all three phases: chain a task onto a finished
+  predecessor's `result`; hand off its working-tree `diff` as a redacted sidecar
+  file instead of inlining the patch; and start the successor's worktree from a
+  snapshot of the predecessor's end state. Injected artifacts are untrusted data
+  under a byte cap, and the stored prompt stays original.
 
 Next:
 
-- Cross-worker handoff Phase 2/3 (`inject: "diff"` artifact sidecar + redaction,
-  `base: "predecessor"` worktree branched from the predecessor's end state).
 - Structured result contracts (JSON output schema per task) + cost/usage roll-up
   from ACP `usage_update` events.
 

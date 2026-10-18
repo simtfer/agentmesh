@@ -125,6 +125,14 @@ export class Orchestrator {
         return typeof w === "number" && Number.isFinite(w) && w > 0 ? w : 1;
       },
       maxHandoffBytes: config.limits?.maxHandoffBytes,
+      // Handoff artifacts (diff sidecars) live next to the rest of the per-repo
+      // state, and snapshots are only usable when both tasks share this repo.
+      workdir: this.workdir,
+      baseRepo: this.baseCwd,
+      profileWorktree: (name) =>
+        this.config.profiles.find((p) => p.name === name)?.worktree ?? false,
+      profileIsRemote: (name) =>
+        this.config.profiles.find((p) => p.name === name)?.driver === "remote",
     });
   }
 
@@ -153,7 +161,7 @@ export class Orchestrator {
 
   async spawnWorker(
     profileName: string,
-    opts: { cwd?: string; worktree?: boolean } = {},
+    opts: { cwd?: string; worktree?: boolean; baseCommit?: string } = {},
   ): Promise<string> {
     const profile = getProfile(this.config, profileName);
     const id = this.registry.nextId(profile.name);
@@ -163,7 +171,9 @@ export class Orchestrator {
     let worktree: WorkerRecord["worktree"];
 
     if (useWorktree) {
-      const info = await createWorktree(this.baseCwd, id, this.workdir);
+      const info = await createWorktree(this.baseCwd, id, this.workdir, {
+        fromCommit: opts.baseCommit,
+      });
       worktree = info;
       cwd = info.path;
     }

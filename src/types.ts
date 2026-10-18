@@ -101,6 +101,12 @@ export interface MockBehavior {
   toolCalls?: number;
   /** if true, ask for permission before replying (drives the `waiting` state) */
   requireApproval?: boolean;
+  /**
+   * Files to write (relative to the worker's cwd) before the turn completes.
+   * Lets tests and demos exercise handoff `inject: "diff"` / `base: "predecessor"`
+   * without a real agent that edits files.
+   */
+  writeFiles?: Record<string, string>;
 }
 
 /** Settings for a `driver: "remote"` profile (a worker that lives on a daemon). */
@@ -266,10 +272,24 @@ export const DEFAULT_MAX_HANDOFF_BYTES = 256 * 1024;
 export interface HandoffSpec {
   /** The task whose output is handed off. Must be terminal and `succeeded`. */
   fromTaskId: string;
-  /** What to inject. Phase 1: `"result"` only (predecessor's final text). */
-  inject?: "result";
-  /** Where the successor runs. Phase 1: `"repo"` only (fresh worktree, context injection). */
-  base?: "repo";
+  /**
+   * What to inject into the successor.
+   * - `"result"` (Phase 1): the predecessor's final result text, inline in the prompt.
+   * - `"diff"` (Phase 2): the predecessor's working-tree diff, redacted and written
+   *   to a sidecar file under `workdir/handoffs/`. The prompt only references the
+   *   path, so a large patch never has to fit in a prompt.
+   */
+  inject?: "result" | "diff";
+  /**
+   * Where the successor runs.
+   * - `"repo"` (Phase 1): a normal worker — its worktree branches from the repo's
+   *   current HEAD, and the predecessor's output is injected as context.
+   * - `"predecessor"` (Phase 3): its worktree branches from a snapshot of the
+   *   predecessor's *end state* (including uncommitted edits and untracked files),
+   *   so the successor literally starts where the predecessor stopped.
+   *   Requires the successor to run in a worktree.
+   */
+  base?: "repo" | "predecessor";
   /** Per-task override of `limits.maxHandoffBytes`. */
   maxBytes?: number;
 }

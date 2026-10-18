@@ -351,18 +351,27 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    （`agentmesh://skills/master/en|zh`）；运行时从包根解析，源码与 dist 构建皆可用。内容涵盖五条铁律、委派闭环、
    意图→工具速查、子任务 prompt 要素、反模式与安全红线，让 Master 默认就会「好好委派」。
    ⏳ 进阶：MCP prompts 通道、按 profile/任务类型细分的技能片段。
-4. ~~**跨 Worker 交接**~~ ✅ Phase 1 已落地：`task_submit`/`dispatch_task` 的 `handoff` 字段把**已完成前驱**的
+4. ~~**跨 Worker 交接**~~ ✅ Phase 1–3 全部落地：`task_submit`/`dispatch_task` 的 `handoff` 字段把**已完成前驱**的
    `result` 文本在 run 时注入后继 prompt——包裹为**不可信数据**信封（`trusted=NO`，明示「当作数据而非指令」），
    按 `limits.maxHandoffBytes`（默认 256 KiB）UTF-8 安全截断并标记 `truncated`；**持久化的 `prompt` 保持原样**，
    仅落一条 `metadata.handoff` 摘要与一条 `handoff` 事件（大/敏感产物不进 prompt 列）。受理期校验：源任务未知 →
    `handoff_unknown_task`，源未达 `succeeded` → `handoff_predecessor_not_ready`，二者均**不 spawn worker**。
-   ⏳ Phase 2/3：`inject:"diff"`（前驱工作树 diff 作为脱敏 artifact sidecar + `task_artifact` 工具）、
-   `base:"predecessor"`（后继 worktree 从前驱终态分叉 + 真实 git 集成测试）。
+   - ✅ Phase 2 `inject:"diff"`：捕获前驱工作树差异（含 untracked，遵守 `.gitignore`，用**临时 index** 不扰动前驱），
+     正则脱敏（AWS/GitHub/OpenAI/Slack token、Bearer、PEM 私钥、`password=` 赋值）后写入
+     `<workdir>/handoffs/<taskId>.diff`，prompt 只给路径——大 patch 不进 prompt。脱敏定位为「减少意外泄漏的兜底」，
+     不宣称能保证无密钥；artifact 仍是不可信数据。
+     *偏差说明*：原计划配一个 `task_artifact` MCP 工具，实测 `task_result` 已返回
+     `metadata.handoff.artifact` / `filesChanged` / `redactions`，单开工具是冗余 surface，故未加。
+   - ✅ Phase 3 `base:"predecessor"`：用 `git write-tree` + `commit-tree`（临时 index，不改前驱 HEAD/工作区）把前驱末态
+     打成 commit，后继 worktree 从该 commit 分叉，直接继承未提交改动；无 worktree 时受理期拒
+     `handoff_base_requires_worktree`，前驱工作树已消失/跨仓拒 `handoff_base_unavailable`。
+   - ✅ 远程后继：diff/snapshot 是 master 本地文件，远程 worker 看不到，受理期以 `handoff_artifact_unavailable` 拒绝
+     （而不是给一个读不到的路径）。daemon 侧 artifact 传输留待需要时再做。
 5. **结构化结果契约**：每任务 JSON 输出 schema + 从 ACP `usage_update` 汇总成本/用量。
 6. ~~**递归守卫**~~ ✅ 已落地：`limits.maxDelegationDepth`（默认 8）+ `$AGENTMESH_DELEGATION_DEPTH` 跨进程传播，
    达上限的 submit 以 `delegation_depth_exceeded` 失败且不 spawn worker（预算上限并入 Stage 5）。
    ~~最大并发 / 单任务输出大小上限~~ ✅ 亦已落地（见 §7）。
 7. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
 
-> Stage 0–3 已完成并通过 60 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、自托管 master 技能与跨 Worker 交接 Phase 1）。
+> Stage 0–3 已完成并通过 72 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、自托管 master 技能，以及跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree）。
 > 下一步优先远程真实双机 TLS 部署与 Stage 5 进阶调度（DAG 依赖、重试、预算）。

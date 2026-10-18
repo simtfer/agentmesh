@@ -9,6 +9,7 @@ const MockBehavior = z.object({
   failOn: z.string().optional(),
   toolCalls: z.number().int().nonnegative().optional(),
   requireApproval: z.boolean().optional(),
+  writeFiles: z.record(z.string()).optional(),
 });
 
 const RemoteSettings = z.object({

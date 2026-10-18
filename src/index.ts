@@ -6,7 +6,17 @@ export { WorkerRegistry, describeWorker } from "./registry.js";
 export { createDrivers } from "./drivers/factory.js";
 export { AcpxWorkerDriver } from "./drivers/acpxDriver.js";
 export { MockWorkerDriver } from "./drivers/mockDriver.js";
-export { createWorktree, removeWorktree, isGitRepo } from "./worktree.js";
+export { createWorktree, removeWorktree, isGitRepo, gitCommonDir } from "./worktree.js";
+export {
+  HandoffError,
+  redactSecrets,
+  captureWorkingTreeDiff,
+  snapshotWorkingTree,
+  sameRepository,
+  handoffSidecarPath,
+  writeHandoffSidecar,
+} from "./handoff.js";
+export type { RedactionReport, DiffCapture } from "./handoff.js";
 export { createMcpServer, runMcpServer } from "./mcp/server.js";
 export { readSkill, skillPath, skillResourceUri, findPackageRoot, SKILL_LANGS } from "./skill.js";
 export type { SkillLang, SkillLoadResult } from "./skill.js";

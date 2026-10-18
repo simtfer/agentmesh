@@ -6,6 +6,8 @@ import type {
   TurnResult,
   RunTurnOptions,
 } from "../types.js";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -74,6 +76,21 @@ class MockWorkerHandle implements WorkerHandle {
         return { status: "cancelled", text: "", events };
       }
       emit({ type: "status", text: `permission granted (${decision})` });
+    }
+
+    // Optionally materialise files so handoff diff/base tests have real changes.
+    if (this.behavior.writeFiles) {
+      const entries = Object.entries(this.behavior.writeFiles);
+      for (const [rel, content] of entries) {
+        const target = path.resolve(this.cwd, rel);
+        await mkdir(path.dirname(target), { recursive: true });
+        await writeFile(target, content, "utf8");
+      }
+      emit({
+        type: "tool",
+        text: `write_file ${entries.map(([rel]) => rel).join(", ")}`,
+        data: { kind: "write" },
+      });
     }
 
     const reply =

@@ -54,7 +54,7 @@
 
 ## 当前状态
 
-已实现并做过端到端验证：**8 态持久化任务机**（SQLite）、**异步任务生命周期**（`task_submit` / `task_wait` / `task_result`……）、面向 worker 权限/交互请求的**人在环路审批流**、用于并行扇出的**有界、加权公平调度器**（队列 TTL、每任务截止时间、可选 profile 权重）、**跨 Worker 交接**、自托管的 **master 委派技能**，以及让 worker 跨机器运行的**远程 Worker Daemon**（带认证、可走 TLS）——驱动对象既有**本机真实的 OpenCode 和 Pi**，也有确定性的 mock。详见[验证](#验证)。
+已实现并做过端到端验证：**8 态持久化任务机**（SQLite）、**异步任务生命周期**（`task_submit` / `task_wait` / `task_result`……）、面向 worker 权限/交互请求的**人在环路审批流**、用于并行扇出的**有界、加权公平调度器**（队列 TTL、每任务截止时间、可选 profile 权重）、**跨 Worker 交接**（结果注入、脱敏 diff 旁挂、前驱末态 worktree）、自托管的 **master 委派技能**，以及让 worker 跨机器运行的**远程 Worker Daemon**（带认证、可走 TLS）——驱动对象既有**本机真实的 OpenCode 和 Pi**，也有确定性的 mock。详见[验证](#验证)。
 
 ## 安装
 
@@ -189,22 +189,33 @@ agentmesh 还**自带 master 技能**：`skills/agentmesh-master/` 下的委派�
 
 ## 跨 Worker 交接
 
-扇出并不总是彼此独立——有时任务 B 应该*接着*任务 A 的结果做（A 写报告、B 审阅；A 打补丁、B 跑测试）。`task_submit` / `dispatch_task` 上的 `handoff` 字段能把一个任务接到已完成的前驱任务上，master 不必手工搬运 A 的输出。
+扇出并不总是彼此独立——有时任务 B 应该*接着*任务 A 做（A 写报告、B 审阅；A 打补丁、B 跑测试）。`task_submit` / `dispatch_task` 上的 `handoff` 字段能把一个任务接到已完成的前驱任务上，master 不必手工搬运 A 的输出。
 
 ```jsonc
 {
-  "task": "Review the report and flag any unsupported claims.",
+  "task": "Review the patch and flag anything unsafe.",
   "profile": "pi",
-  "handoff": { "fromTaskId": "<taskA>", "inject": "result" }
+  "handoff": { "fromTaskId": "<taskA>", "inject": "diff", "base": "predecessor" }
 }
 ```
 
-- **注入什么。** 运行时 agentmesh 读取前驱任务持久化的 `result` 文本，前置到*本*任务的提示词里，并包在一个不可信信封中（`<<<UPSTREAM WORKER OUTPUT  trusted=NO … >>>`），明确告诉 worker 这段内容只能当**数据**处理、绝不当作指令。这与 agentmesh 的核心规则一致：另一个 worker 的输出不是指令通道。
-- **设计上即瞬态。** 增强后的提示词在运行时拼好并交给 worker；*存储的* `prompt` 仍是 master 提交时的原文。持久化的只有一份精简的 `metadata.handoff` 摘要（`fromTaskId`、`inject`、`base`、`injectedBytes`、`truncated`）和一个 `handoff` 事件——因此再大或再敏感的产物也不会落进 prompt 列。
-- **准入校验。** 源任务不存在的交接会被拒（`handoff_unknown_task`）；源任务尚未到 `succeeded` 的也会被拒（`handoff_predecessor_not_ready`）——两者都**不启动 worker**，所以你没法接到一个还在跑或已失败的任务上。
-- **字节上限。** 注入产物受 `handoff.maxBytes` 限制（缺省回落到 `limits.maxHandoffBytes`，默认 256 KiB），在 UTF-8 边界截断，并在元数据里标 `truncated`——和超大结果用的是同一套安全裁剪。
+两个相互独立的维度：
 
-Phase 1 覆盖的是 `inject: "result"` 配合 `base: "repo"` worktree。后续阶段会加 `inject: "diff"`（把前驱的工作区 diff 作为脱敏产物旁挂）与 `base: "predecessor"`（让后继任务在从前驱末态分出的 worktree 里启动）。
+| 字段 | 取值 | 含义 |
+|---|---|---|
+| `inject` | `"result"`（默认） | 前驱的最终文本，内联进提示词 |
+| | `"diff"` | 前驱的工作树补丁，写成脱敏的旁挂文件 |
+| `base` | `"repo"`（默认） | 后继的 worktree 从仓库 HEAD 分叉 |
+| | `"predecessor"` | ……从前驱末态的快照分叉 |
+
+- **`inject: "result"`** 把持久化的结果文本前置进提示词，并包在不可信信封中（`<<<UPSTREAM WORKER OUTPUT  trusted=NO … >>>`），明确告诉 worker 这段内容只能当**数据**处理、绝不当作指令。另一个 worker 的输出不是指令通道。
+- **`inject: "diff"`** 不把补丁塞进提示词。它捕获前驱的工作树差异——已跟踪文件的改动*以及*新增的未跟踪文件，遵守 `.gitignore`——用正则脱敏（`AKIA…`、`ghp_…`、`sk-…`、`xox…`、`Bearer …`、PEM 私钥、`password = …` 这类赋值），按上限裁剪，然后写入 `<workdir>/handoffs/<taskId>.diff`。提示词里只给路径，所以几 MB 的补丁也不需要塞进 prompt。脱敏是**兜底**：它降低意外泄漏的概率，但**不构成保证**，产物依然是不可信数据。
+- **`base: "predecessor"`** 把前驱的工作树打成一份 commit 快照（`git write-tree` + `commit-tree`，用临时 index），后继的 worktree 从这份快照分叉——于是后继**真的**从前驱停下的地方开始，连未提交的改动都在。前驱的分支、index 和工作区不会被改动。要求后继在 worktree 里运行（否则 `handoff_base_requires_worktree`）。
+- **设计上即瞬态。** 增强后的提示词在运行时拼好；*存储的* `prompt` 仍是 master 提交时的原文。持久化的只有一份精简的 `metadata.handoff` 摘要（`fromTaskId`、`inject`、`base`、`injectedBytes`、`truncated`、`filesChanged`、`addedLines`、`deletedLines`、`redactions`、`artifact`）和一个 `handoff` 事件。
+- **准入校验。** 源任务未知 → `handoff_unknown_task`；源未达 `succeeded` → `handoff_predecessor_not_ready`；远程后继碰上产物类交接 → `handoff_artifact_unavailable`；`base: "predecessor"` 但前驱工作树已消失或跨仓 → `handoff_base_unavailable`。全部**不启动 worker**。
+- **字节上限。** `handoff.maxBytes`（缺省回落到 `limits.maxHandoffBytes`，默认 256 KiB），在 UTF-8 边界截断并标 `truncated`。
+
+> diff 交接与前驱快照假设后继与 master 在同一台机器上。`driver: remote` 的后继看不到这两类产物，所以 agentmesh 直接拒绝这种组合，而不是给它一个读不到的路径。
 
 ## 接入真实的 master
 
@@ -296,6 +307,9 @@ master (machine A)                              worker daemon (machine B)
 | `delegation_depth_exceeded` | 委派链达到 `maxDelegationDepth` | 通常是 master 在循环委派——先查链路再考虑抬上限 |
 | `handoff_unknown_task` | `handoff.fromTaskId` 找不到对应任务 | 核对 id；另一个 `workdir` 下的任务在这里不可见 |
 | `handoff_predecessor_not_ready` | 前驱任务还没到 `succeeded` | 先 `task_wait` 它；失败/取消的输出永远不会被交接 |
+| `handoff_base_requires_worktree` | 用了 `base: "predecessor"` 但没开 worktree | 提交时传 `worktree: true`，或在 profile 上开启 |
+| `handoff_base_unavailable` | 前驱的工作树已消失，或不在同一个仓库 | 在先继任任务启动前别杀掉前驱 worker |
+| `handoff_artifact_unavailable` | 对远程 worker 用了 `diff`/`predecessor` 交接，或工作树已不存在 | 让后继在本机跑，或改用 `inject: "result"` |
 
 不是错误码的常见症状：
 
@@ -313,6 +327,7 @@ src/
   config.ts            YAML 加载 + zod 校验
   statemachine.ts      8 态转移 + 终态/合法性守卫
   worktree.ts          并行 worker 的 git worktree 隔离
+  handoff.ts           diff 捕获、密钥脱敏、末态快照、旁挂文件
   registry.ts          worker 生命周期 + 有界事件日志
   approvals.ts         ApprovalBroker：把权限/elicitation 桥接给 master
   tasks.ts             TaskManager：异步 8 态生命周期、超时/取消、审批、交接
@@ -351,13 +366,13 @@ docs/
 
 ```bash
 npm run typecheck   # tsc --noEmit，干净
-npm test            # 60 个测试，全离线，无 API 费用，约 8 秒
+npm test            # 72 个测试，全离线，无 API 费用，约 22 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **60/60**，分四个文件——生命周期、持久化与守卫（32），远程 daemon（18），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
+`npm test` 为 **72/72**，分五个文件——生命周期、持久化与守卫（32），交接产物（12），远程 daemon（18），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
 
 最近一次在 Windows + Node v22.22 上运行。真实的 OpenCode 与 Pi worker 也已端到端跑通（`npm run real`：两者都到达 `succeeded`，共持久化 2 个任务 / 27 条事件）。
 
@@ -376,11 +391,10 @@ npm run real        # 本机真实的 opencode + pi（两者都需已安装并�
 - ✅ 有界 FIFO 调度器：并行扇出、单一队列所有者、超限排队，以及 `scheduler_status` 观测。
 - ✅ 队列 TTL + 每任务截止时间（`deadlineMs` / `deadlineAt`，覆盖排队等待 + 执行）与跨 profile 加权公平（用 `weight` 选择性开启）。
 - ✅ 自托管 master 技能：委派手册随仓库发布，并通过 MCP（`master_playbook` 工具 + 资源）提供，master 默认就能委派得体，无需任何复制粘贴。
-- ✅ 跨 Worker 交接（Phase 1）：把一个任务接在已完成前驱的 `result` 上，以不可信数据形式在字节上限内注入，存储的 prompt 保持原样。
+- ✅ 跨 Worker 交接（Phase 1–3）：把任务接在已完成前驱的 `result` 上；把前驱的工作树 `diff` 作为脱敏旁挂文件交接，而不是把补丁塞进 prompt；让后继的 worktree 从前驱末态的快照分叉。注入的产物一律按不可信数据、受字节上限约束，存储的 prompt 保持原样。
 
 接下来：
 
-- 跨 Worker 交接 Phase 2/3（`inject: "diff"` 产物旁挂 + 脱敏，`base: "predecessor"` 从前驱末态分出 worktree）。
 - 结构化结果契约（每任务的 JSON 输出 schema）+ 从 ACP `usage_update` 事件汇总成本/用量。
 
 这些决定背后的设计笔记、被否决的替代方案与分阶段构建过程：[docs/PLAN.md](docs/PLAN.md)（英文）。

@@ -17,13 +17,13 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 60 tests, offline, ~8s
+npm test            # 72 tests, offline, ~22s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run real        # real local opencode + pi workers (needs both installed & authenticated)
 ```
 
-`npm test` runs the four files below with `tsx --test`. Nothing is skipped, nothing
+`npm test` runs the five files below with `tsx --test`. Nothing is skipped, nothing
 is marked `todo`, and no test asserts a mock's internal calls in place of
 observable behaviour — each one drives the public surface (Orchestrator, MCP
 tools, or the daemon's HTTP/WS endpoints) and checks the resulting task record.
@@ -68,6 +68,34 @@ The lifecycle core. Covers, in order:
   while the stored prompt stays original; a non-succeeded or unknown source is
   refused without spawning a worker; the artifact is capped to `maxBytes` and
   flagged `truncated`.
+
+## `test/handoff.test.ts` — 12 cases
+
+Redaction unit tests plus the Phase 2/3 behaviour, run against real temporary git
+repositories (each test gets its own repo with one commit):
+
+- **Redaction.** Known shapes are replaced and counted (`AKIA…`, `ghp_…`,
+  `sk-ant-…`, `xoxb-…`, `Bearer …`, `password = "…"`); a whole PEM key block
+  collapses to one marker; an assignment keeps its key name and separator; and
+  ordinary code (`tokenize`, `token === undefined`, `timeoutMs: 30000`) is left
+  untouched — no false positives on the shapes it claims to catch.
+- **`inject: "diff"`.** A predecessor that edits a file produces a sidecar under
+  `workdir/handoffs/<taskId>.diff`; the patch contains the file and the
+  `[REDACTED:…]` markers but none of the raw secrets; the successor's stored
+  prompt is still the original string; `metadata.handoff` carries the file/line
+  counts and redaction total; a `handoff` event is recorded. A predecessor with a
+  clean tree still succeeds and reports "no working-tree changes" (no sidecar).
+  `maxBytes` truncates the artifact and flags `truncated`.
+- **`base: "predecessor"`.** The successor's own worktree contains the
+  predecessor's *uncommitted* file, while the predecessor's checkout keeps its
+  commit count and its dirty status — the snapshot is built with plumbing against
+  a temporary index, so it cannot disturb the predecessor. A `base: "repo"`
+  control does not inherit the file. Without a worktree the combination is refused
+  at admission (`handoff_base_requires_worktree`) and no worker is spawned; if the
+  predecessor's worktree was killed, it fails with `handoff_base_unavailable`.
+- **Remote successors.** Both artifact handoffs are refused with
+  `handoff_artifact_unavailable`, because the sidecar and the snapshot live on the
+  master's filesystem.
 
 ## `test/remote.test.ts` — 18 cases
 
@@ -135,3 +163,11 @@ Honest limits of the evidence above — these are not covered by the suite yet:
 - **Cost and usage.** ACP `usage_update` events are not yet rolled up or asserted.
 - **Long-running soak.** Queueing and fairness are tested as unit scenarios, not
   as a multi-hour soak.
+- **Diff handoffs are single-host.** A remote successor is refused rather than
+  shipped a sidecar it cannot read; there is no artifact transfer over the daemon
+  protocol yet.
+- **Redaction is a safety net, not a scanner.** It catches well-known key shapes
+  and `key = value` assignments; a secret with no recognisable shape passes
+  through, so the artifact is still untrusted data.
+- **Handoff sidecars are not garbage-collected.** They accumulate under
+  `<workdir>/handoffs/` (one per diff handoff); pruning is left to the operator.
