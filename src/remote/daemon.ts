@@ -94,6 +94,8 @@ export class WorkerDaemon {
   private heartbeatMs: number;
   private exposedProfiles: string[];
   private orphanGraceMs: number;
+  /** true when a CA was configured, i.e. client certificates are mandatory */
+  private mtls: boolean;
   /** current socket receiving live events for a task (re-routed on attach) */
   private taskOwner = new Map<string, SocketState>();
   /** pending orphan-cancel timers, cleared if a client re-attaches in time */
@@ -114,9 +116,14 @@ export class WorkerDaemon {
         this.daemonId,
         opts.config.daemon?.auditPath,
         path.join(opts.orchestrator.workdir, "daemon-audit.ndjson"),
+        {
+          maxBytes: opts.config.daemon?.auditMaxBytes,
+          keep: opts.config.daemon?.auditKeep,
+        },
       );
 
     const tls = loadTls(opts.tls ?? opts.config.daemon?.tls);
+    this.mtls = Boolean(tls?.ca);
     // Fail-safe: never bind a reachable interface in cleartext without opt-in.
     assertSafeBind(this.host, Boolean(tls), Boolean(opts.allowInsecure));
     if (this.tokens.length === 0) {
@@ -127,8 +134,30 @@ export class WorkerDaemon {
     }
 
     this.server = tls
-      ? https.createServer({ cert: tls.cert, key: tls.key, ca: tls.ca }, this.onHttp)
+      ? https.createServer(
+          {
+            cert: tls.cert,
+            key: tls.key,
+            // A configured CA turns the deployment into mutual TLS: the daemon
+            // then demands a client certificate signed by that CA and refuses
+            // the handshake otherwise. That is what makes a cross-host bind
+            // defensible — a stolen bearer token alone is not enough to reach
+            // an agent that can run tools on this machine.
+            ...(tls.ca ? { ca: tls.ca, requestCert: true, rejectUnauthorized: true } : {}),
+          },
+          this.onHttp,
+        )
       : http.createServer(this.onHttp);
+
+    // A rejected client certificate fails inside TLS, before any HTTP handler
+    // runs, so it would otherwise leave no trace in the audit trail. Record it
+    // (message only — no peer payloads, no cert contents).
+    this.server.on("tlsClientError", (err: Error, socket) => {
+      this.audit.record("tls_reject", {
+        peer: (socket as import("node:net").Socket).remoteAddress,
+        reason: err.message,
+      });
+    });
 
     this.wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES });
     this.server.on("upgrade", this.onUpgrade);
@@ -610,6 +639,7 @@ export class WorkerDaemon {
       host: this.host,
       port: this.port,
       tls: scheme === "https",
+      mtls: this.mtls,
       profiles: this.exposedProfiles,
       acceptedTokens: this.tokens.length,
     });

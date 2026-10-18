@@ -55,7 +55,7 @@
 
 ## 当前状态
 
-已实现并做过端到端验证：**8 态持久化任务机**（SQLite）、**异步任务生命周期**（`task_submit` / `task_wait` / `task_result`……）、面向 worker 权限/交互请求的**人在环路审批流**、用于并行扇出的**有界、加权公平调度器**（队列 TTL、每任务截止时间、可选 profile 权重、`dependsOn` DAG 门控、可选退避重试）、**跨 Worker 交接**（结果注入、脱敏 diff 旁挂、前驱末态 worktree）、**强制的 JSON 结果契约**与 **token/成本汇总**、自托管的 **master 委派技能**，以及让 worker 跨机器运行的**远程 Worker Daemon**（带认证、可走 TLS）——驱动对象既有**本机真实的 OpenCode 和 Pi**，也有确定性的 mock。详见[验证](#验证)。
+已实现并做过端到端验证：**8 态持久化任务机**（SQLite）、**异步任务生命周期**（`task_submit` / `task_wait` / `task_result`……）、面向 worker 权限/交互请求的**人在环路审批流**、用于并行扇出的**有界、加权公平调度器**（队列 TTL、每任务截止时间、可选 profile 权重、`dependsOn` DAG 门控、可选退避重试）、**跨 Worker 交接**（结果注入、脱敏 diff 旁挂、前驱末态 worktree）、**强制的 JSON 结果契约**与 **token/成本汇总**、自托管的 **master 委派技能**，以及让 worker 跨机器运行的**远程 Worker Daemon**（认证 + TLS/双向 TLS、按大小轮转的审计日志、双机部署手册）——驱动对象既有**本机真实的 OpenCode 和 Pi**，也有确定性的 mock。详见[验证](#验证)。
 
 ## 安装
 
@@ -327,9 +327,9 @@ master (machine A)                              worker daemon (machine B)
                                                  local Orchestrator + acpx ──▶ ACP stdio (LOCAL ONLY)
 ```
 
-在 B 机上启动（`agentmesh daemon --token-env … --tls-cert … --tls-key …`），在 A 机上用一个 `driver: remote` profile 指向它。保证的简版：token 只从环境变量来（绝不进配置或版本库）、非 loopback 绑定强制 TLS、`daemon.allowCwd` 白名单限定远程任务可运行的目录、连接断开一律清算为 `cancelled`（绝不假报 `succeeded`）、仍在运行的任务可以恢复而不是重跑，并且控制面的每个决定都写入 NDJSON 审计日志、密钥只留不可逆指纹。
+在 B 机上启动（`agentmesh daemon --token-env … --tls-cert … --tls-key …`），在 A 机上用一个 `driver: remote` profile 指向它。保证的简版：token 只从环境变量来（绝不进配置或版本库）、非 loopback 绑定强制 TLS、配置 `daemon.tls.ca` 会开启**双向 TLS**（单靠偷到的 token 到不了 agent）、`daemon.allowCwd` 白名单限定远程任务可运行的目录、连接断开一律清算为 `cancelled`（绝不假报 `succeeded`）、仍在运行的任务可以恢复而不是重跑，并且控制面的每个决定（包括被拒绝的 TLS 握手）都写入按大小轮转的 NDJSON 审计日志、密钥只留不可逆指纹。
 
-**完整指南**——daemon 参数、`driver: remote` profile、重连与对账（`queryRemoteTask`、`attachRemoteTask`、透明 `resume`）、完整的远程安全模型、密钥轮换，以及远程测试覆盖：**[docs/remote.md](docs/remote.md)**（英文）。
+**完整指南**——daemon 参数、`driver: remote` profile、重连与对账（`queryRemoteTask`、`attachRemoteTask`、透明 `resume`）、完整的远程安全模型、密钥轮换，以及远程测试覆盖：**[docs/remote.md](docs/remote.md)**（英文）。真正的双机部署——私有 CA、mTLS、防火墙、开机启动、证书与 token 轮换——照 **[docs/deploy.md](docs/deploy.md)** 走，软件侧用 `npm run deploy:tls` 验证（在本机真实网卡上跑，不走 loopback）。
 
 ## 安全与限制
 
@@ -385,6 +385,7 @@ task_submit({ "prompt": "…", "profile": "pi",
 - **`dispatch_task` 看起来卡死。** 它会一直等到终态，所以需要审批的任务在里面永远推不动。可能有人工介入时，改用 `task_submit` + `task_wait`。
 - **`cli submit` 退出了但任务没继续。** 符合预期：一次性 CLI 的实时运行随进程结束。要做真正的异步，用长期驻留的 `mcp` server（[命令行](#命令行)里也提到了）。
 - **daemon 拒绝连接或返回 401。** 绑定/TLS/token 规则见 [docs/remote.md](docs/remote.md#security-model)；token 必须来自 `--token-env` 指定的环境变量。
+- **远程任务报 TLS 错误**（`UNABLE_TO_VERIFY_LEAF_SIGNATURE`、`CERT_HAS_EXPIRED`、`altname`、`alert certificate required`、连上即 `ECONNRESET`）。这些是证书问题，不是 agent 问题——[docs/deploy.md](docs/deploy.md#7-troubleshooting) 的表里逐条对应原因与修法。
 
 ## 架构
 
@@ -423,8 +424,14 @@ skills/
 scripts/
   mcp-smoke.mjs        通过 stdio 驱动真实 MCP server（`npm run smoke`）
   real-smoke.ts        驱动真实的 opencode + pi worker（`npm run real`）
+  remote-tls-deploy.ts 在真实网卡上跑 TLS/mTLS（`npm run deploy:tls`）
+deploy/
+  certs/make-certs.sh  为单台主机生成 CA + 服务端/客户端证书
+  systemd/             开机启动单元（systemd）
+  windows/             开机启动入口（计划任务）
 docs/
   remote.md            远程 Worker Daemon 完整指南
+  deploy.md            双机部署手册：CA、mTLS、防火墙、开机启动、轮换
   verification.md      逐项测试的完整验证记录
   PLAN.md              设计笔记 + 路线图
 ```
@@ -435,13 +442,14 @@ docs/
 
 ```bash
 npm run typecheck   # tsc --noEmit，干净
-npm test            # 100 个测试，全离线，无 API 费用，约 24 秒
+npm test            # 108 个测试，全离线，无 API 费用，约 25 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
+npm run deploy:tls  # 在本机真实网卡上跑 TLS/mTLS（不走 loopback）
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **100/100**，分七个文件——生命周期、持久化与守卫（32），交接产物（12），结果契约与用量（10），依赖与重试（18），远程 daemon（18），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
+`npm test` 为 **108/108**，分八个文件——生命周期、持久化与守卫（32），交接产物（12），结果契约与用量（10），依赖与重试（18），远程 daemon（18），部署 TLS 与审计轮转（8），orchestrator（6），master 技能（4）。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。
 
 最近一次在 Windows + Node v22.22 上运行。真实的 OpenCode 与 Pi worker 也已端到端跑通（`npm run real`：两者都到达 `succeeded`，共持久化 2 个任务 / 27 条事件）。
 
@@ -463,11 +471,12 @@ npm run real        # 本机真实的 opencode + pi（两者都需已安装并�
 - ✅ 跨 Worker 交接（Phase 1–3）：把任务接在已完成前驱的 `result` 上；把前驱的工作树 `diff` 作为脱敏旁挂文件交接，而不是把补丁塞进 prompt；让后继的 worktree 从前驱末态的快照分叉。注入的产物一律按不可信数据、受字节上限约束，存储的 prompt 保持原样。
 - ✅ 结构化结果契约（`outputSchema`，强制生效——违约即失败）与从 ACP `usage_update` 事件汇总的 token/成本，按任务记录并经 `usage_summary` 聚合。
 - ✅ DAG 依赖（`dependsOn`：就绪才入队、失败/取消级联、计入队列容量）与可选重试（固定/指数退避、尝试归档、花费跨尝试累加）。
+- ✅ 部署补强：可选双向 TLS；证书/密钥/CA 支持路径与内联 PEM 并在启动时报 `tls_invalid`（而不是让对方看到一句莫名的握手失败）；按大小轮转的审计日志；systemd 单元 / Windows 计划任务；防火墙规则；以及在本机真实网卡上验证过的双机部署手册（`npm run deploy:tls`）。
 
 接下来：
 
-- **远程生产化补强**：开机启动、日志轮转、防火墙，以及真实的双机 TLS 部署样例（loopback 路径已验证，双机还没有）。
 - **审批与成本预算**——限制一次扇出最多能挂起多少个 `waiting` 任务，超了就必须停下来问人；并让任务带上一个由 `usage_summary` 结算的成本上限。
+- **可选 Web 控制台**——审计日志与 `scheduler_status` 已经提供了只读视图所需的数据。
 
 这些决定背后的设计笔记、被否决的替代方案与分阶段构建过程：[docs/PLAN.md](docs/PLAN.md)（英文）。
 

@@ -35,9 +35,27 @@ import {
   type ClientMsg,
   type ServerMsg,
 } from "./protocol.js";
-import { resolveToken } from "./security.js";
+import { readPem, resolveToken } from "./security.js";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 15000;
+
+/**
+ * Build the `ws` TLS options from a profile's remote settings. Certificates may
+ * be inline PEM or paths on disk; paths are re-read on every connection so a
+ * rotated certificate takes effect on the next reconnect without a restart.
+ * Throws a clear `tls_invalid` error when a configured path cannot be read,
+ * instead of letting the TLS stack fail the handshake with a misleading code.
+ */
+function tlsOptions(remote: RemoteSettings): { ca?: string; cert?: string; key?: string } {
+  const ca = readPem(remote.ca, "remote.ca");
+  const cert = readPem(remote.cert, "remote.cert");
+  const key = readPem(remote.key, "remote.key");
+  return {
+    ...(ca ? { ca } : {}),
+    ...(cert ? { cert } : {}),
+    ...(key ? { key } : {}),
+  };
+}
 
 /** http(s)://host:port → ws(s)://host:port/ws */
 function toWsUrl(endpoint: string): string {
@@ -188,9 +206,7 @@ class RemoteWorkerHandle implements WorkerHandle {
           headers: { authorization: `Bearer ${token}` },
           maxPayload: MAX_PAYLOAD_BYTES,
           handshakeTimeout: remote.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
-          ...(remote.ca ? { ca: remote.ca } : {}),
-          ...(remote.cert ? { cert: remote.cert } : {}),
-          ...(remote.key ? { key: remote.key } : {}),
+          ...tlsOptions(remote),
         });
         ws = sock;
         this.activeWs = sock;
@@ -417,9 +433,7 @@ export function queryRemoteTask(
       headers: { authorization: `Bearer ${token}` },
       maxPayload: MAX_PAYLOAD_BYTES,
       handshakeTimeout: remote.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
-      ...(remote.ca ? { ca: remote.ca } : {}),
-      ...(remote.cert ? { cert: remote.cert } : {}),
-      ...(remote.key ? { key: remote.key } : {}),
+      ...tlsOptions(remote),
     });
 
     const done = (fn: () => void) => {
@@ -512,9 +526,7 @@ export function attachRemoteTask(
       headers: { authorization: `Bearer ${token}` },
       maxPayload: MAX_PAYLOAD_BYTES,
       handshakeTimeout: remote.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
-      ...(remote.ca ? { ca: remote.ca } : {}),
-      ...(remote.cert ? { cert: remote.cert } : {}),
-      ...(remote.key ? { key: remote.key } : {}),
+      ...tlsOptions(remote),
     });
 
     const done = (fn: () => void) => {

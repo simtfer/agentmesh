@@ -463,16 +463,22 @@ master (machine A)                              worker daemon (machine B)
 Start it on machine B (`agentmesh daemon --token-env … --tls-cert … --tls-key …`)
 and point a `driver: remote` profile at it on machine A. The short version of the
 guarantees: tokens come from the environment (never config or version control),
-non-loopback binds require TLS, `daemon.allowCwd` whitelists where remote tasks
-may run, a dropped connection reconciles to `cancelled` (never a false
-`succeeded`), still-running tasks can be resumed instead of re-run, and every
-control-plane decision is written to an NDJSON audit log with secrets reduced to
-a non-reversible fingerprint.
+non-loopback binds require TLS, setting `daemon.tls.ca` turns on **mutual TLS**
+so a stolen token alone cannot reach an agent, `daemon.allowCwd` whitelists where
+remote tasks may run, a dropped connection reconciles to `cancelled` (never a
+false `succeeded`), still-running tasks can be resumed instead of re-run, and
+every control-plane decision — including refused TLS handshakes — is written to a
+size-rotated NDJSON audit log with secrets reduced to a non-reversible
+fingerprint.
 
 **Full guide** — daemon flags, the `driver: remote` profile, reconnect &
 reconciliation (`queryRemoteTask`, `attachRemoteTask`, transparent `resume`), the
 complete remote security model, key rotation, and the remote test coverage:
-**[docs/remote.md](docs/remote.md)**.
+**[docs/remote.md](docs/remote.md)**. For two real hosts — private CA, mTLS,
+firewall, boot-time start and certificate/token rotation — follow
+**[docs/deploy.md](docs/deploy.md)** and verify the software side with
+`npm run deploy:tls` (a real TLS run over this machine's LAN interface, not
+loopback).
 
 ## Safety and limits
 
@@ -609,6 +615,11 @@ Symptoms that aren't error codes:
 - **Daemon refuses the connection or returns 401.** Bind/TLS/token rules are in
   [docs/remote.md](docs/remote.md#security-model); the token must come from the
   environment named by `--token-env`.
+- **A remote task fails with a TLS error** (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
+  `CERT_HAS_EXPIRED`, `altname`, `alert certificate required`, `ECONNRESET`
+  immediately after connecting). These are certificate problems, not agent
+  problems — the table in [docs/deploy.md](docs/deploy.md#7-troubleshooting) maps
+  each one to its cause and fix.
 
 ## Architecture
 
@@ -647,8 +658,14 @@ skills/
 scripts/
   mcp-smoke.mjs        drives the real MCP server over stdio (`npm run smoke`)
   real-smoke.ts        drives real opencode + pi workers (`npm run real`)
+  remote-tls-deploy.ts real TLS/mTLS run over a LAN interface (`npm run deploy:tls`)
+deploy/
+  certs/make-certs.sh  generates a CA + server/client certificates for one host
+  systemd/             boot-time unit (systemd)
+  windows/             boot-time launcher (Task Scheduler)
 docs/
   remote.md            the full Remote Worker Daemon guide
+  deploy.md            two-host runbook: CA, mTLS, firewall, boot, rotation
   verification.md      the full test-by-test verification log
   PLAN.md              design notes + roadmap
 ```
@@ -661,15 +678,17 @@ Swap the two and it still works.
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 100 tests, offline, no API cost, ~24s
+npm test            # 108 tests, offline, no API cost, ~25s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
+npm run deploy:tls  # real TLS/mTLS run over this host's LAN interface (not loopback)
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **100/100** across seven files — lifecycle, persistence and guards (32),
+`npm test` is **108/108** across eight files — lifecycle, persistence and guards (32),
 handoff artifacts (12), result contracts and usage (10), dependencies and retries
-(18), remote daemon (18), orchestrator (6), master skill (4).
+(18), remote daemon (18), deployment TLS and audit rotation (8), orchestrator (6),
+master skill (4).
 Every case drives a public surface (Orchestrator, MCP tools, or the daemon's
 HTTP/WS endpoints) and asserts the resulting task record, not a mock's internal
 calls.
@@ -709,15 +728,18 @@ Done:
 - ✅ DAG dependencies (`dependsOn`: ready-queue admission, failure/cancel cascade,
   queue-capacity accounting) and opt-in retries with fixed/exponential backoff,
   attempt archiving, and spend summed across attempts.
+- ✅ Deployment hardening: optional mutual TLS, certificate/key/CA paths resolved
+  and validated (`tls_invalid` instead of an opaque handshake failure),
+  size-rotated audit log, boot-time unit/task, firewall recipes, and a
+  two-host runbook verified over a real interface (`npm run deploy:tls`).
 
 Next:
 
-- **Remote production hardening:** boot-time start, log rotation, firewall rules,
-  and a real two-host TLS deployment recipe (the loopback path is verified; two
-  machines are not).
 - **Approval budgets** — cap how many `waiting` tasks a fan-out may open before it
   must stop and ask, and let a task carry a cost ceiling that `usage_summary`
   enforces.
+- **Optional web console** — the audit trail and scheduler status already expose
+  the data a read-only view would render.
 
 Design notes, rejected alternatives and the staged build-up behind these
 decisions: [docs/PLAN.md](docs/PLAN.md).

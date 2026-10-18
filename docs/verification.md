@@ -17,13 +17,14 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 100 tests, offline, ~24s
+npm test            # 108 tests, offline, ~25s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
+npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
 npm run real        # real local opencode + pi workers (needs both installed & authenticated)
 ```
 
-`npm test` runs the seven files below with `tsx --test`. Nothing is skipped, nothing
+`npm test` runs the eight files below with `tsx --test`. Nothing is skipped, nothing
 is marked `todo`, and no test asserts a mock's internal calls in place of
 observable behaviour — each one drives the public surface (Orchestrator, MCP
 tools, or the daemon's HTTP/WS endpoints) and checks the resulting task record.
@@ -202,6 +203,35 @@ The remote *security* model (flags, deployment shape, rotation drill) is documen
 in [remote.md](remote.md#security-model); the coverage list above mirrors
 [remote.md#remote-tests](remote.md#remote-tests).
 
+## `test/deploy.test.ts` — 8 cases
+
+The deployment path: what only breaks once the daemon leaves loopback. Uses the
+committed throwaway certificates in `test/fixtures/tls/` (a trusted CA and an
+unrelated one), so it needs no `openssl` and no network.
+
+- **TLS material resolution.** Inline PEM passes through; a path is read from
+  disk; a missing path or a non-PEM file raises `tls_invalid` at the point of
+  configuration instead of as an opaque handshake failure on the peer.
+- **mTLS required.** With `daemon.tls.ca` set, a master that presents no client
+  certificate fails before the submit handler runs — asserted both by the failed
+  turn and by the daemon having admitted **zero** tasks — and the refusal appears
+  in the audit trail as `tls_reject`.
+- **mTLS accepted / foreign CA rejected.** A client certificate signed by the
+  daemon's CA completes the task; one signed by the other CA is refused.
+- **Untrusted server certificate.** A master trusting CA A refuses a daemon
+  serving a certificate from CA B (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`).
+- **Plaintext guard.** Constructing a daemon on `0.0.0.0` without TLS throws
+  `insecure_bind` even when a token is configured.
+- **Audit rotation.** With `maxBytes`/`keep`, the log rotates, keeps exactly the
+  configured number of archives, and the retained records tile a *contiguous*
+  sequence — rotation drops the oldest data, never a record in the middle.
+  `maxBytes: 0` never rotates; `auditPath: ""` yields a no-op sink.
+- **Config surface.** `daemon.auditMaxBytes` / `auditKeep` parse.
+
+The same path driven over a *real interface* (not loopback) is `npm run
+deploy:tls`; it is a script rather than a test because it needs `openssl` and a
+non-internal IPv4 address, which a hermetic suite cannot assume.
+
 ## `test/orchestrator.test.ts` — 6 cases
 
 The synchronous façade: dispatch spawns a worker and completes the loop; a spawned
@@ -227,13 +257,21 @@ as browsable resources.
 - `npm run real` — **real local OpenCode and Pi** driven through
   `task_submit → task_wait → task_result`; both return `OK`, reach `succeeded`, and
   persist their tasks + events to SQLite (2 tasks / 27 events observed).
+- `npm run deploy:tls` — the daemon bound to `0.0.0.0` on this host's **LAN
+  address** with a freshly generated CA, driven by a real `RemoteWorkerDriver`
+  over `https://<lan-ip>:<port>`: 9/9 checks — plaintext bind refused, task
+  completes over TLS, the daemon observes the peer on that address, wrong CA
+  refused, mTLS without a certificate refused, mTLS with one completes. Run on
+  Windows with address `192.168.110.27`.
 
 ## Known gaps
 
 Honest limits of the evidence above — these are not covered by the suite yet:
 
-- **Real two-machine deployment.** The daemon is verified over loopback only;
-  a genuine cross-host run with a real certificate chain is not part of the suite.
+- **Two physical machines.** The TLS path is verified on one host over its real
+  interface, with a real certificate chain and mTLS; what remains unexercised is
+  distance — DNS, routing, and the worker's firewall (`docs/deploy.md` covers the
+  checklist, but no run has crossed a physical link).
 - **Concurrent processes sharing one SQLite file.** Two processes *can* open the
   same DB safely (`busy_timeout` + WAL), but the suite tests this incidentally
   rather than as a documented multi-writer contract.

@@ -25,8 +25,8 @@
    **Stage 5 并行调度**已落地核心：有界队列 + 单一 queue owner（`limits.maxQueuedTasks` 开启排队，
    `scheduler_status` 可观测），队列 TTL 与截止时间（`limits.queueTtlMs`、`task_submit{deadlineMs|deadlineAt}`）、
    跨 profile 加权公平（profile `weight`，WFQ finish tag）亦已实现并测试；叠加此前的并发/输出/递归上限。
-   余下重点是 **远程生产化补强**（开机启动、日志轮转、防火墙、真实双机 TLS 部署样例）与
-   **Stage 5 的进阶调度**（DAG 依赖 ✅、重试 ✅、审批/成本预算 ⏳）。
+   余下重点是 **Stage 5 的进阶调度**（DAG 依赖 ✅、重试 ✅、审批/成本预算 ⏳）与
+   **可选 Web 控制台**；**远程生产化补强**（开机启动、日志轮转、防火墙、双机 TLS 手册）已落地。
 
 ---
 
@@ -46,16 +46,18 @@
 | Worker 注册表 + 事件环形缓冲 | ✅ 完成 | `src/registry.ts` |
 | git worktree 并行隔离 | ✅ 完成 | `src/worktree.ts` |
 | MCP Server（18 工具，stdio） | ✅ 完成 | `src/mcp/server.ts` |
-| **远程 Worker Daemon（HTTP+WS）** | ✅ 完成，loopback 端到端验证 | `src/remote/*`、`test/remote.test.ts` |
+| **远程 Worker Daemon（HTTP+WS）** | ✅ 完成，loopback 端到端 + 真实网卡 TLS/mTLS 验证 | `src/remote/*`、`test/remote.test.ts`、`test/deploy.test.ts` |
 | CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 干净通过；`npm test` **100/100**（tasks(32) + handoff(12) + contract(10) +
-dag(18) + remote(18) + orchestrator(6) + skill(4)）；
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **108/108**（tasks(32) + handoff(12) + contract(10) +
+dag(18) + remote(18) + deploy(8) + orchestrator(6) + skill(4)）；
 `npm run demo` 双场景闭环 `CLOSED ✅`；`npm run smoke` 真实 MCP stdio 全生命周期
 （`accepted, started, output…, waiting, resumed, output…, completed`）；`npm run real`
 对**真实 opencode + pi** 走 `submit → wait → result`，均 `succeeded`（2 任务 / 27 事件入库）。
-远程侧：daemon CLI 启动自检 `/healthz` 开放、`/profiles` 无 token 401 / 带 token 200、干净退出。
+远程侧：daemon CLI 启动自检 `/healthz` 开放、`/profiles` 无 token 401 / 带 token 200、干净退出；
+`npm run deploy:tls` 在本机 LAN 地址（非 loopback）上跑通 9/9 检查——明文绑定被拒、
+真实证书链上任务完成、daemon 观测到对端来自该地址、错误 CA 被拒、mTLS 缺证书被拒 / 带证书完成。
 
 ---
 
@@ -363,7 +365,13 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    ⏳ 进阶：审批/成本预算、可选 Web 控制台。（DAG 依赖与可配置重试已完成，见下。）
 2. **远程生产化补强**：状态对账（`query`）、推送式续订（`attach` + orphan 宽限）、透明自动重连（`resume`）、
    **零停机密钥轮换**（多 token + `SIGHUP`/`reloadTokens()`）、**结构化审计日志**（NDJSON，密钥仅记指纹）均已落地。
-   ⏳ 余下：开机启动/日志轮转、防火墙与部署样例；把 loopback 验证形态推向真实双机 TLS 部署。
+   ✅ 后续补强已完成：**可选双向 TLS**（配置 `daemon.tls.ca` 即强制客户端证书，握手拒绝记 `tls_reject`）、
+   证书/密钥/CA 支持「路径或内联 PEM」并在启动时报 `tls_invalid`（此前文档写了路径、客户端却把路径当 PEM 传给 `ws`，
+   照文档双机部署必然握手失败）、**按大小轮转的审计日志**（`auditMaxBytes`/`auditKeep`，轮转期间记录缓冲不丢）、
+   **开机启动**（systemd 单元 + Windows 计划任务入口）、**防火墙规则**，以及 `docs/deploy.md` 的双机手册。
+   验证形态从 loopback 推进到**本机真实网卡**：`npm run deploy:tls` 用现生成的 CA 在 `0.0.0.0` 上起 TLS daemon，
+   master 走 `https://<LAN IP>:<port>`，9/9 检查通过（含错误 CA、mTLS 缺证书/带证书、明文绑定被拒），
+   并断言 daemon 审计里对端地址就是该网卡地址。⚠️ 仍未有跨物理链路的实跑（DNS/路由/防火墙尚未真实穿越）。
 3. ~~**Master 侧提示词/技能包**~~ ✅ 已落地：委派手册随仓库分发（`skills/agentmesh-master/SKILL.md` + `SKILL.zh.md`），
    由 MCP server 自托管——`master_playbook` 工具（通用可调，`lang` 选 en/zh）+ 两个可浏览 resource
    （`agentmesh://skills/master/en|zh`）；运行时从包根解析，源码与 dist 构建皆可用。内容涵盖五条铁律、委派闭环、
@@ -406,6 +414,9 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    `maxDelayMs`/`onlyRetryable`，在终态写入前拦截、尝试归档于 `metadata.attempts`、token/成本跨尝试累加）。
    18 项新用例见 `test/dag.test.ts`（测试总数 82 → 100）。
 8. **可选 Web 控制台**：可视化任务与远程 Worker 状态（结构化审计日志已提供数据源）。
+9. ~~**Stage 6 · 远程部署补强**~~ ✅ 已落地：可选 mTLS、TLS 材料路径解析（`tls_invalid` 前置报错）、审计日志按大小轮转、
+   systemd / Windows 计划任务开机启动、防火墙规则与 `docs/deploy.md` 双机手册；`npm run deploy:tls` 在本机真实网卡上
+   跑通 9/9 检查。8 项新用例见 `test/deploy.test.ts`（测试总数 100 → 108）。
 
-> Stage 0–3 已完成并通过 100 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree，以及结构化结果契约 + token/成本汇总）。
-> 下一步优先远程真实双机 TLS 部署、Stage 5 余项（审批/成本预算）与可选 Web 控制台。
+> Stage 0–3 已完成并通过 108 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总，以及远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证）。
+> 下一步：跨物理链路实跑（DNS/路由/防火墙）、Stage 5 余项（审批/成本预算）与可选 Web 控制台。

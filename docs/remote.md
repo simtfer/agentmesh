@@ -25,6 +25,9 @@ master (machine A)                                  worker daemon (machine B)
 - [Security model](#security-model)
 - [Remote tests](#remote-tests)
 
+> Two real hosts, a private CA, mutual TLS, firewall and boot-time start are a
+> separate runbook: [`deploy.md`](./deploy.md). What follows is the mechanism.
+
 ## Start the daemon (machine B)
 
 ```bash
@@ -37,9 +40,12 @@ npx tsx src/cli.ts daemon \
 ```
 
 Flags: `--host` `--port` `--token-env` `--tls-cert` `--tls-key` `--tls-ca`
-(enables mTLS) `--allow-insecure` (explicit opt-out of the TLS requirement for
-non-loopback binds). The same keys can live under a `daemon:` block in
-`agentmesh.yaml`. Two probes are available:
+(enables mTLS: the daemon then *requires* a client certificate signed by that CA)
+`--allow-insecure` (explicit opt-out of the TLS requirement for non-loopback
+binds). The same keys can live under a `daemon:` block in `agentmesh.yaml`.
+Certificate, key and CA values may be paths or inline PEM; a path that cannot be
+read fails startup with `tls_invalid` rather than an opaque handshake error on
+the other side. Two probes are available:
 
 - `GET /healthz` — **unauthenticated** `{ ok, daemonId, protocol }` liveness.
 - `GET /profiles` — **authenticated**; lists the profiles the daemon exposes.
@@ -142,6 +148,16 @@ profiles:
 - **TLS for anything non-loopback.** `assertSafeBind` refuses to bind a
   non-loopback host without TLS unless you pass `--allow-insecure`. Loopback
   `http://` is allowed for local dev/tests.
+- **Optional mutual TLS.** Setting `daemon.tls.ca` makes the daemon demand a
+  client certificate signed by that CA (`requestCert` + `rejectUnauthorized`);
+  the handshake fails before any request is parsed, and the refusal is audited as
+  `tls_reject` with the peer address. On the master side, `remote.cert` /
+  `remote.key` supply the client certificate. This is what makes a stolen bearer
+  token insufficient on its own.
+- **Rotating audit log.** Size-based rotation (`daemon.auditMaxBytes` /
+  `auditKeep`, default 10 MiB × 5) keeps a probing attacker from filling the
+  disk; rotated files are closed archives, and records arriving mid-rotation are
+  buffered rather than dropped.
 - **ACP stdio stays local.** The daemon runs ACP in-process on machine B; only
   typed task events cross the wire. There is no raw stdio passthrough.
 - **No orphans.** If the WebSocket drops, the daemon cancels any non-terminal
@@ -177,3 +193,11 @@ rotating live while refusing an empty set), a structured audit trail (records
 auth/submit/refusal decisions and asserts no token ever appears in cleartext),
 and unit coverage of `assertSafeBind` / `assertCwdAllowed`. 18 remote tests, no
 network, no API cost.
+
+`test/deploy.test.ts` covers the deployment path with committed throwaway
+certificates (see `test/fixtures/tls/README.md`): a client without a certificate
+is refused before a task exists, a certificate from a foreign CA is refused
+while the right one is accepted, an untrusted *server* certificate is rejected by
+the client, and the audit log rotates by size without losing a retained record.
+For a run against a real network interface, use `npm run deploy:tls`
+([`deploy.md`](./deploy.md)).

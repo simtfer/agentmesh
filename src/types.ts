@@ -216,6 +216,13 @@ export interface DaemonSettings {
    * `<workdir>/daemon-audit.ndjson`; set empty string to disable.
    */
   auditPath?: string;
+  /**
+   * Rotate the audit log once it reaches this many bytes (default 10 MiB).
+   * Set `0` to disable rotation and let the operator handle it externally.
+   */
+  auditMaxBytes?: number;
+  /** How many rotated archives to keep (default 5). `0` disables rotation. */
+  auditKeep?: number;
 }
 
 export interface MeshConfig {

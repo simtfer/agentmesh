@@ -1,5 +1,9 @@
 node_modules/
 dist/
 .agentmesh/
+.agentmesh-*/
 *.log
 .DS_Store
+# generated certificate material (deploy/certs/make-certs.sh) — never commit
+/certs/
+

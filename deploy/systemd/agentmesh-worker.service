@@ -1,0 +1,41 @@
+[Unit]
+Description=agentmesh Worker Daemon
+Documentation=https://github.com/simtfer/agentmesh/blob/main/docs/deploy.md
+# Only start once the network is actually up: the daemon binds a real interface
+# and refuses to start without TLS, so an early start just fails and retries.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentmesh
+Group=agentmesh
+WorkingDirectory=/srv/agentmesh
+# The bearer token lives here, mode 0600, owned by the service account:
+#   AGENTMESH_DAEMON_TOKEN=<openssl rand -hex 32>
+# Never in agentmesh.yaml — the config only names the variable.
+EnvironmentFile=/etc/agentmesh/worker.env
+ExecStart=/usr/bin/node /srv/agentmesh/dist/cli.js daemon --config /etc/agentmesh/agentmesh.yaml
+# Token rotation without downtime: add the new secret to worker.env, then reload.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+# SIGTERM ends the daemon cleanly (it cancels nothing, flushes the audit stream).
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Hardening. The daemon runs coding agents, which need to write inside the
+# whitelisted workdirs — so those stay writable while the rest of the system is
+# read-only. Adjust ReadWritePaths to your daemon.allowCwd roots.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/agentmesh /srv/repos
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -150,6 +150,30 @@ export interface TlsMaterial {
 }
 
 /**
+ * Resolve a TLS value that may be either an inline PEM block or a path to a
+ * file holding one.
+ *
+ * Both forms are supported because operators keep certificates on disk while
+ * tests (and secret managers injecting env vars) pass the PEM directly. A path
+ * that cannot be read is a hard error rather than being handed to the TLS stack
+ * as if it were PEM — otherwise a typo surfaces as an opaque handshake failure
+ * on the other machine, which is exactly the wrong place to debug it.
+ */
+export function readPem(value: string | undefined, what: string): string | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  if (value.includes("-----BEGIN")) return value;
+  const file = path.resolve(value);
+  if (!existsSync(file)) {
+    throw new SecurityError(`${what}: TLS file not found: ${file}`, "tls_invalid");
+  }
+  const text = readFileSync(file, "utf8");
+  if (!text.includes("-----BEGIN")) {
+    throw new SecurityError(`${what}: ${file} does not contain a PEM block`, "tls_invalid");
+  }
+  return text;
+}
+
+/**
  * Load TLS cert/key (and optional CA) from file paths or inline PEM strings.
  * Returns undefined when no cert+key are configured (plain HTTP).
  */
@@ -159,14 +183,13 @@ export function loadTls(tls?: {
   ca?: string;
 }): TlsMaterial | undefined {
   if (!tls?.cert || !tls?.key) return undefined;
-  const read = (v: string): string =>
-    v.includes("-----BEGIN") ? v : existsSync(v) ? readFileSync(v, "utf8") : v;
-  const cert = read(tls.cert);
-  const key = read(tls.key);
-  if (!cert.includes("-----BEGIN") || !key.includes("-----BEGIN")) {
+  const cert = readPem(tls.cert, "daemon.tls.cert");
+  const key = readPem(tls.key, "daemon.tls.key");
+  if (!cert || !key) {
     throw new SecurityError("TLS cert/key could not be read (missing file or PEM)", "tls_invalid");
   }
-  return { cert, key, ...(tls.ca ? { ca: read(tls.ca) } : {}) };
+  const ca = readPem(tls.ca, "daemon.tls.ca");
+  return { cert, key, ...(ca ? { ca } : {}) };
 }
 
 /**

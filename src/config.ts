@@ -73,6 +73,10 @@ const DaemonSettings = z.object({
   exposeProfiles: z.array(z.string()).optional(),
   orphanGraceMs: z.number().int().nonnegative().optional(),
   auditPath: z.string().optional(),
+  /** rotate the audit log at this many bytes (0 disables rotation) */
+  auditMaxBytes: z.number().int().nonnegative().optional(),
+  /** how many rotated audit archives to keep */
+  auditKeep: z.number().int().nonnegative().optional(),
 });
 
 const ConfigSchema = z.object({
