@@ -3,12 +3,17 @@
 Master on machine **A**, worker daemon on machine **B**, first delegated task
 running end to end. Fifteen minutes if Node is already installed.
 
+The scenario throughout: **A runs Claude Code**, which drives the mesh over MCP,
+and **B runs pi**, which does the actual code editing. Every other combination
+works the same way — roles come from configuration — but a concrete pair is
+easier to follow than `agent A` / `agent B`.
+
 ```
-A — master                                    B — worker
-┌───────────────────────────┐   WSS :8790    ┌──────────────────────────────┐
-│ node dist/cli.js dispatch │ ─────────────▶ │ agentmesh daemon (TLS)       │
-│ driver: remote profile    │ ◀───────────── │ local agent: opencode / mock │
-└───────────────────────────┘    task events └──────────────────────────────┘
+A — master                                     B — worker
+┌──────────────────────────────┐  WSS :8790    ┌──────────────────────────────┐
+│ Claude Code                  │ ────────────▶ │ agentmesh daemon (TLS)       │
+│   └── node dist/cli.js mcp   │ ◀──────────── │ local agent: pi (via acpx)   │
+└──────────────────────────────┘  task events  └──────────────────────────────┘
 ```
 
 Only the worker needs an inbound port, and only the worker runs a coding agent.
@@ -20,8 +25,9 @@ The master never accepts connections; it dials out and streams events back.
 - [1. Machine B: certificates and config](#1-machine-b-certificates-and-config)
 - [2. Machine B: start the daemon](#2-machine-b-start-the-daemon)
 - [3. Machine A: point at B and run a task](#3-machine-a-point-at-b-and-run-a-task)
-- [4. Swap the mock for a real agent](#4-swap-the-mock-for-a-real-agent)
-- [5. If it does not work](#5-if-it-does-not-work)
+- [4. Swap the mock for the real pi agent](#4-swap-the-mock-for-the-real-pi-agent)
+- [5. Machine A: attach Claude Code](#5-machine-a-attach-claude-code)
+- [6. If it does not work](#6-if-it-does-not-work)
 - [Next](#next)
 
 ## 0. On both machines
@@ -34,6 +40,10 @@ cd agentmesh && npm ci && npm run build      # produces dist/cli.js
 Requirements: **Node ≥ 22.13**; on B also `openssl` (Git Bash ships it on
 Windows). Every command below is `node dist/cli.js …`; `npm link` gives you a
 plain `agentmesh` if you prefer.
+
+Two more things, installed further down so this step cannot fail because of
+them: **Claude Code on A** (step 5) and **pi on B** (step 4). Until then both
+sides run without an agent at all.
 
 Nothing is published to npm yet, so "install" means this clone on both hosts.
 Keep both hosts on the same version: the wire protocol is versioned, and a
@@ -147,30 +157,97 @@ path that exists there and sits inside `daemon.allowCwd`. The default is the
 master's own working directory, which almost never makes sense on the other host
 and is refused with `cwd_not_whitelisted`. Set it explicitly, to B's path.
 
-## 4. Swap the mock for a real agent
+## 4. Swap the mock for the real pi agent
 
-On B, replace the profile (the daemon reads profiles at startup, so restart it):
+Install and authenticate pi on B first. `acpx` launches it as `npx pi-acp`,
+which in turn needs the `pi` binary on `PATH`:
+
+```bash
+npm install -g @earendil-works/pi-coding-agent
+pi                       # log in once, interactively; credentials land in ~/.pi
+```
+
+Then replace the profile on B (the daemon reads profiles at startup, so restart
+it):
 
 ```yaml
 profiles:
-  - name: opencode
+  - name: pi
     driver: acpx
-    agent: opencode          # must be installed and authenticated on B
+    agent: pi                # acpx built-in -> `npx pi-acp`
     cwd: /srv/repos
 ```
 
-On A, `remoteProfile: opencode` on the remote profile — the profile name on A is
-yours to choose, the value of `remoteProfile` is the name on B.
+A missing or unauthenticated `pi` fails inside the first turn, not at daemon
+startup — the daemon only spawns it when a task arrives.
+
+On A, edit the profile from step 3: rename it to `worker-pi` and point it at the
+profile you just created (`remoteProfile: pi`). The name on A is yours to
+choose; the value of `remoteProfile` is the name on B.
 
 ```bash
-node dist/cli.js dispatch --profile worker-opencode --task "add a /health endpoint and run the tests"
+node dist/cli.js dispatch --profile worker-pi --task "add a /health endpoint and run the tests"
 ```
 
-For real orchestration (async, approvals, multiple workers) start `mcp` on A and
-attach it to OpenCode or Pi — that is what the master agent talks to:
-[`cli.md`](./cli.md).
+That proves the whole chain: A's orchestrator → TLS → B's daemon → acpx → pi
+working in `/srv/repos`.
 
-## 5. If it does not work
+## 5. Machine A: attach Claude Code
+
+Step 4 was A talking to B through the CLI, with no agent on A. The point of
+agentmesh is the other shape: Claude Code on A decides what to delegate.
+
+Register the MCP server with Claude Code — a project `.mcp.json` where you run
+`claude`, or `claude mcp add` for another scope:
+
+```json
+{
+  "mcpServers": {
+    "agentmesh": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/ABS/PATH/agentmesh/dist/cli.js",
+        "mcp",
+        "--config",
+        "/ABS/PATH/agentmesh/agentmesh.yaml"
+      ],
+      "env": { "AGENTMESH_REMOTE_TOKEN": "${AGENTMESH_REMOTE_TOKEN}" }
+    }
+  }
+}
+```
+
+```bash
+# equivalent one-liner, user scope
+claude mcp add --scope user --transport stdio agentmesh -- \
+  node /ABS/PATH/agentmesh/dist/cli.js mcp --config /ABS/PATH/agentmesh/agentmesh.yaml
+```
+
+Two things about that block:
+
+- **absolute paths only.** Claude Code spawns the command from its own cwd, so
+  `./dist/cli.js` and `./agentmesh.yaml` resolve to the wrong place. Check the
+  entry with `claude mcp list`: a server that exits immediately shows as failed.
+- **`${AGENTMESH_REMOTE_TOKEN}` is expanded by Claude Code** (in `.mcp.json`), so
+  the secret stays in your shell (`export AGENTMESH_REMOTE_TOKEN='<hex>'` before starting
+  `claude`) and never in the file.
+
+Then just ask, in a normal Claude Code session:
+
+> Have the pi worker on B add a `/health` endpoint to `/srv/repos/api` and run
+> its test suite.
+
+Claude Code calls `task_submit`, follows the task's events and reports the
+worker's result. Ask it for the async shape — "start it, tell me when it is
+done" — and it uses `task_wait` / `task_result` instead.
+
+> The MCP server is a **child of the Claude Code session**: it lives and dies
+> with it. A task still running when you quit `claude` loses the process that
+> owned it (the record survives, the run does not). Let long jobs finish, or
+> keep the same `mcp` server under a long-lived client.
+
+## 6. If it does not work
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -181,6 +258,8 @@ attach it to OpenCode or Pi — that is what the master agent talks to:
 | `EADDRINUSE` | another daemon already runs on that port | stop it, or change `daemon.port` |
 | `alert certificate required` | B runs mTLS and A sent no client certificate | add `remote.cert` / `remote.key` |
 | Task `cancelled` after a network blip | no grace window on B | set `daemon.orphanGraceMs` and `resume: true` |
+| `claude mcp list` shows agentmesh as failed | relative path, or the config file is not there | absolute paths for both `dist/cli.js` and `agentmesh.yaml` |
+| Claude Code says no agentmesh tools exist | server not started in this session | restart `claude` in the directory with the `.mcp.json`, then approve the server |
 
 Full table, with the exact messages: [`troubleshooting.md`](./troubleshooting.md)
 and [`deploy.md`](./deploy.md#7-troubleshooting).
@@ -190,4 +269,6 @@ and [`deploy.md`](./deploy.md#7-troubleshooting).
 - every key on both sides, OS by OS, plus a verification ladder and an
   operating checklist: [`two-host.md`](./two-host.md)
 - CA, mTLS, firewall, boot-time start, rotation: [`deploy.md`](./deploy.md)
+- attach a different master (OpenCode, Pi) and every CLI command:
+  [`cli.md`](./cli.md)
 - what the daemon actually does: [`remote.md`](./remote.md)

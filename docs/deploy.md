@@ -12,9 +12,9 @@ a verification ladder), see [`two-host.md`](./two-host.md); for the short path,
 ```
  machine A — master                              machine B — worker
 ┌──────────────────────────────┐                ┌───────────────────────────────┐
-│ orchestrator + MCP server    │  WSS :8790     │ agentmesh daemon              │
+│ Claude Code → mcp server     │  WSS :8790     │ agentmesh daemon              │
 │ profile: driver: remote      │ ─────────────▶ │  TLS (+ mTLS) + bearer token  │
-│ token from env               │ ◀───────────── │  local ACP agents (opencode…) │
+│ token from env               │ ◀───────────── │  local ACP agents (pi…)       │
 │ no inbound port needed       │  task events   │  needs inbound 8790 only      │
 └──────────────────────────────┘                └───────────────────────────────┘
 ```
@@ -66,10 +66,10 @@ Config — secrets are named, never inlined:
 workdir: /var/lib/agentmesh
 
 profiles:
-  - name: opencode
+  - name: pi
     driver: acpx
-    agent: opencode
-    cwd: /srv/repos
+    agent: pi                  # acpx built-in -> `npx pi-acp`; `pi` must be installed
+    cwd: /srv/repos            # and logged in as the daemon's account
 
 daemon:
   host: 0.0.0.0
@@ -114,12 +114,13 @@ export AGENTMESH_REMOTE_TOKEN='<the same 32-byte hex secret>'
 ```yaml
 # agentmesh.yaml on the master
 profiles:
-  - name: worker-opencode
+  - name: worker-pi
     driver: remote
+    cwd: /srv/repos            # a path ON B, inside its daemon.allowCwd
     remote:
       endpoint: https://worker.internal:8790
       tokenEnv: AGENTMESH_REMOTE_TOKEN
-      remoteProfile: opencode
+      remoteProfile: pi
       ca: /etc/agentmesh/ca.pem          # trust the private CA
       cert: /etc/agentmesh/client.pem    # required when the daemon runs mTLS
       key: /etc/agentmesh/client-key.pem
@@ -130,7 +131,11 @@ profiles:
 The master opens **no** inbound port: it dials out and streams results back.
 
 ```bash
-node dist/cli.js run --profile worker-opencode --task "summarise the repo"
+node dist/cli.js dispatch --profile worker-pi --task "summarise the repo"
+
+# or hand the same command to a master agent (Claude Code here):
+#   claude mcp add --scope user --transport stdio agentmesh -- \
+#     node /srv/agentmesh/dist/cli.js mcp --config /srv/agentmesh/agentmesh.yaml
 ```
 
 ## 3. Firewall

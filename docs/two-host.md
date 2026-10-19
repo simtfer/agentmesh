@@ -9,6 +9,10 @@ Production hardening (private CA, mutual TLS, firewall, rotation, systemd) has
 its own runbook: [`deploy.md`](./deploy.md). This page covers configuration and
 startup on both hosts, and links there for the operating procedure.
 
+Concrete roles, used in every example below: **A is Claude Code** (the master —
+an MCP client), **B is pi** (the worker — an ACP agent driven by `acpx`). Nothing
+here depends on that pair; swap either side's agent and only the config changes.
+
 ## Contents
 
 - [Topology and trust boundaries](#topology-and-trust-boundaries)
@@ -29,11 +33,11 @@ startup on both hosts, and links there for the operating procedure.
 ```
 machine A — master                              machine B — worker
 ┌────────────────────────────────┐              ┌──────────────────────────────────┐
-│ orchestrator (SQLite)          │  WSS :8790   │ agentmesh daemon                 │
-│ MCP server (opencode / pi)     │ ───────────▶ │  HTTP  /healthz  /profiles       │
+│ Claude Code (MCP client)       │  WSS :8790   │ agentmesh daemon                 │
+│ node dist/cli.js mcp           │ ───────────▶ │  HTTP  /healthz  /profiles       │
 │ profile: driver: remote        │              │  WS    /ws  (typed task events)  │
 │ token from env, no inbound     │ ◀─────────── │  TLS (+ mTLS), bearer token      │
-│ port                             │  events     │  local ACP agents (acpx) ──▶ ACP│
+│ port                           │  events      │ local ACP agent: pi (acpx) ─▶ ACP│
 └────────────────────────────────┘              └──────────────────────────────────┘
 ```
 
@@ -56,7 +60,7 @@ Two consequences worth internalising before you configure anything:
 |---|---|---|
 | Node.js | ≥ 22.13 | ≥ 22.13 |
 | agentmesh build | `dist/cli.js` | `dist/cli.js` |
-| an ACP agent (opencode / pi) | not required on A; needed wherever the master agent runs | **required** for real work (a `driver: mock` profile needs nothing) |
+| the agent itself | **Claude Code** (`claude` on `PATH`), attached over stdio MCP | **pi**, installed and logged in; `acpx` drives it as `npx pi-acp` |
 | `openssl` | only to inspect certificates | yes, to generate the CA/certificates |
 | inbound port | **none** | TCP 8790 (or whatever `daemon.port` says) |
 | outbound | → B:8790 | → whatever the agent talks to |
@@ -81,6 +85,20 @@ On Windows there is no build step difference: `git clone`, `npm ci`,
 `npm run build`, then run `node dist\cli.js`. Use a dedicated local user rather
 than `SYSTEM` if the host is shared — the daemon inherits the account's file
 access, and so does every agent it spawns.
+
+### The agent: pi
+
+```bash
+npm install -g @earendil-works/pi-coding-agent   # provides the `pi` binary
+sudo -u agentmesh -H pi                          # log in once, as the daemon's user
+```
+
+`acpx` launches `npx pi-acp`, which drives that binary. Two consequences worth
+knowing before the first task: `pi` must be on the **daemon account's** `PATH`,
+and it must be logged in **as that account** — credentials live under `~/.pi`,
+so an agent installed and authenticated as your own user is invisible to a
+daemon running as `agentmesh`. The failure surfaces inside the first turn as an
+agent error, not at startup.
 
 ### Certificates
 
@@ -115,9 +133,9 @@ defaults to 825 days; check it with
 workdir: /var/lib/agentmesh        # task store, worktrees, staged handoff patches
 
 profiles:
-  - name: opencode                 # the name A refers to as remoteProfile
+  - name: pi                       # the name A refers to as remoteProfile
     driver: acpx
-    agent: opencode
+    agent: pi                      # acpx built-in -> `npx pi-acp`
     cwd: /srv/repos                # default working dir for this profile on B
     worktree: true                 # isolate each task in a git worktree (optional)
 
@@ -126,7 +144,7 @@ daemon:
   port: 8790                       # default 8787
   tokenEnv: AGENTMESH_DAEMON_TOKEN # env var NAME; never the secret itself
   allowCwd: [/srv/repos]           # required: remote tasks may not run outside these
-  exposeProfiles: [opencode]       # optional; defaults to every non-remote profile
+  exposeProfiles: [pi]             # optional; defaults to every non-remote profile
   orphanGraceMs: 30000             # default 0 — keep a dropped task alive this long
   tls:
     cert: /etc/agentmesh/certs/server.pem
@@ -178,7 +196,7 @@ Task Scheduler job can read; the wrapper script refuses to start without it.
 # foreground, which is what you want the first time
 sudo -u agentmesh env $(sudo cat /etc/agentmesh/worker.env) \
   node /srv/agentmesh/dist/cli.js daemon --config /etc/agentmesh/agentmesh.yaml
-# [agentmesh] worker daemon listening on https://0.0.0.0:8790 (https, profiles: opencode)
+# [agentmesh] worker daemon listening on https://0.0.0.0:8790 (https, profiles: pi)
 ```
 
 Flags override the config for a one-off test: `--host`, `--port`, `--token-env`,
@@ -193,13 +211,13 @@ Two probes, deliberately different:
 ```bash
 curl -k https://10.0.0.12:8790/healthz                  # no auth: {ok, daemonId, protocol}
 curl -k -H "Authorization: Bearer $TOK" https://10.0.0.12:8790/profiles
-# {"daemonId":"daemon-…","profiles":["opencode"]}
+# {"daemonId":"daemon-…","profiles":["pi"]}
 ```
 
 ## Machine A: the master
 
-A needs no inbound port, no agent, and no daemon. It needs the same build and a
-profile that points at B.
+A needs no inbound port, no worker agent, and no daemon. It needs the same build,
+a profile that points at B, and Claude Code if you want an agent driving it.
 
 ```bash
 git clone https://github.com/simtfer/agentmesh.git && cd agentmesh
@@ -211,13 +229,13 @@ export AGENTMESH_REMOTE_TOKEN='<the 32-byte hex from B>'
 workdir: ./state
 
 profiles:
-  - name: worker-opencode          # your name for this worker; used in task_submit
+  - name: worker-pi                # your name for this worker; used in task_submit
     driver: remote
     cwd: /srv/repos                # a path ON B — see the next section
     remote:
       endpoint: https://10.0.0.12:8790   # https:// here; wss:// is derived
       tokenEnv: AGENTMESH_REMOTE_TOKEN
-      remoteProfile: opencode      # the profile name on B; defaults to this profile's name
+      remoteProfile: pi            # the profile name on B; defaults to this profile's name
       ca: /etc/agentmesh/ca.pem    # trust B's private CA
       cert: /etc/agentmesh/client.pem      # required only when B runs mTLS
       key: /etc/agentmesh/client-key.pem
@@ -231,21 +249,66 @@ profiles:
 that cannot be read fails immediately with `tls_invalid` instead of surfacing as
 an opaque handshake error on the other machine.
 
-Two ways to drive it:
+Two ways to drive it.
+
+**From the CLI** — enough to prove the chain without an agent on A:
 
 ```bash
-# synchronous: submit and wait for the terminal result (what the quickstart uses)
-node dist/cli.js dispatch --profile worker-opencode --task "run the test suite"
-
-# resident: the MCP surface a real master agent attaches to
-node dist/cli.js mcp --config agentmesh.yaml
+node dist/cli.js dispatch --profile worker-pi --task "run the test suite"
 ```
 
-Approvals only work through the resident mode. A pending approval lives in the
-orchestrator that owns the running task, so a second CLI process cannot answer
-it: `dispatch` on a task that needs permission parks in `waiting` until the task
-timeout (ten minutes by default) and then ends `timed_out`. Attach the master to
-`mcp` and answer with `task_approve`.
+**From Claude Code** — the shape that gives A a mind of its own. Claude Code
+starts `dist/cli.js mcp` as a stdio server and then calls the tools itself:
+
+```json
+{
+  "mcpServers": {
+    "agentmesh": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/ABS/PATH/agentmesh/dist/cli.js",
+        "mcp",
+        "--config",
+        "/ABS/PATH/agentmesh/agentmesh.yaml"
+      ],
+      "env": { "AGENTMESH_REMOTE_TOKEN": "${AGENTMESH_REMOTE_TOKEN}" }
+    }
+  }
+}
+```
+
+```bash
+# same thing without the file, at user scope
+claude mcp add --scope user --transport stdio agentmesh -- \
+  node /ABS/PATH/agentmesh/dist/cli.js mcp --config /ABS/PATH/agentmesh/agentmesh.yaml
+```
+
+Put the JSON in `.mcp.json` where you run `claude` (project scope, so it travels
+with the directory) or let `claude mcp add` write it elsewhere. Then, in a session:
+*"have the pi worker on B run the test suite in /srv/repos/api and fix what
+fails."* Claude Code does the rest with `task_submit` / `task_wait`.
+
+Three properties of that arrangement are worth stating plainly, because they
+explain most "it stopped" reports:
+
+- **Absolute paths.** The server is spawned from Claude Code's own cwd;
+  `./dist/cli.js` and `./agentmesh.yaml` silently point somewhere else.
+- **The secret stays out of the file.** In `.mcp.json`, Claude Code expands
+  `${AGENTMESH_REMOTE_TOKEN}` from the environment, so export it in the shell that launches
+  `claude` (`~/.bashrc` / `setx`). A literal token in `.mcp.json` is a token in
+  a repo.
+- **The server is a child of the session.** Quit `claude` and the process that
+  owned the orchestrator goes with it: records stay in A's SQLite file, but the
+  run that was executing does not survive. For a job that must outlive the
+  session, keep the same `mcp` server under a long-lived client instead.
+
+Approvals are the one thing that only works through the resident mode. A pending
+approval lives in the orchestrator that owns the running task, so a second CLI
+process cannot answer it: `dispatch` on a task that needs permission parks in
+`waiting` until the task timeout (ten minutes by default) and then ends
+`timed_out`. Claude Code answers with `task_approve`, because that is the same
+process that submitted.
 
 ## The `cwd` contract
 
@@ -276,7 +339,7 @@ failure at rung *n* means everything below it is fine.
 | 1 | the wire works | `curl -k https://<B>:8790/healthz` | `{"ok":true,…}` — no auth needed |
 | 2 | the token works | `curl -k -H "Authorization: Bearer $TOK" https://<B>:8790/profiles` | the profile list; without the header, `401` |
 | 3 | the TLS trust works | `dispatch` with a `driver: mock` profile | `"status": "completed"` |
-| 4 | the agent works | `dispatch` with the real `acpx` profile | a real answer, and B's audit log gets `submit_ok` |
+| 4 | the agent works | `dispatch` with the real `pi` profile | a real answer, and B's audit log gets `submit_ok` |
 | 5 | mTLS works | dispatch without `remote.cert`, then with it | first fails with `alert certificate required`, second succeeds |
 | 6 | a drop is survivable | kill the socket mid-run (`orphanGraceMs` > 0, `resume: true`) | the task finishes; events are replayed, not duplicated |
 
@@ -375,6 +438,8 @@ Messages below are the ones the code actually emits.
 | A | `ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED` | B runs mTLS, A is certless | same as the `tls_reject` row |
 | A | `connect ECONNREFUSED` | nothing listening, or a firewall drop | check rung 1 of the ladder |
 | A | task ends `cancelled` after a blip | `orphanGraceMs: 0` or `resume: false` | grace window + resume |
+| A (Claude Code) | server shows as failed in `claude mcp list` | the stdio command exits: relative path, missing config, or a `node` that is not on Claude's `PATH` | absolute paths; run the same command by hand to see its stderr |
+| A (Claude Code) | the tools exist but every remote submit fails with `401` | the session's environment has no `AGENTMESH_REMOTE_TOKEN` | export it where `claude` is launched, or use `${AGENTMESH_REMOTE_TOKEN}` in `env` |
 
 More codes: [`troubleshooting.md`](./troubleshooting.md). The daemon's audit
 trail is the first place to look for "who tried what" — refusals record the peer
@@ -409,6 +474,12 @@ Stated plainly, because "it works" is not one claim:
 - The configuration on this page was executed as written — TLS with a private
   CA, mTLS on and off, the whitelist refusal, the wrong-token refusal — on
   Windows, both processes on one host.
+- The master side was exercised through the same stdio MCP surface Claude Code
+  attaches to (`npm run smoke` drives it over a real pipe: full task lifecycle,
+  approvals included), and against real `pi` and `opencode` workers on one host
+  (`npm run real`). **Not** verified: a Claude Code session driving this stack
+  end to end — the wiring above is the standard stdio MCP entry, but treat it as
+  untested until you have seen `claude mcp list` report it healthy.
 - **Not** covered: two physical machines. DNS, routing and the worker's firewall
   are exactly what the checklist above is for, and they are the steps that fail
   first in practice. macOS is untested.

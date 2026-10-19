@@ -60,10 +60,11 @@ the other side. Two probes are available:
 profiles:
   - name: big-gpu-impl
     driver: remote
+    cwd: /srv/repos                            # a path ON the daemon host
     remote:
       endpoint: https://gpu.example.com:8790   # wss:// derived automatically
       tokenEnv: AGENTMESH_REMOTE_TOKEN          # value read from env, never stored
-      remoteProfile: opencode                   # which daemon-side profile to run
+      remoteProfile: pi                         # which daemon-side profile to run
       # ca: ./certs/daemon-ca.pem               # trust a self-signed daemon cert
 ```
 
@@ -151,7 +152,7 @@ profiles:
     remote:
       endpoint: https://gpu.example.com:8790
       tokenEnv: AGENTMESH_REMOTE_TOKEN
-      remoteProfile: opencode
+      remoteProfile: pi
       resume: true              # auto re-attach if the socket drops mid-turn
       reconnectAttempts: 3
       reconnectDelayMs: 500

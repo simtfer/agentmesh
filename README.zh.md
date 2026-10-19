@@ -2,12 +2,12 @@
 
 [English](https://github.com/simtfer/agentmesh/blob/main/README.md) · **简体中文**
 
-一个**协议原生适配器**：让一个编码 agent 充当 **master**，指挥一池**异构 worker agent**（OpenCode、Pi、Codex、Gemini、Claude Code 等）。角色由*配置*决定，而不是由 agent 类型决定——所以 OpenCode 可以当 master 驱动 Pi worker，Pi 也可以驱动 OpenCode，代码完全一样。
+一个**协议原生适配器**：让一个编码 agent 充当 **master**，指挥一池**异构 worker agent**（OpenCode、Pi、Codex、Gemini、Claude Code 等）。角色由*配置*决定，而不是由 agent 类型决定——所以 Claude Code 可以当 master 驱动 Pi worker，OpenCode 可以驱动 Pi，Pi 也可以驱动 OpenCode，代码完全一样。
 
 ```
 ┌─────────────┐   MCP tools    ┌──────────────────────────┐   ACP (JSON-RPC/stdio)   ┌──────────────┐
 │ master agent │ ─────────────▶ │ agentmesh adapter        │ ───────────────────────▶ │ worker: pi   │
-│ (opencode/pi)│  spawn/dispatch│  • MCP server (in)       │   via acpx runtime       ├──────────────┤
+│ (Claude Code)│  spawn/dispatch│  • MCP server (in)       │   via acpx runtime       ├──────────────┤
 │  ...any MCP  │ ◀───────────── │  • Orchestrator          │ ◀─────────────────────── │ worker:      │
 │    client    │   results      │  • Worker registry       │   streamed events        │   opencode   │
 └─────────────┘                │  • git-worktree isolation│                          ├──────────────┤
@@ -67,19 +67,22 @@ npm run build
 
 ```json
 {
-  "mcp": {
+  "mcpServers": {
     "agentmesh": {
-      "type": "local",
-      "command": ["node", "/ABS/PATH/agentmesh/dist/cli.js", "mcp", "--config", "/ABS/PATH/agentmesh/agentmesh.yaml"],
-      "enabled": true
+      "type": "stdio",
+      "command": "node",
+      "args": ["/ABS/PATH/agentmesh/dist/cli.js", "mcp", "--config", "/ABS/PATH/agentmesh/agentmesh.yaml"]
     }
   }
 }
 ```
 
-上面是 OpenCode 风格的条目；Pi 1.0 把同一行命令作为本地/stdio MCP server 加进去即可。之后直接跟 master 说话：*“spawn an opencode worker to fix the failing tests while a pi worker writes the changelog.”*——它会去调 `dispatch_task`。
+上面就是 Claude Code 的形态——项目里的 `.mcp.json`，或者用
+`claude mcp add --transport stdio agentmesh -- node …` 写同样的命令。OpenCode 与 Pi
+各自在自己的配置里填这条命令即可。之后直接跟 master 说话：*“让 pi worker 加一个 `/health` 端点并跑测试。”*——它会去调 `dispatch_task`。
+路径必须是绝对路径：server 是从 master 的 cwd 拉起来的。
 
-各客户端的完整配置片段与全部命令：[`docs/cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md)（英文）。
+各客户端的完整片段（含远程 token 的 `env` 写法）与全部命令：[`docs/cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md)（英文）。
 
 ## 核心概念
 

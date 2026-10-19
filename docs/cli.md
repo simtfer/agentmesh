@@ -53,6 +53,32 @@ always: `node <abs>/dist/cli.js mcp --config <abs>/agentmesh.yaml`.
 npm run build
 ```
 
+**Claude Code** (project `.mcp.json`, or `claude mcp add`) — the configuration
+used throughout [`quickstart.md`](./quickstart.md) and
+[`two-host.md`](./two-host.md):
+
+```json
+{
+  "mcpServers": {
+    "agentmesh": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/ABS/PATH/agentmesh/dist/cli.js", "mcp", "--config", "/ABS/PATH/agentmesh/agentmesh.yaml"],
+      "env": { "AGENTMESH_REMOTE_TOKEN": "${AGENTMESH_REMOTE_TOKEN}" }
+    }
+  }
+}
+```
+
+```bash
+claude mcp add --scope user --transport stdio agentmesh -- \
+  node /ABS/PATH/agentmesh/dist/cli.js mcp --config /ABS/PATH/agentmesh/agentmesh.yaml
+claude mcp list          # a server that exits immediately shows up as failed
+```
+
+`${VAR}` is expanded by Claude Code, so the token stays in the shell. Absolute
+paths are not optional: the server is spawned from Claude Code's cwd.
+
 **OpenCode** (`opencode.json` / `~/.config/opencode/opencode.json`) — shape:
 
 ```json
@@ -73,8 +99,9 @@ MCP; add agentmesh as a local/stdio MCP server with the same command.
 > Verify the exact MCP-server config keys against the current OpenCode/Pi docs —
 > the command line above is what matters and is stable.
 
-Then just talk to your master: *"spawn an opencode worker to fix the failing
-tests while a pi worker writes the changelog."* It will call `dispatch_task`.
+Then just talk to your master: *"have the pi worker on B add a `/health`
+endpoint and run its tests"* (or *"spawn an opencode worker here while pi writes
+the changelog"*). It calls `dispatch_task`.
 
 ## One-shot vs resident
 

@@ -4,14 +4,14 @@
 
 A **protocol-native adapter** that lets one coding agent act as a **master** and
 command a pool of **heterogeneous worker agents** (OpenCode, Pi, Codex, Gemini,
-Claude Code, …). Roles are decided by *configuration*, not by agent type — so an
-OpenCode master can drive Pi workers, a Pi master can drive OpenCode workers, or
-anything else, with the same code.
+Claude Code, …). Roles are decided by *configuration*, not by agent type — so a
+Claude Code master can drive Pi workers, an OpenCode master can drive Pi workers,
+a Pi master can drive OpenCode workers, or anything else, with the same code.
 
 ```
 ┌─────────────┐   MCP tools    ┌──────────────────────────┐   ACP (JSON-RPC/stdio)   ┌──────────────┐
 │ master agent │ ─────────────▶ │ agentmesh adapter        │ ───────────────────────▶ │ worker: pi   │
-│ (opencode/pi)│  spawn/dispatch│  • MCP server (in)       │   via acpx runtime       ├──────────────┤
+│ (Claude Code)│  spawn/dispatch│  • MCP server (in)       │   via acpx runtime       ├──────────────┤
 │  ...any MCP  │ ◀───────────── │  • Orchestrator          │ ◀─────────────────────── │ worker:      │
 │    client    │   results      │  • Worker registry       │   streamed events        │   opencode   │
 └─────────────┘                │  • git-worktree isolation│                          ├──────────────┤
@@ -89,21 +89,24 @@ npm run build
 
 ```json
 {
-  "mcp": {
+  "mcpServers": {
     "agentmesh": {
-      "type": "local",
-      "command": ["node", "/ABS/PATH/agentmesh/dist/cli.js", "mcp", "--config", "/ABS/PATH/agentmesh/agentmesh.yaml"],
-      "enabled": true
+      "type": "stdio",
+      "command": "node",
+      "args": ["/ABS/PATH/agentmesh/dist/cli.js", "mcp", "--config", "/ABS/PATH/agentmesh/agentmesh.yaml"]
     }
   }
 }
 ```
 
-That is an OpenCode-style entry; Pi 1.0 takes the same command as a local/stdio
-MCP server. Then just talk to your master: *"spawn an opencode worker to fix the
-failing tests while a pi worker writes the changelog."* — it calls `dispatch_task`.
+That is the Claude Code shape — a project `.mcp.json`, or the same command via
+`claude mcp add --transport stdio agentmesh -- node …`. OpenCode and Pi take the
+same command in their own config. Then just talk to your master: *"have the pi
+worker add a `/health` endpoint and run its tests"* — it calls `dispatch_task`.
+Absolute paths are required: the server is spawned from your master's cwd.
 
-Per-client snippets and every CLI command: [`docs/cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md).
+Per-client snippets, the remote-token `env` entry, and every CLI command:
+[`docs/cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md).
 
 ## Core concepts
 

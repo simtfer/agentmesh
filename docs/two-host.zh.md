@@ -6,6 +6,10 @@
 生产加固（私有 CA、双向 TLS、防火墙、轮换、systemd）另有运维手册：[`deploy.md`](./deploy.md)。
 本篇讲配置与启动，运维流程去那边看。
 
+下文所有例子固定用这一对角色：**A 是 Claude Code**（master，也就是 MCP 客户端），
+**B 是 pi**（worker，由 `acpx` 驱动的 ACP agent）。这不依赖具体是哪两个 agent——换掉任意一侧，
+改的只是配置。
+
 ## 目录
 
 - [拓扑与信任边界](#拓扑与信任边界)
@@ -26,11 +30,11 @@
 ```
 A 机 —— master                                  B 机 —— worker
 ┌────────────────────────────────┐              ┌──────────────────────────────────┐
-│ orchestrator（SQLite）         │  WSS :8790   │ agentmesh daemon                 │
-│ MCP server（opencode / pi）    │ ───────────▶ │  HTTP  /healthz  /profiles       │
+│ Claude Code（MCP 客户端）      │  WSS :8790   │ agentmesh daemon                 │
+│ node dist/cli.js mcp           │ ───────────▶ │  HTTP  /healthz  /profiles       │
 │ profile: driver: remote        │              │  WS    /ws（带类型的任务事件）   │
-│ token 从环境读，无入站端口     │ ◀─────────── │  TLS（+ mTLS）、bearer token      │
-│                                │    事件      │  本机 ACP agent（acpx）──▶ ACP   │
+│ token 从环境读，无入站端口     │ ◀─────────── │  TLS（+ mTLS）、bearer token     │
+│                                │    事件      │ 本机 ACP agent：pi（acpx）──▶ ACP│
 └────────────────────────────────┘              └──────────────────────────────────┘
 ```
 
@@ -48,7 +52,7 @@ A 机 —— master                                  B 机 —— worker
 |---|---|---|
 | Node.js | ≥ 22.13 | ≥ 22.13 |
 | agentmesh 构建产物 | `dist/cli.js` | `dist/cli.js` |
-| ACP agent（opencode / pi） | A 上不需要；真正跑 agent 的那台才需要 | **必须有**才能干真活（`driver: mock` 的 profile 什么也不用装） |
+| agent 本身 | **Claude Code**（`PATH` 上有 `claude`），通过 stdio MCP 接入 | **pi**，装好并登录；`acpx` 以 `npx pi-acp` 驱动它 |
 | `openssl` | 只在检查证书时用 | 需要，用来生成 CA 与证书 |
 | 入站端口 | **没有** | TCP 8790（或 `daemon.port` 指定的端口） |
 | 出站 | → B:8790 | → agent 自己要访问的东西 |
@@ -71,6 +75,18 @@ sudo mkdir -p /srv/repos && sudo chown agentmesh: /srv/repos
 Windows 上构建步骤没有任何区别：`git clone`、`npm ci`、`npm run build`，然后 `node dist\cli.js`。
 如果这台机器还有人用，给 daemon 一个专用本地账号而不是 `SYSTEM`——daemon 继承该账号的文件权限，
 它拉起的每个 agent 也一样继承。
+
+### agent：pi
+
+```bash
+npm install -g @earendil-works/pi-coding-agent   # 提供 `pi` 这个可执行文件
+sudo -u agentmesh -H pi                          # 以 daemon 的身份登录一次
+```
+
+`acpx` 用 `npx pi-acp` 拉起它，`pi-acp` 再去驱动那个可执行文件。所以有两个前提必须在第一个任务
+之前就成立：`pi` 在 **daemon 账号的 `PATH`** 里，并且是用 **那个账号** 登录的——凭据在 `~/.pi` 下，
+你用自己的用户装好、登录好的 agent，对以 `agentmesh` 身份运行的 daemon 是不存在的。
+这种失败在第一轮对话里以 agent 报错的形式出现，不会在启动时暴露。
 
 ### 证书
 
@@ -102,9 +118,9 @@ B 机的 `agentmesh.yaml`，`daemon:` 块里的每个键：
 workdir: /var/lib/agentmesh        # 任务库、worktree、暂存的交接补丁都在这
 
 profiles:
-  - name: opencode                 # A 侧 remoteProfile 要写的名字
+  - name: pi                       # A 侧 remoteProfile 要写的名字
     driver: acpx
-    agent: opencode
+    agent: pi                      # acpx 内置名 -> `npx pi-acp`
     cwd: /srv/repos                # 该 profile 在 B 上的默认工作目录
     worktree: true                 # 每个任务隔离在独立 git worktree（可选）
 
@@ -113,7 +129,7 @@ daemon:
   port: 8790                       # 默认 8787
   tokenEnv: AGENTMESH_DAEMON_TOKEN # 环境变量名，不是密钥本身
   allowCwd: [/srv/repos]           # 必填：远程任务不能跑出这些根
-  exposeProfiles: [opencode]       # 可选；默认暴露所有非 remote 的 profile
+  exposeProfiles: [pi]             # 可选；默认暴露所有非 remote 的 profile
   orphanGraceMs: 30000             # 默认 0——掉线后让任务多活这么久
   tls:
     cert: /etc/agentmesh/certs/server.pem
@@ -159,7 +175,7 @@ Windows：`setx /M AGENTMESH_DAEMON_TOKEN "<hex>"` 设成机器级变量，计�
 # 前台跑，第一次就该这么跑
 sudo -u agentmesh env $(sudo cat /etc/agentmesh/worker.env) \
   node /srv/agentmesh/dist/cli.js daemon --config /etc/agentmesh/agentmesh.yaml
-# [agentmesh] worker daemon listening on https://0.0.0.0:8790 (https, profiles: opencode)
+# [agentmesh] worker daemon listening on https://0.0.0.0:8790 (https, profiles: pi)
 ```
 
 一次性测试时命令行参数可以覆盖配置：`--host`、`--port`、`--token-env`、`--tls-cert`、`--tls-key`、
@@ -173,12 +189,13 @@ sudo -u agentmesh env $(sudo cat /etc/agentmesh/worker.env) \
 ```bash
 curl -k https://10.0.0.12:8790/healthz                  # 免鉴权：{ok, daemonId, protocol}
 curl -k -H "Authorization: Bearer $TOK" https://10.0.0.12:8790/profiles
-# {"daemonId":"daemon-…","profiles":["opencode"]}
+# {"daemonId":"daemon-…","profiles":["pi"]}
 ```
 
 ## A 机：master
 
-A 不需要入站端口、不需要 agent、也不需要 daemon。它需要同一份构建，加一个指向 B 的 profile。
+A 不需要入站端口、不需要 worker agent、也不需要 daemon。它需要同一份构建、一个指向 B 的 profile，
+以及——如果你想让它有脑子——Claude Code。
 
 ```bash
 git clone https://github.com/simtfer/agentmesh.git && cd agentmesh
@@ -190,13 +207,13 @@ export AGENTMESH_REMOTE_TOKEN='<B 上那串 32 字节十六进制>'
 workdir: ./state
 
 profiles:
-  - name: worker-opencode          # 你给这个 worker 起的名字，task_submit 时用
+  - name: worker-pi                # 你给这个 worker 起的名字，task_submit 时用
     driver: remote
     cwd: /srv/repos                # B 机上的路径——见下一节
     remote:
       endpoint: https://10.0.0.12:8790   # 这里写 https://，wss:// 会自动推导
       tokenEnv: AGENTMESH_REMOTE_TOKEN
-      remoteProfile: opencode      # B 上的 profile 名；不写则用本 profile 的名字
+      remoteProfile: pi            # B 上的 profile 名；不写则用本 profile 的名字
       ca: /etc/agentmesh/ca.pem    # 信任 B 的私有 CA
       cert: /etc/agentmesh/client.pem      # 仅当 B 开 mTLS 时需要
       key: /etc/agentmesh/client-key.pem
@@ -209,19 +226,59 @@ profiles:
 两端的 `cert`/`key`/`ca` 都既接受文件路径，也接受内联 PEM。路径读不到时会立刻报
 `tls_invalid`，而不是在另一台机器上表现成一个看不懂的握手失败。
 
-两种驱动方式：
+两种驱动方式。
+
+**用命令行**——A 上还没有 agent 时，这样就能先把链路验通：
 
 ```bash
-# 同步：提交并等到终态（快速上手用的就是它）
-node dist/cli.js dispatch --profile worker-opencode --task "跑一遍测试"
-
-# 常驻：真正的 master agent 接入的 MCP 面
-node dist/cli.js mcp --config agentmesh.yaml
+node dist/cli.js dispatch --profile worker-pi --task "跑一遍测试"
 ```
 
-审批只能在常驻模式下走完。待审批项活在持有该任务的 orchestrator 进程里，第二个 CLI 进程没法回答它——
-对需要授权的任务用 `dispatch`，它会一直停在 `waiting`，直到任务超时（默认十分钟）并以 `timed_out` 结束。
-把 master 接到 `mcp`，用 `task_approve` 回答。
+**用 Claude Code**——这才是让 A 自己有判断力的形态。Claude Code 把 `dist/cli.js mcp` 当 stdio
+server 拉起来，之后由它自己决定调哪些工具：
+
+```json
+{
+  "mcpServers": {
+    "agentmesh": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/ABS/PATH/agentmesh/dist/cli.js",
+        "mcp",
+        "--config",
+        "/ABS/PATH/agentmesh/agentmesh.yaml"
+      ],
+      "env": { "AGENTMESH_REMOTE_TOKEN": "${AGENTMESH_REMOTE_TOKEN}" }
+    }
+  }
+}
+```
+
+```bash
+# 不写文件，注册到 user scope 的等价写法
+claude mcp add --scope user --transport stdio agentmesh -- \
+  node /ABS/PATH/agentmesh/dist/cli.js mcp --config /ABS/PATH/agentmesh/agentmesh.yaml
+```
+
+JSON 放在你运行 `claude` 的目录下的 `.mcp.json`（project scope，跟着目录走），或者让
+`claude mcp add` 写到别处。然后在会话里说：*“让 B 上那个 pi worker 在 /srv/repos/api 里跑一遍测试，
+把失败的修掉。”* 剩下的由 Claude Code 用 `task_submit` / `task_wait` 完成。
+
+这个安排有三条性质值得先说清，因为“它停了”这类问题大多是它们引起的：
+
+- **必须用绝对路径。** server 是从 Claude Code 自己的 cwd 拉起来的，`./dist/cli.js` 和
+  `./agentmesh.yaml` 会静默指到别的地方去。
+- **密钥不进文件。** 在 `.mcp.json` 里，`${AGENTMESH_REMOTE_TOKEN}` 由 Claude Code 从环境展开，所以在启动
+  `claude` 的那个 shell 里 export（`~/.bashrc` 或 `setx`）。把 token 字面量写进 `.mcp.json`，
+  就是写进了一个仓库。
+- **server 是会话的子进程。** 退出 `claude`，持有 orchestrator 的那个进程也一起走：任务记录还在
+  A 的 SQLite 里，但正在跑的那一轮不会接着跑。要活过会话的长任务，就让同一个 `mcp` server
+  挂在长生命周期的客户端下面。
+
+审批是唯一只能在常驻模式下走完的事。待审批项活在持有该任务的 orchestrator 进程里，第二个 CLI
+进程没法回答它——对需要授权的任务用 `dispatch`，它会一直停在 `waiting`，直到任务超时（默认十分钟）
+并以 `timed_out` 结束。Claude Code 用 `task_approve` 回答，因为提交它的就是同一个进程。
 
 ## `cwd` 的契约
 
@@ -249,7 +306,7 @@ node dist/cli.js mcp --config agentmesh.yaml
 | 1 | 链路通 | `curl -k https://<B>:8790/healthz` | `{"ok":true,…}`，不需要鉴权 |
 | 2 | token 对 | `curl -k -H "Authorization: Bearer $TOK" https://<B>:8790/profiles` | 返回 profile 列表；不带头发 `401` |
 | 3 | TLS 信任对 | 用 `driver: mock` 的 profile 跑一次 `dispatch` | `"status": "completed"` |
-| 4 | agent 能跑 | 用真实的 `acpx` profile 跑 `dispatch` | 得到真实回答，且 B 的审计日志出现 `submit_ok` |
+| 4 | agent 能跑 | 用真实的 `pi` profile 跑 `dispatch` | 得到真实回答，且 B 的审计日志出现 `submit_ok` |
 | 5 | mTLS 生效 | 先不带 `remote.cert` 跑，再带上 | 第一次报 `alert certificate required`，第二次成功 |
 | 6 | 掉线可恢复 | 跑到一半掐掉连接（`orphanGraceMs` > 0、`resume: true`） | 任务照样跑完；事件被重放而不是重复 |
 
@@ -334,6 +391,8 @@ reload 会拒绝空集合，所以打错字既不会让 daemon 变成免鉴权�
 | A | `ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED` | B 开 mTLS，A 没证书 | 同 `tls_reject` 那行 |
 | A | `connect ECONNREFUSED` | 没人监听，或被防火墙丢了 | 回到验证第 1 级 |
 | A | 抖动后任务 `cancelled` | `orphanGraceMs: 0` 或 `resume: false` | 给宽限窗口 + 开 resume |
+| A（Claude Code） | `claude mcp list` 里 server 显示失败 | stdio 命令一启动就退：相对路径、配置文件不在，或 Claude 的 `PATH` 里没有 `node` | 全用绝对路径；把同一条命令手动跑一遍看它的 stderr |
+| A（Claude Code） | 工具在，但每个远程提交都 `401` | 会话环境里没有 `AGENTMESH_REMOTE_TOKEN` | 在启动 `claude` 的地方 export，或在 `env` 里写 `${AGENTMESH_REMOTE_TOKEN}` |
 
 更多错误码：[`troubleshooting.md`](./troubleshooting.md)。想知道“谁试过什么”，先看审计日志——
 拒绝记录会带对端地址，鉴权失败还会带所给 token 的 12 位十六进制指纹（永远不是 token 本身）。
@@ -359,6 +418,10 @@ reload 会拒绝空集合，所以打错字既不会让 daemon 变成免鉴权�
   master 信任错 CA、在可达网卡上明文绑定、mTLS 缺失或外来客户端证书。
 - 本页的配置是照着实际执行验证过的——私有 CA + TLS、mTLS 开与关、白名单拒绝、错 token 拒绝——
   在 Windows 上、两个进程同机。
+- master 这一侧是通过 Claude Code 接入的**同一个 stdio MCP 面**验证的（`npm run smoke` 用真实管道
+  驱动它跑完整任务生命周期，含审批），另外也在同一台机器上对真实的 `pi` 与 `opencode` worker
+  跑过（`npm run real`）。**没有**验证的是：用一次真正的 Claude Code 会话把整套跑通——上面那段
+  接法是标准的 stdio MCP 配置，但在你亲眼看到 `claude mcp list` 报健康之前，请按“未验证”对待。
 - **没有**覆盖的是：两台物理机器。DNS、路由、worker 的防火墙正是上面那份清单要解决的东西，
   也恰恰是实践中最先失败的部分。macOS 未验证。
 
