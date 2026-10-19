@@ -245,12 +245,14 @@ same conversation:
 
 > Now have it add a regression test for the bug it just fixed.
 
-That is a **second task**, not another message to the first one: pi gets a fresh
-session. It can pick up where it left off because it runs in the same `cwd` on B,
-where the edit is still on disk — worker memory never crosses the network. If
-task 1 had run on A instead, that patch would be on the wrong machine; that is
-what `handoff: {fromTaskId, inject: "diff"}` is for
-([`handoff.md`](./handoff.md#cross-host-handoff)). All four rules:
+For B to actually *remember* the first turn, Claude Code has to reuse the same
+worker: `spawn_worker` once, then pass that `workerId` to every `task_submit`.
+One worker on B is one pi session, so "what you just fixed" resolves on the far
+side. If it spawns a fresh worker instead, the second task still sees the files
+(same `cwd`) but not the reasoning — and if turn one had run on A, even the files
+would be on the wrong machine, which is what
+`handoff: {fromTaskId, inject: "diff"}` is for
+([`handoff.md`](./handoff.md#cross-host-handoff)). All five rules:
 [`two-host.md`](./two-host.md#the-loop-dispatch-result-continue).
 
 > The MCP server is a **child of the Claude Code session**: it lives and dies

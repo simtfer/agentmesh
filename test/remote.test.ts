@@ -614,6 +614,179 @@ test("runTurn transparently re-attaches after a mid-run drop (resume on)", async
 
 /* ------------------------- security unit guards ------------------------- */
 
+/**
+ * Open a socket, submit one frame, and resolve with either `submitted` or the
+ * `error` the daemon sent back. Used where the raw frame matters (workerRef).
+ */
+function submitFrame(
+  url: string,
+  body: Record<string, unknown>,
+): Promise<{ taskId?: string; workerRef?: string; code?: string }> {
+  return new Promise((resolve, reject) => {
+    const ws = new WS(`${url.replace(/^http/, "ws")}/ws`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    const done = (v: { taskId?: string; workerRef?: string; code?: string }) => {
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      resolve(v);
+    };
+    ws.on("error", reject);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "submit", submitId: randomUUID(), ...body })));
+    ws.on("message", (d) => {
+      const m = JSON.parse(d.toString()) as {
+        type: string;
+        taskId?: string;
+        workerRef?: string;
+        code?: string;
+      };
+      if (m.type === "submitted") done({ taskId: m.taskId, workerRef: m.workerRef });
+      if (m.type === "error") done({ code: m.code });
+    });
+  });
+}
+
+/** Poll until `fn()` is true, or fail after `timeoutMs`. */
+async function until(fn: () => boolean, timeoutMs = 3000): Promise<void> {
+  const started = Date.now();
+  while (!fn()) {
+    if (Date.now() - started > timeoutMs) throw new Error("condition not met in time");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+test("consecutive turns on one worker keep ONE session on the daemon", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  const orch = clientOrch(harness.url, dir);
+  try {
+    const workerId = await orch.spawnWorker("r-fast", { cwd: dir });
+    const wrec = orch.getWorkerRecord(workerId);
+    assert.ok(wrec, "worker should be registered locally");
+
+    const first = await wrec!.handle.runTurn("first question");
+    const second = await wrec!.handle.runTurn("second question");
+    assert.equal(first.status, "completed");
+    assert.equal(second.status, "completed");
+
+    // The point of workerRef: the second turn reused the same agent process on B
+    // instead of spawning a new one, so pi would still have the first turn's
+    // context. One worker, two tasks.
+    assert.equal(harness.dOrch.listWorkers().length, 1);
+  } finally {
+    await orch.shutdown();
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("separate workers do not share a session on the daemon", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  const orch = clientOrch(harness.url, dir);
+  try {
+    for (const prompt of ["one", "two"]) {
+      const workerId = await orch.spawnWorker("r-fast", { cwd: dir });
+      await orch.getWorkerRecord(workerId)!.handle.runTurn(prompt);
+    }
+    assert.equal(harness.dOrch.listWorkers().length, 2);
+  } finally {
+    await orch.shutdown();
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an unknown workerRef is refused instead of silently starting over", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  try {
+    const res = await submitFrame(harness.url, {
+      profile: "fast",
+      prompt: "continue the conversation",
+      cwd: dir,
+      workerRef: "w-does-not-exist",
+    });
+    assert.equal(res.code, "worker_ref_unknown");
+    assert.equal(harness.dOrch.listWorkers().length, 0);
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Submit and wait for the daemon to bind a worker (worker_bound). */
+function submitAndBind(
+  url: string,
+  body: Record<string, unknown>,
+): Promise<{ taskId: string; workerRef: string }> {
+  return new Promise((resolve, reject) => {
+    const ws = new WS(`${url.replace(/^http/, "ws")}/ws`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    let taskId: string | undefined;
+    const timer = setTimeout(() => {
+      ws.close();
+      reject(new Error("no worker_bound within 5s"));
+    }, 5000);
+    ws.on("error", reject);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "submit", submitId: randomUUID(), ...body })));
+    ws.on("message", (d) => {
+      const m = JSON.parse(d.toString()) as { type: string; taskId?: string; workerRef?: string };
+      if (m.type === "submitted" && m.taskId) taskId = m.taskId;
+      if (m.type === "worker_bound" && taskId && m.workerRef) {
+        clearTimeout(timer);
+        ws.close();
+        resolve({ taskId, workerRef: m.workerRef });
+      }
+    });
+  });
+}
+
+test("a conversation refuses a second turn while its first is still running", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  try {
+    const first = await submitAndBind(harness.url, {
+      profile: "slow",
+      prompt: "long turn",
+      cwd: dir,
+      timeoutMs: 10000,
+    });
+    const second = await submitFrame(harness.url, {
+      profile: "slow",
+      prompt: "interrupting turn",
+      cwd: dir,
+      workerRef: first.workerRef,
+    });
+    assert.equal(second.code, "worker_ref_busy");
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("closing a remote worker releases the session on the daemon", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir]);
+  const orch = clientOrch(harness.url, dir);
+  try {
+    const workerId = await orch.spawnWorker("r-fast", { cwd: dir });
+    await orch.getWorkerRecord(workerId)!.handle.runTurn("hello");
+    assert.equal(harness.dOrch.listWorkers().length, 1);
+
+    await orch.killWorker(workerId);
+    await until(() => harness.dOrch.listWorkers().length === 0);
+  } finally {
+    await orch.shutdown();
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("assertSafeBind refuses non-loopback without TLS", () => {
   assert.throws(() => assertSafeBind("0.0.0.0", false, false), SecurityError);
   assert.doesNotThrow(() => assertSafeBind("0.0.0.0", true, false)); // TLS ok

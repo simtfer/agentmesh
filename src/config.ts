@@ -72,6 +72,8 @@ const DaemonSettings = z.object({
     .optional(),
   exposeProfiles: z.array(z.string()).optional(),
   orphanGraceMs: z.number().int().nonnegative().optional(),
+  /** keep a reused worker alive this long after its last turn (0 = forever) */
+  workerIdleMs: z.number().int().nonnegative().optional(),
   auditPath: z.string().optional(),
   /** rotate the audit log at this many bytes (0 disables rotation) */
   auditMaxBytes: z.number().int().nonnegative().optional(),

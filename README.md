@@ -9,8 +9,10 @@ Claude Code master can drive Pi workers, an OpenCode master can drive Pi workers
 a Pi master can drive OpenCode workers, or anything else, with the same code.
 
 A task is one round trip — dispatch, result, decide — and that loop lives in the
-master, not in the adapter. Workers keep no memory between tasks; what carries
-over is the checkout they run in, or an explicit `handoff`.
+master, not in the adapter. Reuse one worker (`workerId`) and it keeps its session
+between turns, so the master can hold a real conversation with a worker on the
+other host; start a fresh one and what carries over is only the checkout, or an
+explicit `handoff`.
 
 ```
 ┌─────────────┐   MCP tools    ┌──────────────────────────┐   ACP (JSON-RPC/stdio)   ┌──────────────┐
@@ -27,7 +29,7 @@ over is the checkout they run in, or an explicit `handoff`.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/simtfer/agentmesh/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](https://github.com/simtfer/agentmesh/blob/main/package.json)
 
-129 offline tests on Linux and Windows · not published to npm yet
+134 offline tests on Linux and Windows · not published to npm yet
 
 ## What this is
 
@@ -276,7 +278,7 @@ non-error symptoms (daemon 401s, TLS failures):
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 129 tests, offline, no API cost, ~26s
+npm test            # 134 tests, offline, no API cost, ~27s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run check:pack  # publish tarball contains dist/, and no sources or tests
@@ -284,7 +286,7 @@ npm run deploy:tls  # real TLS/mTLS run over this host's LAN interface (not loop
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **129/129** across eleven files, offline, in about 26 seconds. Every
+`npm test` is **134/134** across eleven files, offline, in about 27 seconds. Every
 case drives a public surface (Orchestrator, MCP tools, or the daemon's HTTP/WS
 endpoints) and asserts the resulting task record, not a mock's internal calls.
 CI runs the same gate on Linux and Windows × Node 22 and 24

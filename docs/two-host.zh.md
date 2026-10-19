@@ -132,6 +132,7 @@ daemon:
   allowCwd: [/srv/repos]           # 必填：远程任务不能跑出这些根
   exposeProfiles: [pi]             # 可选；默认暴露所有非 remote 的 profile
   orphanGraceMs: 30000             # 默认 0——掉线后让任务多活这么久
+  workerIdleMs: 1800000            # 默认 30 分钟——被复用的 worker 活多久
   tls:
     cert: /etc/agentmesh/certs/server.pem
     key: /etc/agentmesh/certs/server-key.pem
@@ -152,9 +153,11 @@ daemon:
   给个宽限窗口，A 就能用 `resume: true` 重连并把同一轮跑完。
 - **`tls.ca`** 就是双向 TLS 的开关。填了之后，daemon 在握手阶段（解析任何请求之前）就要求由该 CA
   签发的客户端证书。
-- **`worktree: true`** 让每个任务在从仓库 HEAD 拉出的新 worktree 里跑。并行*写*任务该开，
-  串行链条不该开：下一个任务看不见上一个任务还没提交的文件。链式的活儿就关掉它——
+- **`worktree: true`** 让每个任务在自己的、从仓库 HEAD 拉出的 worktree 里跑。并行*写*任务该开；
+  串联链条只有**复用同一个 worker** 时才连贯，而释放该 worker 会删掉 worktree——先提交。
   见[闭环](#闭环下发回传再继续)。
+- **`workerIdleMs`** 给会话兜底。被复用的 worker 是这台机器上一个活着的、已登录的 agent；
+  `0` 表示留到 daemon 停止，默认 30 分钟表示“被遗忘的 master”最多占你半小时，而不是永久。
 - **`workdir`** 是 B 的状态，不是 A 的：任务库、worktree、暂存补丁的 `<workdir>/handoffs/` 都在这里。
   它不必位于 `allowCwd` 之内。
 
@@ -287,42 +290,50 @@ JSON 放在你运行 `claude` 的目录下的 `.mcp.json`（project scope，跟�
 
 ## 闭环：下发、回传、再继续
 
-一个任务就是一次往返。master 发出自包含的 prompt，B 上的 pi 用自己的工具、凭据和模型跑完，
-最终文本回到 A，由 master 决定下一步。除此之外没有共享：每个任务在 B 上都是新的 ACP 会话，
-跨机器过去的只有 prompt，以及你额外附上的 handoff 产物。
+master 是调度器：你跟它说话，它拆任务、下发给 B、再决定下一步。而这个循环里“B 是什么”，
+是可以选的：
+
+- **每个任务一个新 worker**（默认）。B 每次拉一个新的 agent 进程，上一个任务学到的东西不留。
+- **一个 worker 跑很多轮**——先 `spawn_worker`，之后一直用同一个 `workerId` 调 `task_submit`。
+  daemon 会把这个 worker 连着它的 ACP 会话和上下文一起留着。这才是“A 一直在跟 B 说话”的形态。
 
 ```
 Claude Code（A）                                   daemon（B）
-  |  task_submit {profile: worker-pi, prompt}  -->  拉起 pi，新开 ACP 会话
-  |                                                   |  干活；可能请求授权
-  |  <-- waiting {approvalId} ------------------------|
-  |  task_approve ---------------------------------->|  继续
-  |  <-- task_event ... succeeded --------------------|
-  |  task_result -> {text, structured?, usage}
-  |
-  +-- master 读完，决定：收工，还是再发一单
+  spawn_worker {profile: worker-pi}  ----------->  pi（worker w-8f2c）
+  task_submit {workerId, "跑一遍测试"}  --------->  同一个会话
+  <------------------------------------------  结果
+  task_submit {workerId, "把失败的修掉"}  -------->  同一个会话，还记得上文
+  <------------------------------------------  结果
+  kill_worker {workerId}  ---------------------->  释放
 ```
 
-第二单能不能真的接上第一单，取决于四条：
+复用能维持多久，取决于你手里的句柄：`kill_worker` 会释放它；闲置超过 `daemon.workerIdleMs`
+（默认 30 分钟）也会被回收。两条都是故意的——一个被复用的 worker，就是那台机器上一个活着的、
+已登录的 agent 进程。上一轮还没跑完就提交下一轮，会被拒成 `worker_ref_busy`，
+master 应该先等自己的任务，而不是把两段 prompt 塞进同一个会话。
 
-1. **B 上的 pi 不记得 A 的对话。** 每个任务都是新会话，所以“就按刚才说的”在对面等于没说。
-   目标、约束、期望的输出形态都得写进 prompt——和本地委派是同一条规矩，只是共享上下文更少。
-2. **B 上那份 checkout 才是真正的记忆。** 两个任务在同一个 `cwd` 里看到的是同一批文件，
-   所以“给刚修好的问题补个回归测试”能成立——原因是改动还在磁盘上，不是 agent 记得。
-   这也正是 B 侧 profile 开 `worktree: true` 会打断链条的原因：每个任务都从仓库 HEAD 拉一个新
-   worktree，看不见上一个任务还没提交的改动。并行独立任务用 worktree，串行链条用共享的 `cwd`。
-3. **跨机器的“继续”必须显式。** 第一单在 A 上跑、第二单在 B 上跑，文件就在错的那台机器上：
-   传 `handoff: {fromTaskId, inject: "diff"}` 让补丁按字节过去，或用 `inject: "result"` 把文本内联。
+第二轮回不回得到第一轮，取决于五条：
+
+1. **复用 worker 才是“记得”的来源。** 用同一个 `workerId` 时，B 的 agent 看得到自己上一轮的
+   文件改动、工具输出和判断；不复用，每个任务都是一个只读 prompt 的新 agent，prompt 必须自足。
+2. **新 worker 看得见 checkout，看不见对话。** 两个任务在同一个 `cwd` 里仍然看到同一批文件，
+   所以“给刚修好的问题补个回归测试”即使不复用也成立——前提是改动还在磁盘上。
+   传不过去的是那些只存在于对话里的东西。
+3. **`worktree: true` 只在复用期间成立。** 被复用的 worker 一直待在自己的 worktree 里，多轮是连贯的；
+   一旦换成新 worker，它就又从仓库 HEAD 拉一份，看不见前任没提交的改动——而 `kill_worker`
+   会删掉 worktree，所以要先提交再释放。
+4. **跨机器的“继续”必须显式。** 第一轮在 A 上跑、第二轮在 B 上跑，补丁就在错的那台机器上：
+   传 `handoff: {fromTaskId, inject: "diff"}` 让它按字节过去，或用 `inject: "result"` 把文本内联。
    远程后继用 `base: "predecessor"` 会被拒——commit 对象过不了主机边界。
    详见 [`handoff.md`](./handoff.md#cross-host-handoff)。
-4. **`resume: true` 管的是 socket，不是 agent。** 它只在连接掉线后把事件流重新接上；不会让 pi 的
-   会话在任务之间活着，也撑不过 daemon 重启。
+5. **`resume: true` 管的是 socket，不是 agent。** 它只在掉线后把事件流接回来；不会让会话在任务之间
+   活着，也撑不过 daemon 重启——只要 daemon 还在、ref 没过期，会话本身是活的。
 
 如果下一步取决于*回来的是什么*，给任务加 `outputSchema`（[`contracts.md`](./contracts.md)）：
 判定结果以 `structured` 回来，master 就能按数据分支，而不是从最终文本里抠字。
 
-落到双机部署上的结论：**链条**要一个共享的 `cwd` + B 侧 `worktree: false`；**扇出**多个独立写任务
-才要 `worktree: true`。一种形态一个 profile，比事后 debug“第二单为什么看不见第一单的文件”便宜。
+A 上建议备两个 profile，而不是硬凑一个：`worker-pi` 走链条（复用一个 worker、共享 `cwd`），
+`worker-pi-fanout` 在 B 侧开 `worktree: true`，留给并行的独立写任务。
 
 ## `cwd` 的契约
 
@@ -353,6 +364,7 @@ Claude Code（A）                                   daemon（B）
 | 4 | agent 能跑 | 用真实的 `pi` profile 跑 `dispatch` | 得到真实回答，且 B 的审计日志出现 `submit_ok` |
 | 5 | mTLS 生效 | 先不带 `remote.cert` 跑，再带上 | 第一次报 `alert certificate required`，第二次成功 |
 | 6 | 掉线可恢复 | 跑到一半掐掉连接（`orphanGraceMs` > 0、`resume: true`） | 任务照样跑完；事件被重放而不是重复 |
+| 7 | 会话能续 | 用同一个 `workerId` 连发两个 `task_submit`，再在 B 上 `agent_inspect` | 一个 worker、两个任务——第二轮还带着第一轮的上文 |
 
 第 1–5 级在本页写出来之前，已经在同一台机器上用私有 CA + TLS 端到端跑过（含 mTLS 开与关）；
 第 6 级由 `test/remote.test.ts` 覆盖。诚实的边界见[验证到了哪一步](#验证到了哪一步)。
@@ -428,6 +440,9 @@ reload 会拒绝空集合，所以打错字既不会让 daemon 变成免鉴权�
 | B 启动 | `tls_invalid` | cert/key/ca 路径读不到，或不是 PEM | 修路径与权限 |
 | B 运行 | `working directory not in whitelist: … (cwd_not_whitelisted)` | A 的 `cwd` 不在 `allowCwd` 里 | 两边对齐 |
 | B 运行 | `profile_not_allowed` | `remoteProfile` 没被暴露 | 加进 `exposeProfiles` |
+| B 运行 | `worker_ref_unknown` | 会话已过期（`workerIdleMs`）或被释放 | 丢掉 `workerId` 重新 spawn；那个会话已经没了 |
+| B 运行 | `worker_ref_busy` | 这个 worker 上一轮还在跑 | 先 `task_wait`；一个会话一次只吃一段 prompt |
+| B 运行 | `worker_ref_cwd_mismatch` | 想让被复用的 worker 换目录 | 会话的 `cwd` 固定；要换就 `kill_worker` 重开 |
 | B 审计 | `tls_reject` 带 `peer did not return a certificate` | 开了 mTLS，A 没带客户端证书 | 补 `remote.cert`/`remote.key` |
 | A | 升级连接时 `401` | token 不一致 | 两端同一个密钥 |
 | A | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | A 信任的 CA 不对 | `remote.ca` 指向 B 的 `ca.pem` |

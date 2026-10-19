@@ -22,6 +22,7 @@ master (machine A)                                  worker daemon (machine B)
 - [Start the daemon (machine B)](#start-the-daemon-machine-b)
 - [Point a master at it (machine A)](#point-a-master-at-it-machine-a)
 - [Handoff artifacts](#handoff-artifacts)
+- [Conversations: one worker, many turns](#conversations-one-worker-many-turns)
 - [Reconnect & reconciliation](#reconnect--reconciliation)
 - [Security model](#security-model)
 - [Remote tests](#remote-tests)
@@ -94,6 +95,52 @@ instead of being named by a path the other machine cannot see.
 
 Staged files are untrusted data, are written with mode 0600, and live next to the
 task store; the daemon does not delete them on its own.
+
+## Conversations: one worker, many turns
+
+By default a remote task gets a fresh worker on the daemon host: the agent
+process is spawned when the task starts, and nothing of it survives the result.
+That is the right default for independent work, and the wrong one for a
+conversation — where the master wants to say "now do X" and have the worker
+remember what it just did.
+
+The wire keeps that possible without inventing a session object:
+
+| frame | direction | meaning |
+|---|---|---|
+| `worker_bound { taskId, workerRef }` | daemon → client | the task started on a worker; this opaque ref is your handle to it |
+| `submit { …, workerRef }` | client → daemon | run this turn on that same worker (same ACP session, same cwd) |
+| `release { workerRef }` | client → daemon | close it; `released { workerRef, ok }` answers |
+| `submitted { …, workerRef }` | daemon → client | echoed when the submit reused an existing conversation |
+
+The client half is automatic: a `RemoteWorkerHandle` stores the ref it was given
+and sends it on the next `runTurn`, so `spawn_worker` + repeated
+`task_submit { workerId }` becomes a single remote session. `kill_worker` closes
+the handle and releases the ref.
+
+Rules the daemon enforces:
+
+- **One turn at a time.** A submit for a conversation whose previous task is still
+  running is refused (`worker_ref_busy`) rather than queued behind it — two
+  prompts must not interleave inside one agent session.
+- **A conversation cannot move.** `cwd` and profile are fixed when the worker is
+  created; a submit that asks for a different one is refused
+  (`worker_ref_cwd_mismatch`, `worker_ref_profile_mismatch`). Release and start a
+  new worker instead.
+- **Refs are capabilities.** They are random, minted only by this daemon, and
+  never reconstructed from a worker id. An unknown or expired ref is refused
+  (`worker_ref_unknown`) — never silently replaced by a fresh worker, which would
+  let a master believe it was continuing a thread it had actually lost.
+- **Conversations expire.** `daemon.workerIdleMs` (default 30 minutes, `0` = until
+  shutdown) reaps a worker that has had no turn. A reused worker is a live,
+  authenticated agent, so this is a resource bound, not a cache eviction.
+- **Nothing survives a daemon restart.** Refs live in memory; after a restart the
+  master starts a new conversation (task records, and any files the worker
+  committed, are still there).
+
+Optional, so version skew degrades instead of failing: a daemon that predates
+`workerRef` ignores it and runs a fresh worker; a client that predates
+`worker_bound` ignores the frame and behaves exactly as before.
 
 ## Reconnect & reconciliation
 
@@ -214,6 +261,8 @@ profiles:
 
 `test/remote.test.ts` boots an ephemeral loopback daemon against mocks and drives
 a real `RemoteWorkerDriver` client through it — dispatch + streamed events,
+worker conversations (one session across two turns, separate workers staying
+separate, `worker_ref_unknown`, `worker_ref_busy`, release on `kill_worker`),
 approval round-trip, cancel, bad-token rejection, cwd-whitelist refusal, the
 `/healthz` vs `/profiles` auth split, reconnect reconciliation (completed-task
 query, unknown-id → `undefined`, and a dropped mid-run connection reconciling to

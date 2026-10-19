@@ -124,6 +124,7 @@ daemon:
     # ca: ./certs/client-ca.pem      # enables mTLS client verification
   exposeProfiles: [opencode, pi]      # default: every non-remote profile
   orphanGraceMs: 30000                # keep a dropped task alive so a client can re-attach
+  workerIdleMs: 1800000               # reap a reused worker after 30 min idle (0 = never)
   auditPath: /var/log/agentmesh/daemon-audit.ndjson
   auditMaxBytes: 10485760             # rotate at 10 MiB (0 = never)
   auditKeep: 5                        # keep 5 archives: .1 = newest

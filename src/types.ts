@@ -230,6 +230,14 @@ export interface DaemonSettings {
    */
   orphanGraceMs?: number;
   /**
+   * How long a reused worker (one conversation's agent session) survives after
+   * its last turn. Default 30 minutes; `0` keeps it until the daemon stops.
+   * Reuse is what lets a remote master continue one conversation; the timer is
+   * what stops an abandoned conversation from leaving an authenticated agent
+   * running on this host.
+   */
+  workerIdleMs?: number;
+  /**
    * Path to an append-only NDJSON audit log of security-relevant control-plane
    * events (auth decisions, submits, approvals, cancels, reloads). Secrets are
    * never written — only a redacted fingerprint. Defaults to

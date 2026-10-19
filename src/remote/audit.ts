@@ -45,7 +45,11 @@ export type AuditEvent =
   | "orphan_scheduled"
   | "orphan_cancelled"
   | "token_reload"
-  | "token_reload_rejected";
+  | "token_reload_rejected"
+  | "worker_created"
+  | "worker_released"
+  | "worker_reaped"
+  | "release";
 
 export interface AuditRecord {
   /** ISO-8601 timestamp, assigned at record() time. */

@@ -11,7 +11,10 @@
  * exposed, and only to authenticated callers over TLS (or loopback for dev).
  */
 
-/** v2: `submit` may carry handoff artifacts (base64 + sha256). */
+/** v2: `submit` may carry handoff artifacts (base64 + sha256);
+ *  `submit.workerRef` / `submitted.workerRef` add per-conversation worker reuse,
+ *  and `release` frees one. Both additions are optional, so a peer that does not
+ *  understand them degrades to "a fresh worker per task" instead of failing. */
 export const PROTOCOL_VERSION = 2;
 
 /** Oldest daemon a client may send `submit.artifacts` to. */
@@ -60,6 +63,13 @@ export interface SubmitMsg {
    * on a machine it cannot see.
    */
   artifacts?: ArtifactMsg[];
+  /**
+   * Reuse a live worker on the daemon host, so consecutive tasks share one ACP
+   * session (and therefore one conversation). The value is opaque and issued by
+   * the daemon in `submitted`; omit it to get a fresh worker. Treat it as a
+   * capability: it is unguessable, and a daemon will refuse one it did not mint.
+   */
+  workerRef?: string;
 }
 
 export interface ApproveMsg {
@@ -78,6 +88,16 @@ export interface RespondMsg {
 export interface CancelMsg {
   type: "cancel";
   taskId: string;
+}
+
+/**
+ * Close a reused worker and free its session on the daemon. Optional and
+ * best-effort: idle conversations are reaped anyway, this just stops paying for
+ * an agent process the master already gave up on.
+ */
+export interface ReleaseMsg {
+  type: "release";
+  workerRef: string;
 }
 
 /**
@@ -121,6 +141,7 @@ export type ClientMsg =
   | CancelMsg
   | QueryMsg
   | AttachMsg
+  | ReleaseMsg
   | PingMsg;
 
 /* ----------------------------- server → client ---------------------------- */
@@ -129,6 +150,12 @@ export interface SubmittedMsg {
   type: "submitted";
   submitId: string;
   taskId: string;
+  /**
+   * Handle to the worker running this task. Pass it back on the next `submit` to
+   * keep the same agent session; drop it (or `release` it) to start over. Absent
+   * from a daemon that predates worker reuse.
+   */
+  workerRef?: string;
 }
 
 /**
@@ -184,6 +211,25 @@ export interface PongMsg {
   type: "pong";
 }
 
+/**
+ * The daemon bound a task to a worker and minted a ref for it: the next `submit`
+ * may pass `workerRef` to keep talking to the same agent session. Sent when the
+ * task actually starts, because the worker is spawned by the scheduler then —
+ * issuing the ref at submit time would require spawning ahead of the queue.
+ */
+export interface WorkerBoundMsg {
+  type: "worker_bound";
+  taskId: string;
+  workerRef: string;
+}
+
+/** Acknowledge a `release`. `ok` is false when the ref was already gone. */
+export interface ReleasedMsg {
+  type: "released";
+  workerRef: string;
+  ok: boolean;
+}
+
 export interface WelcomeMsg {
   type: "welcome";
   protocol: number;
@@ -199,7 +245,9 @@ export type ServerMsg =
   | QueryResultMsg
   | AttachedMsg
   | ErrorMsg
-  | PongMsg;
+  | PongMsg
+  | ReleasedMsg
+  | WorkerBoundMsg;
 
 /* --------------------------------- helpers -------------------------------- */
 
@@ -241,6 +289,7 @@ export function parseClientMsg(raw: string): ClientMsg | undefined {
           }
         }
       }
+      if (v.workerRef !== undefined && typeof v.workerRef !== "string") return undefined;
       return v as unknown as SubmitMsg;
     case "approve":
       if (typeof v.approvalId !== "string" || typeof v.decision !== "string") return undefined;
@@ -258,6 +307,9 @@ export function parseClientMsg(raw: string): ClientMsg | undefined {
       if (typeof v.attachId !== "string" || typeof v.taskId !== "string") return undefined;
       if (v.afterSequence !== undefined && typeof v.afterSequence !== "number") return undefined;
       return v as unknown as AttachMsg;
+    case "release":
+      if (typeof v.workerRef !== "string") return undefined;
+      return v as unknown as ReleaseMsg;
     case "ping":
       return { type: "ping" };
     default:

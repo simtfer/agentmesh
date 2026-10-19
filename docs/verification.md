@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 129 tests, offline, ~26s
+npm test            # 134 tests, offline, ~27s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -288,7 +288,7 @@ Two guards on what a fan-out costs *while it runs*: approval width and spend.
   the budget open: `budget.spentCost` shows `[{ USD, 10 }]` and the next submit is
   admitted.
 
-## `test/remote.test.ts` — 18 cases
+## `test/remote.test.ts` — 23 cases
 
 Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
 
@@ -307,6 +307,11 @@ Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
 - **Resumption.** `attach` resumes a dropped-but-grace task and streams it to
   success; `afterSequence` replays only newer events; attaching to an unknown task
   rejects; `runTurn` transparently re-attaches after a mid-run drop.
+- **Conversations.** Two turns on one client-side worker keep ONE worker on the
+  daemon (the session the master is talking to); two separate workers stay
+  separate; an unknown `workerRef` is refused instead of silently starting over;
+  a second turn while the first is running is refused (`worker_ref_busy`);
+  `kill_worker` releases the daemon-side session.
 - **Audit.** The daemon writes a structured NDJSON trail and never the token in
   cleartext.
 

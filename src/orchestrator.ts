@@ -179,6 +179,12 @@ export class Orchestrator {
     return rec ? describeWorker(rec, recentEvents) : undefined;
   }
 
+  /** Raw worker record (not the described view) — used by the daemon to reuse
+   *  a conversation's worker, where its cwd and profile must be exact. */
+  getWorkerRecord(id: string) {
+    return this.registry.get(id);
+  }
+
   async spawnWorker(
     profileName: string,
     opts: { cwd?: string; worktree?: boolean; baseCommit?: string } = {},

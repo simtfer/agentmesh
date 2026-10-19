@@ -97,6 +97,13 @@ class RemoteWorkerHandle implements WorkerHandle {
   private activeTaskId?: string;
   private closed = false;
 
+  /**
+   * The daemon-side worker this handle is talking to. Sent back on every submit
+   * so consecutive tasks stay in ONE agent session on the other host; that is
+   * what turns "one task per dispatch" into an actual conversation.
+   */
+  private workerRef?: string;
+
   constructor(
     readonly id: string,
     readonly profile: string,
@@ -238,6 +245,7 @@ class RemoteWorkerHandle implements WorkerHandle {
               profile: remoteProfile,
               prompt: text,
               cwd: this.cwd,
+              ...(this.workerRef ? { workerRef: this.workerRef } : {}),
               ...(attachments && attachments.length > 0
                 ? {
                     artifacts: attachments.map((a) => ({
@@ -317,7 +325,16 @@ class RemoteWorkerHandle implements WorkerHandle {
           );
         }
         return;
+      case "worker_bound":
+        // Minted when the task starts; the next turn on this handle will reuse
+        // that agent session instead of spawning a new one.
+        this.workerRef = msg.workerRef;
+        return;
       case "submitted":
+        // Keep the daemon's handle so the next turn continues this conversation.
+        // An older daemon omits it; the next turn then starts a fresh worker,
+        // which is exactly the pre-reuse behaviour.
+        if (typeof msg.workerRef === "string") this.workerRef = msg.workerRef;
         ctx.setTaskId(msg.taskId);
         return;
       case "task_event":
@@ -400,12 +417,18 @@ class RemoteWorkerHandle implements WorkerHandle {
 
   async close(_reason = "remote worker closed"): Promise<void> {
     this.closed = true;
+    const ref = this.workerRef;
+    this.workerRef = undefined;
     try {
       this.activeWs?.close();
     } catch {
       /* ignore */
     }
     this.activeWs = undefined;
+    // Hand the agent process back. Best-effort: if the daemon is unreachable the
+    // conversation is reaped by its idle timer, which is why this is not awaited
+    // for longer than a couple of seconds and never throws.
+    if (ref) await releaseRemoteWorker(this.wp.remote, ref).catch(() => {});
   }
 }
 
@@ -505,6 +528,60 @@ export function queryRemoteTask(
     ws.on("close", () => {
       done(() => reject(new Error("query: daemon closed the connection before answering")));
     });
+  });
+}
+
+/**
+ * Tell the daemon to close a reused worker (one conversation's agent session).
+ * Short-lived connection, 2s budget, resolves `true` when the daemon acknowledged
+ * the release. Never used on the hot path: `close()` calls it best-effort so an
+ * abandoned conversation does not keep an authenticated agent process alive.
+ */
+export function releaseRemoteWorker(
+  remote: RemoteSettings | undefined,
+  workerRef: string,
+): Promise<boolean> {
+  if (!remote?.endpoint) return Promise.resolve(false);
+  const token = resolveToken(remote.tokenEnv);
+  if (!token) return Promise.resolve(false);
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      resolve(ok);
+    };
+
+    const ws = new WSClient(toWsUrl(remote.endpoint), {
+      headers: { authorization: `Bearer ${token}` },
+      maxPayload: MAX_PAYLOAD_BYTES,
+      handshakeTimeout: Math.min(remote.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS, 2000),
+      ...tlsOptions(remote),
+    });
+    const timer = setTimeout(() => done(false), 2000);
+    if (timer.unref) timer.unref();
+
+    ws.on("open", () => ws.send(encode({ type: "release", workerRef } satisfies ClientMsg)));
+    ws.on("message", (data) => {
+      let msg: unknown;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+      if (isRecord(msg) && msg.type === "released" && msg.workerRef === workerRef) {
+        done(msg.ok === true);
+      }
+    });
+    ws.on("error", () => done(false));
+    ws.on("close", () => done(false));
   });
 }
 

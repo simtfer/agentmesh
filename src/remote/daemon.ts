@@ -67,6 +67,13 @@ export interface WorkerDaemonOptions {
   orphanGraceMs?: number;
   /** inject a custom audit sink (tests); defaults to the configured file log */
   audit?: AuditLog;
+  /**
+   * How long a reused worker (one conversation's ACP session) is kept after its
+   * last turn before being reaped. Default 30 min; 0 disables reaping, which
+   * leaves an agent process — logged in, with tools — alive until the daemon
+   * stops. Reuse exists so a master can talk to the same agent repeatedly.
+   */
+  workerIdleMs?: number;
 }
 
 const TERMINAL_EVENT_TYPES = new Set(["completed", "failed", "cancelled", "timed_out"]);
@@ -117,6 +124,20 @@ export class WorkerDaemon {
   private taskOwner = new Map<string, SocketState>();
   /** pending orphan-cancel timers, cleared if a client re-attaches in time */
   private orphanTimers = new Map<string, NodeJS.Timeout>();
+  /**
+   * Conversations: an opaque ref → the local worker that owns its ACP session.
+   * This is what makes a remote master able to talk to the SAME agent turn after
+   * turn instead of briefing a new one each time. `active` guards against two
+   * turns running on one worker at once.
+   */
+  private conversations = new Map<
+    string,
+    { workerId: string; lastUsedAt: number; active: Set<string> }
+  >();
+  /** task → conversation, so a terminal event frees the worker for the next turn */
+  private taskRef = new Map<string, string>();
+  private workerIdleMs: number;
+  private reaper?: NodeJS.Timeout;
 
   constructor(private opts: WorkerDaemonOptions) {
     this.host = opts.host ?? "127.0.0.1";
@@ -125,6 +146,7 @@ export class WorkerDaemon {
     this.daemonId = opts.daemonId ?? `daemon-${randomUUID().slice(0, 8)}`;
     this.heartbeatMs = opts.heartbeatMs ?? 20000;
     this.orphanGraceMs = opts.orphanGraceMs ?? opts.config.daemon?.orphanGraceMs ?? 0;
+    this.workerIdleMs = opts.workerIdleMs ?? opts.config.daemon?.workerIdleMs ?? 30 * 60_000;
     this.tokens = this.resolveTokens();
     this.exposedProfiles = this.computeExposedProfiles();
     this.audit =
@@ -383,11 +405,14 @@ export class WorkerDaemon {
       return;
     }
     switch (msg.type) {
+      case "release":
+        void this.handleRelease(state, msg);
+        return;
       case "ping":
         this.send(state, { type: "pong" });
         return;
       case "submit":
-        this.handleSubmit(state, msg);
+        void this.handleSubmit(state, msg);
         return;
       case "approve":
         this.audit.record("approve", {
@@ -440,7 +465,7 @@ export class WorkerDaemon {
     }
   }
 
-  private handleSubmit(state: SocketState, msg: import("./protocol.js").SubmitMsg): void {
+  private async handleSubmit(state: SocketState, msg: import("./protocol.js").SubmitMsg): Promise<void> {
     const orch = this.opts.orchestrator;
     const profile = msg.profile;
     if (!this.exposedProfiles.includes(profile)) {
@@ -458,27 +483,88 @@ export class WorkerDaemon {
       return;
     }
 
-    // Confine the working directory to the whitelist before any agent starts.
-    let cwd: string;
-    try {
-      const requested = msg.cwd ?? orch.baseCwd;
-      cwd = assertCwdAllowed(requested, this.allowCwd);
-    } catch (e) {
-      // The prompt is untrusted master content and is never logged; the
-      // requested cwd is recorded because a whitelist escape is the signal here.
+    // A `workerRef` turns this submit into the next turn of an existing
+    // conversation: same worker, same agent session, same directory.
+    const conv = msg.workerRef ? this.conversations.get(msg.workerRef) : undefined;
+    const reject = (code: string, message: string, reason = code) => {
       this.audit.record("submit_rejected", {
         connId: state.connId,
-        reason: "cwd_not_whitelisted",
+        reason,
         profile,
-        requestedCwd: msg.cwd ?? orch.baseCwd,
+        ...(msg.workerRef ? { workerRef: msg.workerRef } : {}),
+        ...(msg.cwd ? { requestedCwd: msg.cwd } : {}),
       });
-      this.send(state, {
-        type: "error",
-        submitId: msg.submitId,
-        message: e instanceof Error ? e.message : String(e),
-        code: e instanceof SecurityError ? e.code : "cwd_not_whitelisted",
-      });
+      this.send(state, { type: "error", submitId: msg.submitId, message, code });
+    };
+
+    if (msg.workerRef && !conv) {
+      // Expired, released, or minted by another daemon: never silently fall back
+      // to a fresh worker — the master would believe it was continuing a thread.
+      reject(
+        "worker_ref_unknown",
+        "unknown workerRef: the conversation expired or was released",
+        "worker_ref_unknown",
+      );
       return;
+    }
+    if (conv && conv.active.size > 0) {
+      reject(
+        "worker_ref_busy",
+        "this conversation still has a running task; wait for it before the next turn",
+        "worker_ref_busy",
+      );
+      return;
+    }
+
+    // Confine the working directory to the whitelist before any agent starts.
+    // A conversation keeps the directory it was created with; re-checking a
+    // follow-up that omits `cwd` would reject a legitimate turn.
+    let cwd: string;
+    if (conv) {
+      const wrec = orch.getWorkerRecord(conv.workerId);
+      if (!wrec) {
+        this.conversations.delete(msg.workerRef!);
+        reject("worker_ref_unknown", "the worker behind this conversation is gone", "worker_ref_lost");
+        return;
+      }
+      if (wrec.profileName !== profile) {
+        reject(
+          "worker_ref_profile_mismatch",
+          `this conversation belongs to profile "${wrec.profileName}", not "${profile}"`,
+          "worker_ref_profile_mismatch",
+        );
+        return;
+      }
+      if (msg.cwd && path.resolve(msg.cwd) !== path.resolve(wrec.cwd)) {
+        reject(
+          "worker_ref_cwd_mismatch",
+          `a conversation cannot move: it runs in ${wrec.cwd}; release the ref to start elsewhere`,
+          "worker_ref_cwd_mismatch",
+        );
+        return;
+      }
+      cwd = wrec.cwd;
+    } else {
+      try {
+        const requested = msg.cwd ?? orch.baseCwd;
+        cwd = assertCwdAllowed(requested, this.allowCwd);
+      } catch (e) {
+        // The prompt is untrusted master content and is never logged; the
+        // requested cwd is recorded because a whitelist escape is the signal here.
+        this.audit.record("submit_rejected", {
+          connId: state.connId,
+          reason: "cwd_not_whitelisted",
+          profile,
+          requestedCwd: msg.cwd ?? orch.baseCwd,
+        });
+        this.send(state, {
+          type: "error",
+          submitId: msg.submitId,
+          message: e instanceof Error ? e.message : String(e),
+          code: e instanceof SecurityError ? e.code : "cwd_not_whitelisted",
+        });
+        return;
+      }
     }
 
     // Artifacts travel with the submit (cross-host handoff). Stage them in the
@@ -511,12 +597,20 @@ export class WorkerDaemon {
     // path here; resolve them now that the bytes are on this host.
     const prompt = substituteArtifacts(msg.prompt, staged);
 
+    // A new conversation does NOT spawn its worker here: the task machine spawns
+    // it when the task actually starts, so the scheduler's concurrency cap still
+    // bounds how many agent processes exist (pre-spawning would put one behind
+    // every queued task). The ref is therefore issued when the task starts — see
+    // onTaskEvent — which is well before the next turn needs it.
+    if (conv) conv.lastUsedAt = Date.now();
+
     let record;
     try {
       record = orch.submitTask(
         {
           prompt,
           profile,
+          ...(conv ? { workerId: conv.workerId } : {}),
           cwd,
           timeoutMs: msg.timeoutMs,
           idempotencyKey: msg.idempotencyKey,
@@ -550,16 +644,75 @@ export class WorkerDaemon {
 
     state.tasks.add(record.taskId);
     this.taskOwner.set(record.taskId, state);
+    if (conv) {
+      // A reused worker is busy until this turn's terminal event.
+      conv.active.add(record.taskId);
+      this.taskRef.set(record.taskId, msg.workerRef!);
+    }
     this.audit.record("submit_ok", {
       connId: state.connId,
       taskId: record.taskId,
       profile,
       cwd,
+      ...(conv ? { workerRef: msg.workerRef, reused: true } : { reused: false }),
       ...(staged.length > 0
         ? { artifacts: staged.length, artifactBytes: staged.reduce((n, a) => n + a.bytes, 0) }
         : {}),
     });
-    this.send(state, { type: "submitted", submitId: msg.submitId, taskId: record.taskId });
+    this.send(state, {
+      type: "submitted",
+      submitId: msg.submitId,
+      taskId: record.taskId,
+      ...(conv ? { workerRef: msg.workerRef } : {}),
+    });
+  }
+
+  /**
+   * Free a conversation on request. Best-effort by design: the master closes a
+   * handle it may never have used, and a missing ref is not an error worth
+   * failing a shutdown over.
+   */
+  private async handleRelease(
+    state: SocketState,
+    msg: import("./protocol.js").ReleaseMsg,
+  ): Promise<void> {
+    const ok = await this.releaseConversation(msg.workerRef);
+    this.audit.record("release", { connId: state.connId, workerRef: msg.workerRef, ok });
+    this.send(state, { type: "released", workerRef: msg.workerRef, ok });
+  }
+
+  private async releaseConversation(ref: string): Promise<boolean> {
+    const conv = this.conversations.get(ref);
+    if (!conv) return false;
+    this.conversations.delete(ref);
+    for (const taskId of conv.active) this.taskRef.delete(taskId);
+    await this.opts.orchestrator.killWorker(conv.workerId).catch(() => {});
+    this.audit.record("worker_released", { workerRef: ref, workerId: conv.workerId });
+    return true;
+  }
+
+  /** Reap conversations that have been idle past `workerIdleMs`. */
+  private async reapIdleWorkers(): Promise<void> {
+    const cutoff = Date.now() - this.workerIdleMs;
+    for (const [ref, conv] of [...this.conversations]) {
+      if (conv.active.size > 0 || conv.lastUsedAt > cutoff) continue;
+      this.conversations.delete(ref);
+      await this.opts.orchestrator.killWorker(conv.workerId).catch(() => {});
+      this.audit.record("worker_reaped", {
+        workerRef: ref,
+        workerId: conv.workerId,
+        idleMs: Date.now() - conv.lastUsedAt,
+      });
+    }
+  }
+
+  private async releaseAllConversations(): Promise<void> {
+    for (const [ref, conv] of [...this.conversations]) {
+      this.conversations.delete(ref);
+      await this.opts.orchestrator.killWorker(conv.workerId).catch(() => {});
+      this.audit.record("worker_released", { workerRef: ref, workerId: conv.workerId });
+    }
+    this.taskRef.clear();
   }
 
   /**
@@ -630,6 +783,45 @@ export class WorkerDaemon {
 
   private onTaskEvent(state: SocketState, ev: TaskEvent): void {
     const terminal = TERMINAL_EVENT_TYPES.has(ev.type);
+
+    // Bind a new conversation the moment its worker exists. Everything that
+    // follows (approvals, events, the result) already flows on this socket; this
+    // only tells the client which handle to bring back for the next turn.
+    if (ev.type === "started" && !this.taskRef.has(ev.taskId)) {
+      const workerId = ev.workerId ?? this.opts.orchestrator.taskStatus(ev.taskId)?.workerId;
+      if (workerId) {
+        const ref = `w-${randomUUID()}`;
+        this.conversations.set(ref, {
+          workerId,
+          lastUsedAt: Date.now(),
+          active: new Set([ev.taskId]),
+        });
+        this.taskRef.set(ev.taskId, ref);
+        if (!state.closed) {
+          this.send(state, { type: "worker_bound", taskId: ev.taskId, workerRef: ref });
+        }
+        this.audit.record("worker_created", {
+          connId: state.connId,
+          workerRef: ref,
+          workerId,
+          taskId: ev.taskId,
+        });
+      }
+    }
+
+    if (terminal) {
+      // The conversation's worker is free again; its session stays alive so the
+      // next turn continues the same thread.
+      const ref = this.taskRef.get(ev.taskId);
+      if (ref) {
+        this.taskRef.delete(ev.taskId);
+        const conv = this.conversations.get(ref);
+        if (conv) {
+          conv.active.delete(ev.taskId);
+          conv.lastUsedAt = Date.now();
+        }
+      }
+    }
     if (!state.closed) {
       this.send(state, { type: "task_event", taskId: ev.taskId, event: ev });
     }
@@ -695,6 +887,17 @@ export class WorkerDaemon {
     }, this.heartbeatMs);
     if (this.heartbeat.unref) this.heartbeat.unref();
 
+    // Reap conversations nobody came back to. A reused worker is a whole agent
+    // process, authenticated on this host: keeping it forever would turn every
+    // abandoned master into a resident agent.
+    if (this.workerIdleMs > 0) {
+      this.reaper = setInterval(
+        () => void this.reapIdleWorkers(),
+        Math.min(this.workerIdleMs, 60_000),
+      );
+      if (this.reaper.unref) this.reaper.unref();
+    }
+
     const scheme = this.opts.config.daemon?.tls || this.opts.tls ? "https" : "http";
     this.audit.record("daemon_start", {
       host: this.host,
@@ -709,6 +912,8 @@ export class WorkerDaemon {
 
   async stop(): Promise<void> {
     if (this.heartbeat) clearInterval(this.heartbeat);
+    if (this.reaper) clearInterval(this.reaper);
+    await this.releaseAllConversations();
     for (const timer of this.orphanTimers.values()) clearTimeout(timer);
     this.orphanTimers.clear();
     this.taskOwner.clear();

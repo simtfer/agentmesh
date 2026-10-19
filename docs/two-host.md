@@ -147,6 +147,7 @@ daemon:
   allowCwd: [/srv/repos]           # required: remote tasks may not run outside these
   exposeProfiles: [pi]             # optional; defaults to every non-remote profile
   orphanGraceMs: 30000             # default 0 — keep a dropped task alive this long
+  workerIdleMs: 1800000            # default 30 min — how long a reused worker lives
   tls:
     cert: /etc/agentmesh/certs/server.pem
     key: /etc/agentmesh/certs/server-key.pem
@@ -170,10 +171,13 @@ Why each of the load-bearing ones exists:
   a grace window lets A re-attach (`resume: true`) and keep the same run.
 - **`tls.ca`** is the mTLS switch. Present ⇒ the daemon requires a client
   certificate signed by that CA at the handshake, before any request is parsed.
-- **`worktree: true`** isolates each task in a fresh worktree branched from the
-  repo's HEAD. Right for parallel *write* tasks, wrong for a chain: the next task
-  cannot see the previous task's uncommitted files. Leave it off when the loop is
-  sequential — see [The loop](#the-loop-dispatch-result-continue).
+- **`worktree: true`** puts each task in its own worktree branched from the repo's
+  HEAD. Right for parallel *write* tasks; for a chain, only a *reused* worker keeps
+  it coherent, and releasing that worker deletes the worktree — commit first.
+  See [The loop](#the-loop-dispatch-result-continue).
+- **`workerIdleMs`** bounds a conversation. A reused worker is a live, logged-in
+  agent on this host; `0` means "keep it until the daemon stops", the default 30
+  minutes means an abandoned master costs you half an hour of that, not forever.
 - **`workdir`** is B's state, not A's: the task store, worktrees and
   `<workdir>/handoffs/` for staged patches all live here. It does not have to be
   inside `allowCwd`.
@@ -319,54 +323,65 @@ process that submitted.
 
 ## The loop: dispatch, result, continue
 
-One task is one round trip. The master sends a self-contained prompt, B's pi runs
-it with its own tools, credentials and model, the final text comes back to A, and
-the master decides what happens next. Nothing else is shared: each task is a new
-ACP session on B, and the only state that crosses the machine is the prompt —
-plus any handoff artifact the master attaches.
+The master is the scheduler: you talk to it, it decomposes the work, it dispatches
+to B, and it decides what happens next. What B *is* during that loop is a choice:
+
+- **A fresh worker per task** (the default). B gets a new agent process each time,
+  so nothing the previous task learned survives.
+- **One worker for many turns** — `spawn_worker` once, then `task_submit` with that
+  `workerId`. The daemon keeps the worker, and therefore its ACP session and its
+  context, alive between tasks. That is the "A keeps talking to B" shape.
 
 ```
 Claude Code (A)                                    daemon (B)
-  |  task_submit {profile: worker-pi, prompt}  -->  spawns pi, new ACP session
-  |                                                   |  works; may need permission
-  |  <-- waiting {approvalId} ------------------------|
-  |  task_approve ---------------------------------->|  continues
-  |  <-- task_event ... succeeded --------------------|
-  |  task_result -> {text, structured?, usage}
-  |
-  +-- master reads it, then decides: done, or one more task_submit
+  spawn_worker {profile: worker-pi}  ----------->  pi (worker w-8f2c)
+  task_submit {workerId, "run the tests"}  ------>  same session
+  <------------------------------------------  result
+  task_submit {workerId, "now fix what failed"} ->  same session, still remembers
+  <------------------------------------------  result
+  kill_worker {workerId}  ---------------------->  released
 ```
 
-Four rules decide whether the second task actually continues the first.
+Reuse lasts as long as the handle: `kill_worker` releases it, and the daemon
+reaps a conversation idle for `daemon.workerIdleMs` (default 30 minutes). Both
+are deliberate — a reused worker is a whole agent process, authenticated on that
+host. A second turn submitted while the first is still running is refused with
+`worker_ref_busy`, so the master waits for its own task rather than interleaving
+two prompts into one session.
 
-1. **B's pi does not remember A's conversation.** Every task starts a fresh
-   session, so "as we discussed" means nothing on the other side. The prompt has
-   to carry the objective, the constraints and the expected output shape — the
-   same rule as local delegation, with even less shared context.
-2. **The checkout on B is the real memory.** Two tasks in the same `cwd` see the
-   same files, so *"now add a regression test for what you just fixed"* works
-   because the edit is still on disk, not because the agent remembers it. That is
-   also why `worktree: true` on B's profile breaks a chain: each task branches
-   from the repo's HEAD and cannot see the previous task's uncommitted work. Use
-   worktrees for parallel independent tasks, a shared `cwd` for a sequence.
-3. **Continuation across hosts is explicit.** If task 1 ran on A and task 2 runs
-   on B, the file is on the wrong machine: pass
-   `handoff: {fromTaskId, inject: "diff"}` and the patch travels as bytes, or
+Five rules decide whether turn two actually continues turn one.
+
+1. **Reusing the worker is what keeps the conversation.** With a reused
+   `workerId`, B's agent sees its own previous turn — including files it wrote,
+   tool output it read, and what it decided. Without one, every task is a new
+   agent reading a prompt that must stand on its own.
+2. **A fresh worker sees the checkout, not the chat.** Two tasks in the same
+   `cwd` still see the same files, so *"now add a regression test for what you
+   just fixed"* works even without reuse — as long as the edits are on disk. What
+   does not transfer is anything the agent only knew from the conversation.
+3. **`worktree: true` holds while you reuse the worker, and only then.** A reused
+   worker keeps its own worktree, so its turns stay coherent. The moment you
+   start a fresh worker it branches from the repo's HEAD and cannot see the
+   predecessor's uncommitted work — and `kill_worker` deletes the worktree, so
+   release after committing, not before.
+4. **Cross-host continuation is explicit.** If turn one ran on A and turn two runs
+   on B, the patch is on the wrong machine: pass
+   `handoff: {fromTaskId, inject: "diff"}` and it travels as bytes, or
    `inject: "result"` to inline the text. `base: "predecessor"` is refused for a
    remote successor — a commit object does not cross a host boundary.
    [`handoff.md`](./handoff.md#cross-host-handoff).
-4. **`resume: true` is about the socket, not the agent.** It re-attaches the
-   event stream after a dropped connection. It does not keep pi's session alive
-   between tasks, and it does not survive a daemon restart.
+5. **`resume: true` is about the socket, not the agent.** It re-attaches the
+   event stream after a dropped connection. It does not keep a session alive
+   between tasks, and it does not survive a daemon restart — the conversation
+   does, as long as the daemon stays up and the ref has not expired.
 
 If the next step depends on *what* came back, give the task an `outputSchema`
 ([`contracts.md`](./contracts.md)): the verdict arrives as `structured`, so the
 master branches on data instead of parsing prose out of the final text.
 
-The practical consequence for the two-host setup: a *chain* wants one shared
-`cwd` with `worktree: false` on B, while a *fan-out* of independent writers wants
-`worktree: true`. One profile per shape is cheaper than debugging why the second
-task cannot see the first task's files.
+Two profiles are worth having on A rather than one clever one: `worker-pi` for
+chains (one reused worker in a shared `cwd`) and `worker-pi-fanout` with
+`worktree: true` on B for independent parallel writes.
 
 ## The `cwd` contract
 
@@ -400,6 +415,7 @@ failure at rung *n* means everything below it is fine.
 | 4 | the agent works | `dispatch` with the real `pi` profile | a real answer, and B's audit log gets `submit_ok` |
 | 5 | mTLS works | dispatch without `remote.cert`, then with it | first fails with `alert certificate required`, second succeeds |
 | 6 | a drop is survivable | kill the socket mid-run (`orphanGraceMs` > 0, `resume: true`) | the task finishes; events are replayed, not duplicated |
+| 7 | a conversation survives | two `task_submit`s with the same `workerId`, then `agent_inspect` on B | one worker, two tasks — the second turn still had the first in context |
 
 Rungs 1–5 were run end to end over TLS with a private CA on one machine before
 this page was written; rung 6 is covered by `test/remote.test.ts`. See
@@ -489,6 +505,9 @@ Messages below are the ones the code actually emits.
 | B startup | `tls_invalid` | cert/key/ca path unreadable, or not a PEM block | fix path and permissions |
 | B runtime | `working directory not in whitelist: … (cwd_not_whitelisted)` | A's `cwd` is not inside `allowCwd` | align the two |
 | B runtime | `profile_not_allowed` | `remoteProfile` not exposed | add it to `exposeProfiles` |
+| B runtime | `worker_ref_unknown` | the conversation expired (`workerIdleMs`) or was released | drop the `workerId` and spawn a new worker; the session is gone |
+| B runtime | `worker_ref_busy` | a turn on that worker is still running | `task_wait` for it; one session takes one prompt at a time |
+| B runtime | `worker_ref_cwd_mismatch` | a reused worker was asked to move directory | a conversation keeps its `cwd`; `kill_worker` and start elsewhere |
 | B audit | `tls_reject` with `peer did not return a certificate` | mTLS on, A sent no client cert | add `remote.cert`/`remote.key` |
 | A | `401` on upgrade | token mismatch | same secret on both sides |
 | A | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | A trusts a different CA | point `remote.ca` at B's `ca.pem` |

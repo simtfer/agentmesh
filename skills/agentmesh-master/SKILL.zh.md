@@ -46,7 +46,9 @@ agent_list ─▶ 规划/拆解 ─▶ scheduler_status ─▶ task_submit（×N
 
 1. **发现。** `agent_list` → 有哪些 profile、哪些 worker 在线。按任务性质匹配 profile：
    只读研究/分析 vs 写代码 vs 需审批。需要沿用某个在线 worker 上下文的后续任务，用
-   `workerId` 复用它；相互独立的新活，用 `profile` 新起。
+   `workerId` 复用它——**跨远程 daemon 也成立**：daemon 会在两轮之间保留该 worker 的会话，
+   所以它会记得这条线。相互独立的新活，用 `profile` 新起；一条线聊完就 `kill_worker`,
+   因为被复用的 worker 是那台机器上一个活着的 agent 进程。
 2. **拆解。** 把目标拆成*最小的一组可独立验证*的子任务。每个子任务的 prompt 必须自包含：
    worker 看不到你的对话。写清目标、约束、期望的输出形态，以及工作目录 / 是否需要 worktree。
 3. **看容量。** `scheduler_status` → 若 `running` 已到 `maxConcurrentTasks` 且队列在涨，
