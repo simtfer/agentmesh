@@ -15,7 +15,11 @@
                                                                                       └──────────────┘
 ```
 
-Node.js ≥ 22.13 · MIT · 126 个离线测试 · 尚未发布到 npm
+[![CI](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml/badge.svg)](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](package.json)
+
+126 个离线测试，覆盖 Linux 与 Windows · 尚未发布到 npm
 
 ## 这是什么
 
@@ -198,11 +202,12 @@ npm run typecheck   # tsc --noEmit，干净
 npm test            # 126 个测试，全离线，无 API 费用，约 26 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
+npm run check:pack  # 发布包里有 dist/，且不含源码与测试
 npm run deploy:tls  # 在本机真实网卡上跑 TLS/mTLS（不走 loopback）
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **126/126**，分十个文件，全离线，约 26 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。最近一次在 Windows + Node v22.22 上运行；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](docs/verification.md)（英文）。
+`npm test` 为 **126/126**，分十个文件，全离线，约 26 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。CI 在 Linux 与 Windows × Node 22 / 24 上跑同一套关卡（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](docs/verification.md)（英文）。
 
 ## 路线图
 
@@ -218,7 +223,7 @@ npm run real        # 本机真实的 opencode + pi（两者都需已安装并�
 npm run typecheck && npm test && npm run build && npm run demo
 ```
 
-这四件套是每个改动都该通过的关卡；改动 MCP 表面时再加 `npm run smoke`。新测试是 `node:test` 文件，驱动公开接口（orchestrator、MCP 工具、daemon HTTP/WS）并断言任务记录——绝不断言 mock 内部——且每个新文件都要手动加进 `package.json#scripts.test` 的显式列表。文档是双语的：`README.md` 与 `README.zh.md` 结构必须严格一致，深度文档放在 `docs/`。
+这四件套是每个改动都该通过的关卡；改动 MCP 表面时再加 `npm run smoke`。CI 在 Linux 与 Windows 上跑它，所以这道关卡是被执行的，而不是靠记忆。新测试是 `node:test` 文件，驱动公开接口（orchestrator、MCP 工具、daemon HTTP/WS）并断言任务记录——绝不断言 mock 内部——且每个新文件都要手动加进 `package.json#scripts.test` 的显式列表。文档是双语的：`README.md` 与 `README.zh.md` 结构必须严格一致，深度文档放在 `docs/`。
 
 ## 许可证
 

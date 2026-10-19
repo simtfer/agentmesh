@@ -19,7 +19,11 @@ anything else, with the same code.
                                                                                       └──────────────┘
 ```
 
-Node.js ≥ 22.13 · MIT · 126 offline tests · not published to npm yet
+[![CI](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml/badge.svg)](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](package.json)
+
+126 offline tests on Linux and Windows · not published to npm yet
 
 ## What this is
 
@@ -265,6 +269,7 @@ npm run typecheck   # tsc --noEmit, clean
 npm test            # 126 tests, offline, no API cost, ~26s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
+npm run check:pack  # publish tarball contains dist/, and no sources or tests
 npm run deploy:tls  # real TLS/mTLS run over this host's LAN interface (not loopback)
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
@@ -272,9 +277,10 @@ npm run real        # real local opencode + pi (both must be installed & authent
 `npm test` is **126/126** across ten files, offline, in about 26 seconds. Every
 case drives a public surface (Orchestrator, MCP tools, or the daemon's HTTP/WS
 endpoints) and asserts the resulting task record, not a mock's internal calls.
-Last run on Windows with Node v22.22; real OpenCode and Pi workers have also been
-driven end-to-end. Per-case breakdown and what is **not** covered yet:
-[`docs/verification.md`](docs/verification.md).
+CI runs the same gate on Linux and Windows × Node 22 and 24
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)); real OpenCode and Pi
+workers have also been driven end-to-end. Per-case breakdown and what is **not**
+covered yet: [`docs/verification.md`](docs/verification.md).
 
 ## Roadmap
 
@@ -296,7 +302,8 @@ npm run typecheck && npm test && npm run build && npm run demo
 ```
 
 That four-command gate is what every change is expected to pass; `npm run smoke`
-too when the MCP surface moves. New tests are `node:test` files driving a public
+too when the MCP surface moves. CI runs it on Linux and Windows, so that gate is
+enforced rather than remembered. New tests are `node:test` files driving a public
 interface (orchestrator, MCP tools, daemon HTTP/WS) and asserting the task record
 — never a mock's internals — and each new file must be added to the explicit list
 in `package.json#scripts.test`. Documentation is bilingual: `README.md` and

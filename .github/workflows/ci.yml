@@ -1,0 +1,63 @@
+name: CI
+
+# The README tells people the suite passes; this is what makes that claim
+# checkable. Windows was the only platform the suite had ever run on, and
+# dist/ is gitignored, so both a Linux breakage and an empty publish tarball
+# were invisible from a developer machine.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same ref supersedes the one in flight: the suite takes
+# about a minute, so a cancelled run costs little and a stale green says nothing.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }} · node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux catches path/case/separator assumptions that case-insensitive
+        # Windows hides; Windows catches the reverse (shell, .cmd shims).
+        os: [ubuntu-latest, windows-latest]
+        # 22 is the floor declared in engines; 24 is the current LTS line.
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # npm ci, not npm install: the suite must pass on the exact lockfile a
+      # consumer would get, not on whatever the runner resolves today.
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - run: npm run build
+
+      # demo and smoke drive the real CLI/runtime rather than mocks: demo walks
+      # two complete lifecycles, smoke is a real MCP server over stdio. They fail
+      # on wiring problems the unit tests cannot see.
+      - run: npm run demo
+
+      - run: npm run smoke
+
+      # dist/ is gitignored, so nothing else here proves `npm publish` would
+      # ship a working package; this asserts bin/exports targets are in the
+      # tarball and that sources, tests and local state are not.
+      - run: npm run check:pack

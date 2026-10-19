@@ -8,7 +8,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 | | |
 |---|---|
-| OS | Windows — the only platform the suite has actually been run on; CI on Linux/macOS is not wired up yet |
+| OS | Windows 11 and Ubuntu — CI runs the suite on `ubuntu-latest` and `windows-latest` (see [CI](#ci)) |
 | Node | v22.22 (`engines: >=22.13`; `node:sqlite` is built in, no native deps) |
 | Network | not required — every test uses mocks or a loopback daemon |
 | Cost | zero — no model API is called unless you run `npm run real` |
@@ -22,12 +22,36 @@ npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
 npm run real        # real local opencode + pi workers (needs both installed & authenticated)
+npm run check:pack  # asserts the publish tarball contains dist/ and no sources
 ```
 
 `npm test` runs the ten files below with `tsx --test`. Nothing is skipped, nothing
 is marked `todo`, and no test asserts a mock's internal calls in place of
 observable behaviour — each one drives the public surface (Orchestrator, MCP
 tools, or the daemon's HTTP/WS endpoints) and checks the resulting task record.
+
+## CI
+
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs the same commands on
+a matrix of `ubuntu-latest` and `windows-latest` × Node 22 and 24, on every push to
+`main` and every pull request:
+
+```text
+npm ci → npm run typecheck → npm test → npm run build → npm run demo → npm run smoke → npm run check:pack
+```
+
+Two of those steps exist only because of what a developer machine cannot see:
+
+- **`npm run build` must precede `check:pack`.** `dist/` is gitignored, so a clean
+  clone that publishes without building ships a tarball whose `bin` entry points at
+  a missing file. The check fails on that (and on `src/`, `test/`, `.github/`, local
+  state or `.env` ending up in the tarball).
+- **Linux is the case-sensitivity check.** Windows resolves `./Foo.js` against
+  `foo.ts`; Linux does not. The matrix is what makes any such slip fail during
+  review rather than for the first Linux user.
+
+`npm run deploy:tls` is deliberately **not** in CI: it binds this host's LAN
+address and asserts a real interface, which a hosted runner does not have.
 
 ## `test/tasks.test.ts` — 32 cases
 
@@ -329,6 +353,9 @@ as browsable resources.
 
 Honest limits of the evidence above — these are not covered by the suite yet:
 
+- **macOS.** CI covers Linux and Windows only; nothing here has been run on
+  Darwin, where `node:sqlite`, the `ws` TLS stack and git are all the same but
+  path handling and the default shell are not.
 - **Two physical machines.** The TLS path is verified on one host over its real
   interface, with a real certificate chain and mTLS; what remains unexercised is
   distance — DNS, routing, and the worker's firewall (`docs/deploy.md` covers the
