@@ -23,7 +23,7 @@ anything else, with the same code.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](package.json)
 
-126 offline tests on Linux and Windows · not published to npm yet
+129 offline tests on Linux and Windows · not published to npm yet
 
 ## What this is
 
@@ -266,7 +266,7 @@ non-error symptoms (daemon 401s, TLS failures):
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 126 tests, offline, no API cost, ~26s
+npm test            # 129 tests, offline, no API cost, ~26s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run check:pack  # publish tarball contains dist/, and no sources or tests
@@ -274,7 +274,7 @@ npm run deploy:tls  # real TLS/mTLS run over this host's LAN interface (not loop
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **126/126** across ten files, offline, in about 26 seconds. Every
+`npm test` is **129/129** across eleven files, offline, in about 26 seconds. Every
 case drives a public surface (Orchestrator, MCP tools, or the daemon's HTTP/WS
 endpoints) and asserts the resulting task record, not a mock's internal calls.
 CI runs the same gate on Linux and Windows × Node 22 and 24

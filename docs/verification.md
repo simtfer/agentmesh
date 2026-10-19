@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 126 tests, offline, ~26s
+npm test            # 129 tests, offline, ~26s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -25,7 +25,7 @@ npm run real        # real local opencode + pi workers (needs both installed & a
 npm run check:pack  # asserts the publish tarball contains dist/ and no sources
 ```
 
-`npm test` runs the ten files below with `tsx --test`. Nothing is skipped, nothing
+`npm test` runs the eleven files below with `tsx --test`. Nothing is skipped, nothing
 is marked `todo`, and no test asserts a mock's internal calls in place of
 observable behaviour — each one drives the public surface (Orchestrator, MCP
 tools, or the daemon's HTTP/WS endpoints) and checks the resulting task record.
@@ -52,6 +52,12 @@ Two of those steps exist only because of what a developer machine cannot see:
 
 `npm run deploy:tls` is deliberately **not** in CI: it binds this host's LAN
 address and asserts a real interface, which a hosted runner does not have.
+
+The workflow earned its keep on its first run: both Windows legs failed on two
+cases that pass on the development machine — a `base: "predecessor"` handoff
+refused because two spellings of one temp directory compared unequal, and a skill
+frontmatter assertion that assumed LF in a CRLF checkout. Both were real defects
+in the product and the test respectively, not runner quirks.
 
 ## `test/tasks.test.ts` — 32 cases
 
@@ -147,6 +153,23 @@ by a path the other machine cannot see.
 - **Version skew.** A fake daemon that announces protocol v1 is refused at the
   handshake (`protocol_mismatch`) instead of being sent a patch it would silently
   drop, leaving its agent with a literal `{{artifact:0}}` token.
+
+## `test/paths.test.ts` — 3 cases
+
+Whether two spellings of one directory name the same repository — the check that
+decides if a `base: "predecessor"` successor may branch from the predecessor's
+snapshot. A false negative refuses a valid handoff and blames the user's checkout
+("is gone or not in the same repository") for something that is right there.
+
+- **Linked worktree.** A `git worktree add` checkout and its main repo compare as
+  one repository, in both directions.
+- **Aliases.** A junction (Windows) or directory symlink (POSIX) pointing at a repo
+  compares equal to the real path, so an 8.3 short name (`C:\Users\RUNNER~1\…`) or
+  a `/private/var` style alias cannot produce a phantom mismatch. This is the
+  regression test for the first Windows CI run, where two spellings of one
+  directory made a valid handoff fail.
+- **Negative cases.** Two distinct repos, a deleted directory, and a plain
+  non-repository directory all report `false` — refusing those is the point.
 
 ## `test/contract.test.ts` — 10 cases
 

@@ -44,7 +44,10 @@ test("readSkill returns both languages' markdown from disk", async () => {
     assert.equal(r.ok, true, `${lang} skill should load`);
     if (!r.ok) continue;
     assert.ok(r.markdown.length > 500, `${lang} playbook should be substantial`);
-    assert.match(r.markdown, /^---\nname: agentmesh-master/m, `${lang} has skill frontmatter`);
+    // \r? because a Windows checkout can carry CRLF; .gitattributes pins these
+    // files to LF, but the assertion should not depend on how the repo was
+    // cloned (it failed exactly that way on the Windows CI runner).
+    assert.match(r.markdown, /^---\r?\nname: agentmesh-master/m, `${lang} has skill frontmatter`);
     assert.equal(skillPath(lang), r.path);
   }
   // The two languages are distinct files with distinct bodies.

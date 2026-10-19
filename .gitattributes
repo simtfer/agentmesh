@@ -5,3 +5,10 @@
 *.service text eol=lf
 *.pem     text eol=lf
 *.cmd     text eol=crlf
+
+# Markdown and workflow files are asserted byte-for-byte by the suite (the skill
+# frontmatter must start with "---\n") and are diffed in review. A Windows
+# checkout with core.autocrlf=true would otherwise turn them into CRLF and fail
+# tests that pass on the machine that wrote the files.
+*.md      text eol=lf
+*.yml     text eol=lf

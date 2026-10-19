@@ -16,6 +16,7 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -230,16 +231,56 @@ export async function snapshotWorkingTree(dir: string, message?: string): Promis
 }
 
 /**
- * The common git dir of two working trees, so callers can check that a snapshot
- * commit is reachable from the repo the successor's worktree will be created in.
+ * Canonical form of a path for *comparison*, not for display.
+ *
+ * Two paths can name one directory while comparing unequal as strings, and that
+ * is not hypothetical: Windows hands out 8.3 aliases (`C:\Users\RUNNER~1\…`) and
+ * macOS `/var` is a symlink to `/private/var`, so the same temp directory shows
+ * up spelled two ways depending on whether git or `os.tmpdir()` produced it.
+ * Comparing raw strings then reports "not the same repository" for a checkout
+ * that is right there — a false refusal, on the platforms we do not develop on.
+ *
+ * `realpath` resolves symlinks and 8.3 aliases; case folding is needed because
+ * Windows paths are case-insensitive. A path that no longer exists falls back to
+ * its lexical form, which is what makes a *deleted* worktree still compare
+ * unequal (the caller wants to refuse that case).
+ */
+function comparisonPath(p: string): string {
+  let out = p;
+  try {
+    out = realpathSync.native(p);
+  } catch {
+    out = path.resolve(p);
+  }
+  out = path.resolve(out);
+  return process.platform === "win32" ? out.toLowerCase() : out;
+}
+
+/**
+ * The common git dir of a working tree, absolute.
+ *
+ * A normal checkout answers with a relative ".git"; a linked worktree answers
+ * with the main repo's absolute gitdir. `--path-format=absolute` makes git
+ * resolve both itself, and git older than 2.31 (no such flag) falls back to the
+ * lexical join so the check degrades instead of refusing every handoff.
+ */
+async function commonGitDir(dir: string): Promise<string | undefined> {
+  const abs = await tryGit(["rev-parse", "--path-format=absolute", "--git-common-dir"], dir);
+  if (abs !== undefined) return abs.trim();
+  const rel = await tryGit(["rev-parse", "--git-common-dir"], dir);
+  return rel === undefined ? undefined : path.resolve(dir, rel.trim());
+}
+
+/**
+ * Do two working trees belong to the same repository (same common git dir)?
+ *
+ * Only equal repositories can see each other's commit objects, which is the
+ * precondition for branching a successor from a predecessor's snapshot.
  */
 export async function sameRepository(a: string, b: string): Promise<boolean> {
-  const [ca, cb] = await Promise.all([
-    tryGit(["rev-parse", "--git-common-dir"], a),
-    tryGit(["rev-parse", "--git-common-dir"], b),
-  ]);
+  const [ca, cb] = await Promise.all([commonGitDir(a), commonGitDir(b)]);
   if (ca === undefined || cb === undefined) return false;
-  return path.resolve(a, ca.trim()) === path.resolve(b, cb.trim());
+  return comparisonPath(ca) === comparisonPath(cb);
 }
 
 /* --------------------------------- sidecar -------------------------------- */

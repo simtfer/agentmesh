@@ -50,8 +50,8 @@
 | CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 干净通过；`npm test` **126/126**（tasks(32) + handoff(12) + artifact(7) +
-contract(10) + dag(18) + budget(11) + remote(18) + deploy(8) + orchestrator(6) + skill(4)）；
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **129/129**（tasks(32) + handoff(12) + artifact(7) +
+paths(3) + contract(10) + dag(18) + budget(11) + remote(18) + deploy(8) + orchestrator(6) + skill(4)）；
 `npm run demo` 双场景闭环 `CLOSED ✅`；`npm run smoke` 真实 MCP stdio 全生命周期
 （`accepted, started, output…, waiting, resumed, output…, completed`）；`npm run real`
 对**真实 opencode + pi** 走 `submit → wait → result`，均 `succeeded`（2 任务 / 27 事件入库）。
