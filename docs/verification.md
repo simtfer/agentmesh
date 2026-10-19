@@ -42,10 +42,13 @@ npm ci → npm run typecheck → npm test → npm run build → npm run demo →
 
 Two of those steps exist only because of what a developer machine cannot see:
 
-- **`npm run build` must precede `check:pack`.** `dist/` is gitignored, so a clean
-  clone that publishes without building ships a tarball whose `bin` entry points at
-  a missing file. The check fails on that (and on `src/`, `test/`, `.github/`, local
-  state or `.env` ending up in the tarball).
+- **`npm run build` must precede `check:pack`.** `dist/` is gitignored, so the
+  pack check is the only evidence that a tarball would be complete: it fails when
+  `bin`/`exports` targets are missing, and when `src/`, `test/`, `.github/`, local
+  state or `.env` end up in it. `prepack` now runs build + check for anyone
+  publishing (see [`release.md`](./release.md)); CI deliberately builds first and
+  runs the check with `--ignore-scripts`, because a check that silently builds can
+  never tell you the build was forgotten.
 - **Linux is the case-sensitivity check.** Windows resolves `./Foo.js` against
   `foo.ts`; Linux does not. The matrix is what makes any such slip fail during
   review rather than for the first Linux user.

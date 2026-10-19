@@ -1,6 +1,6 @@
 # agentmesh
 
-**English** · [简体中文](README.zh.md)
+**English** · [简体中文](https://github.com/simtfer/agentmesh/blob/main/README.zh.md)
 
 A **protocol-native adapter** that lets one coding agent act as a **master** and
 command a pool of **heterogeneous worker agents** (OpenCode, Pi, Codex, Gemini,
@@ -20,8 +20,8 @@ anything else, with the same code.
 ```
 
 [![CI](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml/badge.svg)](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/simtfer/agentmesh/blob/main/LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](https://github.com/simtfer/agentmesh/blob/main/package.json)
 
 129 offline tests on Linux and Windows · not published to npm yet
 
@@ -103,7 +103,7 @@ That is an OpenCode-style entry; Pi 1.0 takes the same command as a local/stdio
 MCP server. Then just talk to your master: *"spawn an opencode worker to fix the
 failing tests while a pi worker writes the changelog."* — it calls `dispatch_task`.
 
-Per-client snippets and every CLI command: [`docs/cli.md`](docs/cli.md).
+Per-client snippets and every CLI command: [`docs/cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md).
 
 ## Core concepts
 
@@ -129,7 +129,7 @@ queued ─▶ starting ─▶ running ─▶ succeeded
 - **Worker output is untrusted data**, never instructions — including everything
   that arrives through a handoff.
 
-Full transition rules and the approval loop: [`docs/lifecycle.md`](docs/lifecycle.md).
+Full transition rules and the approval loop: [`docs/lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md).
 
 ## Configuration
 
@@ -159,7 +159,7 @@ profiles:
 `agent` can be any acpx built-in name (`pi`, `opencode`, `codex`, `claude`,
 `gemini`, `cursor`, `qwen`, `qoder`, …) or a custom key paired with `command`.
 Every key — profiles, `limits`, `daemon` — is documented in
-[`docs/configuration.md`](docs/configuration.md).
+[`docs/configuration.md`](https://github.com/simtfer/agentmesh/blob/main/docs/configuration.md).
 
 ## MCP tools
 
@@ -176,7 +176,7 @@ Eighteen tools over stdio. The core loop:
 `skills/agentmesh-master/SKILL.md`, also browsable as
 `agentmesh://skills/master/en|zh`), so the guidance travels with the server
 instead of being pasted into each agent's config. Full signatures:
-[`docs/mcp-tools.md`](docs/mcp-tools.md).
+[`docs/mcp-tools.md`](https://github.com/simtfer/agentmesh/blob/main/docs/mcp-tools.md).
 
 ## Going further
 
@@ -185,24 +185,24 @@ A's text under an untrusted envelope, `inject: "diff"` writes a redacted patch
 sidecar (and, for a remote worker, ships the patch with the submit so the daemon
 stages it locally), `base: "predecessor"` starts B's worktree from A's end state
 — that last one stays same-host, since a commit is not bytes.
-[`docs/handoff.md`](docs/handoff.md)
+[`docs/handoff.md`](https://github.com/simtfer/agentmesh/blob/main/docs/handoff.md)
 
 **Structured results and cost** — `outputSchema` enforces a JSON contract
 (violations fail the task; the parsed value returns in `structured`), while ACP
 `usage_update` feeds a per-task and aggregate token/cost roll-up.
-[`docs/contracts.md`](docs/contracts.md)
+[`docs/contracts.md`](https://github.com/simtfer/agentmesh/blob/main/docs/contracts.md)
 
 **Advanced scheduling** — `dependsOn` gates a task behind others, `retry` re-runs
 transient failures with backoff, `deadlineMs` bounds queue wait *and* execution,
 and profile `weight` turns the queue into weighted fair queueing.
-[`docs/limits.md`](docs/limits.md)
+[`docs/limits.md`](https://github.com/simtfer/agentmesh/blob/main/docs/limits.md)
 
 **Remote workers** — a `driver: remote` profile talks WSS + Bearer token to a
 daemon that wraps the same core, so ACP stdio never crosses the network. Tokens
 come from the environment, non-loopback binds require TLS, `daemon.tls.ca` enables
 mTLS, `allowCwd` whitelists paths, a dropped connection reconciles to `cancelled`,
 and every decision lands in a size-rotated NDJSON audit log.
-[`docs/remote.md`](docs/remote.md) · runbook [`docs/deploy.md`](docs/deploy.md)
+[`docs/remote.md`](https://github.com/simtfer/agentmesh/blob/main/docs/remote.md) · runbook [`docs/deploy.md`](https://github.com/simtfer/agentmesh/blob/main/docs/deploy.md)
 
 ## Safety and limits
 
@@ -225,7 +225,7 @@ These guards apply to every deployment, local or remote:
   `outputTruncated`, so a runaway agent cannot bloat the store.
 
 Every cap, its default, and what happens when it fires:
-[`docs/limits.md`](docs/limits.md).
+[`docs/limits.md`](https://github.com/simtfer/agentmesh/blob/main/docs/limits.md).
 
 ## Troubleshooting
 
@@ -242,25 +242,26 @@ Every failure lands on the task record (`error.code`) *and* the event log, so
 A task stuck in `waiting` is blocked on an approval, and `dispatch_task` cannot
 advance it — use `task_submit` + `task_wait`. The other 16 codes, plus the
 non-error symptoms (daemon 401s, TLS failures):
-[`docs/troubleshooting.md`](docs/troubleshooting.md).
+[`docs/troubleshooting.md`](https://github.com/simtfer/agentmesh/blob/main/docs/troubleshooting.md).
 
 ## Docs
 
 | | |
 |---|---|
-| [`configuration.md`](docs/configuration.md) | every key in `agentmesh.yaml` |
-| [`cli.md`](docs/cli.md) | commands + attaching OpenCode / Pi |
-| [`lifecycle.md`](docs/lifecycle.md) | 8 states, delegating modes, approvals |
-| [`mcp-tools.md`](docs/mcp-tools.md) | the 18 tools + the self-hosted playbook |
-| [`handoff.md`](docs/handoff.md) | chaining tasks onto a predecessor's output |
-| [`contracts.md`](docs/contracts.md) | JSON result contracts, usage/cost roll-up |
-| [`limits.md`](docs/limits.md) | scheduler, retries, budgets, safety guards |
-| [`troubleshooting.md`](docs/troubleshooting.md) | error codes and symptoms |
-| [`remote.md`](docs/remote.md) | the Remote Worker Daemon in full |
-| [`deploy.md`](docs/deploy.md) | two-host runbook: CA, mTLS, firewall, boot |
-| [`architecture.md`](docs/architecture.md) | layers, source map, role symmetry |
-| [`verification.md`](docs/verification.md) | test-by-test coverage and known gaps |
-| [`PLAN.md`](docs/PLAN.md) | design notes, rejected alternatives, roadmap |
+| [`configuration.md`](https://github.com/simtfer/agentmesh/blob/main/docs/configuration.md) | every key in `agentmesh.yaml` |
+| [`cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md) | commands + attaching OpenCode / Pi |
+| [`lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md) | 8 states, delegating modes, approvals |
+| [`mcp-tools.md`](https://github.com/simtfer/agentmesh/blob/main/docs/mcp-tools.md) | the 18 tools + the self-hosted playbook |
+| [`handoff.md`](https://github.com/simtfer/agentmesh/blob/main/docs/handoff.md) | chaining tasks onto a predecessor's output |
+| [`contracts.md`](https://github.com/simtfer/agentmesh/blob/main/docs/contracts.md) | JSON result contracts, usage/cost roll-up |
+| [`limits.md`](https://github.com/simtfer/agentmesh/blob/main/docs/limits.md) | scheduler, retries, budgets, safety guards |
+| [`troubleshooting.md`](https://github.com/simtfer/agentmesh/blob/main/docs/troubleshooting.md) | error codes and symptoms |
+| [`remote.md`](https://github.com/simtfer/agentmesh/blob/main/docs/remote.md) | the Remote Worker Daemon in full |
+| [`deploy.md`](https://github.com/simtfer/agentmesh/blob/main/docs/deploy.md) | two-host runbook: CA, mTLS, firewall, boot |
+| [`architecture.md`](https://github.com/simtfer/agentmesh/blob/main/docs/architecture.md) | layers, source map, role symmetry |
+| [`verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md) | test-by-test coverage and known gaps |
+| [`release.md`](https://github.com/simtfer/agentmesh/blob/main/docs/release.md) | publishing a version, and what it has to survive |
+| [`PLAN.md`](https://github.com/simtfer/agentmesh/blob/main/docs/PLAN.md) | design notes, rejected alternatives, roadmap |
 
 ## Verification
 
@@ -278,9 +279,9 @@ npm run real        # real local opencode + pi (both must be installed & authent
 case drives a public surface (Orchestrator, MCP tools, or the daemon's HTTP/WS
 endpoints) and asserts the resulting task record, not a mock's internal calls.
 CI runs the same gate on Linux and Windows × Node 22 and 24
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)); real OpenCode and Pi
+([`.github/workflows/ci.yml`](https://github.com/simtfer/agentmesh/blob/main/.github/workflows/ci.yml)); real OpenCode and Pi
 workers have also been driven end-to-end. Per-case breakdown and what is **not**
-covered yet: [`docs/verification.md`](docs/verification.md).
+covered yet: [`docs/verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md).
 
 ## Roadmap
 

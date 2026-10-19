@@ -1,6 +1,6 @@
 # agentmesh
 
-[English](README.md) · **简体中文**
+[English](https://github.com/simtfer/agentmesh/blob/main/README.md) · **简体中文**
 
 一个**协议原生适配器**：让一个编码 agent 充当 **master**，指挥一池**异构 worker agent**（OpenCode、Pi、Codex、Gemini、Claude Code 等）。角色由*配置*决定，而不是由 agent 类型决定——所以 OpenCode 可以当 master 驱动 Pi worker，Pi 也可以驱动 OpenCode，代码完全一样。
 
@@ -16,8 +16,8 @@
 ```
 
 [![CI](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml/badge.svg)](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/simtfer/agentmesh/blob/main/LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](https://github.com/simtfer/agentmesh/blob/main/package.json)
 
 129 个离线测试，覆盖 Linux 与 Windows · 尚未发布到 npm
 
@@ -79,7 +79,7 @@ npm run build
 
 上面是 OpenCode 风格的条目；Pi 1.0 把同一行命令作为本地/stdio MCP server 加进去即可。之后直接跟 master 说话：*“spawn an opencode worker to fix the failing tests while a pi worker writes the changelog.”*——它会去调 `dispatch_task`。
 
-各客户端的完整配置片段与全部命令：[`docs/cli.md`](docs/cli.md)（英文）。
+各客户端的完整配置片段与全部命令：[`docs/cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md)（英文）。
 
 ## 核心概念
 
@@ -99,7 +99,7 @@ queued ─▶ starting ─▶ running ─▶ succeeded
 - **审批是一等状态。** worker 撞上高风险工具或需要补充输入时，任务转入 `waiting` 且 `task_wait` 提前返回；master 用 `task_approve` / `task_respond` 作答。
 - **worker 输出是不可信数据**，永远不是指令——包括通过 handoff 传进来的一切。
 
-完整状态转移与审批环：[`docs/lifecycle.md`](docs/lifecycle.md)（英文）。
+完整状态转移与审批环：[`docs/lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md)（英文）。
 
 ## 配置
 
@@ -126,7 +126,7 @@ profiles:
     worktree: true
 ```
 
-`agent` 可以是任何 acpx 内置名（`pi`、`opencode`、`codex`、`claude`、`gemini`、`cursor`、`qwen`、`qoder`……），也可以是自定义 key 搭配 `command`。所有键——profiles、`limits`、`daemon`——见 [`docs/configuration.md`](docs/configuration.md)（英文）。
+`agent` 可以是任何 acpx 内置名（`pi`、`opencode`、`codex`、`claude`、`gemini`、`cursor`、`qwen`、`qoder`……），也可以是自定义 key 搭配 `command`。所有键——profiles、`limits`、`daemon`——见 [`docs/configuration.md`](https://github.com/simtfer/agentmesh/blob/main/docs/configuration.md)（英文）。
 
 ## MCP 工具
 
@@ -139,17 +139,17 @@ stdio 上共 18 个工具。核心循环：
 | 运维 | `scheduler_status` · `usage_summary` · `pending_approvals` · `task_approve` · `task_respond` |
 | 便利 | `dispatch_task` · `master_playbook` |
 
-`master_playbook` 提供**自托管的委派手册**（内容同 `skills/agentmesh-master/SKILL.md`，也能作为 `agentmesh://skills/master/en|zh` 资源浏览），所以这套指导跟着服务器走，不必粘进每个 agent 的配置。完整签名：[`docs/mcp-tools.md`](docs/mcp-tools.md)（英文）。
+`master_playbook` 提供**自托管的委派手册**（内容同 `skills/agentmesh-master/SKILL.md`，也能作为 `agentmesh://skills/master/en|zh` 资源浏览），所以这套指导跟着服务器走，不必粘进每个 agent 的配置。完整签名：[`docs/mcp-tools.md`](https://github.com/simtfer/agentmesh/blob/main/docs/mcp-tools.md)（英文）。
 
 ## 进阶
 
-**跨 Worker 交接**——把任务 B 接在已完成的 A 上：`inject: "result"` 把 A 的文本包进不可信信封内联；`inject: "diff"` 写成脱敏补丁旁挂文件（后继在远程时，补丁随提交一起过网，由 daemon 落到它自己的状态目录）；`base: "predecessor"` 让 B 的 worktree 从 A 的末态分叉——最后这一种仍然只在同一台机器上成立，因为 commit 不是字节。[`docs/handoff.md`](docs/handoff.md)
+**跨 Worker 交接**——把任务 B 接在已完成的 A 上：`inject: "result"` 把 A 的文本包进不可信信封内联；`inject: "diff"` 写成脱敏补丁旁挂文件（后继在远程时，补丁随提交一起过网，由 daemon 落到它自己的状态目录）；`base: "predecessor"` 让 B 的 worktree 从 A 的末态分叉——最后这一种仍然只在同一台机器上成立，因为 commit 不是字节。[`docs/handoff.md`](https://github.com/simtfer/agentmesh/blob/main/docs/handoff.md)
 
-**结构化结果与成本**——`outputSchema` 强制 JSON 契约（违约即失败；解析值从 `structured` 返回），ACP `usage_update` 则汇成逐任务与聚合的 token/成本。[`docs/contracts.md`](docs/contracts.md)
+**结构化结果与成本**——`outputSchema` 强制 JSON 契约（违约即失败；解析值从 `structured` 返回），ACP `usage_update` 则汇成逐任务与聚合的 token/成本。[`docs/contracts.md`](https://github.com/simtfer/agentmesh/blob/main/docs/contracts.md)
 
-**进阶调度**——`dependsOn` 把任务门控在其他任务之后，`retry` 按退避重跑瞬时失败，`deadlineMs` 同时约束排队与执行，profile `weight` 让队列变成加权公平调度。[`docs/limits.md`](docs/limits.md)
+**进阶调度**——`dependsOn` 把任务门控在其他任务之后，`retry` 按退避重跑瞬时失败，`deadlineMs` 同时约束排队与执行，profile `weight` 让队列变成加权公平调度。[`docs/limits.md`](https://github.com/simtfer/agentmesh/blob/main/docs/limits.md)
 
-**远程 worker**——`driver: remote` profile 用 WSS + Bearer token 连接包着同一套核心的 daemon，ACP stdio 永不过网。token 只从环境变量来，非 loopback 绑定强制 TLS，`daemon.tls.ca` 开启 mTLS，`allowCwd` 限定可运行目录，连接断开一律清算为 `cancelled`，控制面的每个决定都写进按大小轮转的 NDJSON 审计日志。[`docs/remote.md`](docs/remote.md) · 部署手册 [`docs/deploy.md`](docs/deploy.md)
+**远程 worker**——`driver: remote` profile 用 WSS + Bearer token 连接包着同一套核心的 daemon，ACP stdio 永不过网。token 只从环境变量来，非 loopback 绑定强制 TLS，`daemon.tls.ca` 开启 mTLS，`allowCwd` 限定可运行目录，连接断开一律清算为 `cancelled`，控制面的每个决定都写进按大小轮转的 NDJSON 审计日志。[`docs/remote.md`](https://github.com/simtfer/agentmesh/blob/main/docs/remote.md) · 部署手册 [`docs/deploy.md`](https://github.com/simtfer/agentmesh/blob/main/docs/deploy.md)
 
 ## 安全与限制
 
@@ -162,7 +162,7 @@ stdio 上共 18 个工具。核心循环：
 - **审批宽度**——超过 `limits.maxWaitingTasks` 后，权限请求当场被拒而不是挂起。
 - **输出上限**——`maxOutputBytes` 在 UTF-8 边界截断并标记 `outputTruncated`，失控 agent 撑不爆存储。
 
-每条护栏的默认值、触发后给什么错误码：[`docs/limits.md`](docs/limits.md)（英文）。
+每条护栏的默认值、触发后给什么错误码：[`docs/limits.md`](https://github.com/simtfer/agentmesh/blob/main/docs/limits.md)（英文）。
 
 ## 排障
 
@@ -175,25 +175,26 @@ stdio 上共 18 个工具。核心循环：
 | `handoff_artifact_unavailable` | 让后继在本机跑，或改用 `inject: "result"` |
 | `output_schema_invalid` | 看 `metadata.outputContract.errors` 里的出错路径 |
 
-任务卡在 `waiting` 说明它在等审批，而 `dispatch_task` 推不动它——改用 `task_submit` + `task_wait`。其余 16 个错误码，以及不是错误码的常见症状（daemon 401、TLS 失败）：[`docs/troubleshooting.md`](docs/troubleshooting.md)（英文）。
+任务卡在 `waiting` 说明它在等审批，而 `dispatch_task` 推不动它——改用 `task_submit` + `task_wait`。其余 16 个错误码，以及不是错误码的常见症状（daemon 401、TLS 失败）：[`docs/troubleshooting.md`](https://github.com/simtfer/agentmesh/blob/main/docs/troubleshooting.md)（英文）。
 
 ## 文档
 
 | | |
 |---|---|
-| [`configuration.md`](docs/configuration.md) | `agentmesh.yaml` 的每一个键 |
-| [`cli.md`](docs/cli.md) | 命令 + 接入 OpenCode / Pi |
-| [`lifecycle.md`](docs/lifecycle.md) | 8 态机、委派方式、审批 |
-| [`mcp-tools.md`](docs/mcp-tools.md) | 18 个工具 + 自托管手册 |
-| [`handoff.md`](docs/handoff.md) | 把任务接在前驱输出上 |
-| [`contracts.md`](docs/contracts.md) | JSON 结果契约、用量/成本汇总 |
-| [`limits.md`](docs/limits.md) | 调度器、重试、预算、安全护栏 |
-| [`troubleshooting.md`](docs/troubleshooting.md) | 错误码与症状 |
-| [`remote.md`](docs/remote.md) | 远程 Worker Daemon 完整指南 |
-| [`deploy.md`](docs/deploy.md) | 双机部署手册：CA、mTLS、防火墙、开机启动 |
-| [`architecture.md`](docs/architecture.md) | 分层、源码地图、角色对称 |
-| [`verification.md`](docs/verification.md) | 逐项测试覆盖与已知缺口 |
-| [`PLAN.md`](docs/PLAN.md) | 设计笔记、被否决的替代方案、路线图 |
+| [`configuration.md`](https://github.com/simtfer/agentmesh/blob/main/docs/configuration.md) | `agentmesh.yaml` 的每一个键 |
+| [`cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md) | 命令 + 接入 OpenCode / Pi |
+| [`lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md) | 8 态机、委派方式、审批 |
+| [`mcp-tools.md`](https://github.com/simtfer/agentmesh/blob/main/docs/mcp-tools.md) | 18 个工具 + 自托管手册 |
+| [`handoff.md`](https://github.com/simtfer/agentmesh/blob/main/docs/handoff.md) | 把任务接在前驱输出上 |
+| [`contracts.md`](https://github.com/simtfer/agentmesh/blob/main/docs/contracts.md) | JSON 结果契约、用量/成本汇总 |
+| [`limits.md`](https://github.com/simtfer/agentmesh/blob/main/docs/limits.md) | 调度器、重试、预算、安全护栏 |
+| [`troubleshooting.md`](https://github.com/simtfer/agentmesh/blob/main/docs/troubleshooting.md) | 错误码与症状 |
+| [`remote.md`](https://github.com/simtfer/agentmesh/blob/main/docs/remote.md) | 远程 Worker Daemon 完整指南 |
+| [`deploy.md`](https://github.com/simtfer/agentmesh/blob/main/docs/deploy.md) | 双机部署手册：CA、mTLS、防火墙、开机启动 |
+| [`architecture.md`](https://github.com/simtfer/agentmesh/blob/main/docs/architecture.md) | 分层、源码地图、角色对称 |
+| [`verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md) | 逐项测试覆盖与已知缺口 |
+| [`release.md`](https://github.com/simtfer/agentmesh/blob/main/docs/release.md) | 发布一个版本的步骤与验收 |
+| [`PLAN.md`](https://github.com/simtfer/agentmesh/blob/main/docs/PLAN.md) | 设计笔记、被否决的替代方案、路线图 |
 
 ## 验证
 
@@ -207,7 +208,7 @@ npm run deploy:tls  # 在本机真实网卡上跑 TLS/mTLS（不走 loopback）
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **129/129**，分十一个文件，全离线，约 26 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。CI 在 Linux 与 Windows × Node 22 / 24 上跑同一套关卡（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](docs/verification.md)（英文）。
+`npm test` 为 **129/129**，分十一个文件，全离线，约 26 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。CI 在 Linux 与 Windows × Node 22 / 24 上跑同一套关卡（[`.github/workflows/ci.yml`](https://github.com/simtfer/agentmesh/blob/main/.github/workflows/ci.yml)）；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md)（英文）。
 
 ## 路线图
 

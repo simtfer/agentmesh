@@ -44,6 +44,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build && npm run check:pack",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "demo": "tsx src/cli.ts demo",
     "mcp": "tsx src/cli.ts mcp",
