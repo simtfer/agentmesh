@@ -50,7 +50,7 @@
     "list": "tsx src/cli.ts list",
     "smoke": "node scripts/mcp-smoke.mjs",
     "real": "tsx scripts/real-smoke.ts",
-    "test": "tsx --test test/orchestrator.test.ts test/tasks.test.ts test/handoff.test.ts test/contract.test.ts test/dag.test.ts test/budget.test.ts test/remote.test.ts test/deploy.test.ts test/skill.test.ts",
+    "test": "tsx --test test/orchestrator.test.ts test/tasks.test.ts test/handoff.test.ts test/artifact.test.ts test/contract.test.ts test/dag.test.ts test/budget.test.ts test/remote.test.ts test/deploy.test.ts test/skill.test.ts",
     "deploy:tls": "tsx scripts/remote-tls-deploy.ts"
   },
   "dependencies": {

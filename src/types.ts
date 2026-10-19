@@ -76,6 +76,26 @@ export interface RunTurnOptions {
   onPermissionRequest?: PermissionHandler;
   /** Called when the agent asks the user for input; blocks until answered. */
   onElicitation?: ElicitationHandler;
+  /**
+   * Files the turn needs on the worker's side of the wire (cross-host handoff).
+   * A local driver ignores them; the remote driver ships them with the submit so
+   * the daemon can stage them where its agent can read them.
+   */
+  attachments?: TaskAttachment[];
+}
+
+/**
+ * One file travelling with a task turn. Only the *name* crosses the wire — the
+ * receiver picks the directory, so a caller can never ask a daemon to write
+ * outside its own state dir.
+ */
+export interface TaskAttachment {
+  /** bare file name, no directories; `.diff` artifacts only */
+  name: string;
+  /** raw bytes; base64-encoded on the wire */
+  data: Buffer;
+  /** hex SHA-256 of `data`, verified by the receiver */
+  sha256: string;
 }
 
 /** A live, addressable worker the orchestrator can send turns to. */
@@ -327,6 +347,17 @@ export const DEFAULT_MAX_DELEGATION_DEPTH = 8;
 
 /** Default cap on injected handoff artifact bytes when `limits.maxHandoffBytes` is unset. */
 export const DEFAULT_MAX_HANDOFF_BYTES = 256 * 1024;
+
+/**
+ * Hard ceiling for a single cross-host handoff artifact, in raw bytes.
+ *
+ * This is a *protocol* limit, not a policy knob: the wire frame is base64 and
+ * must fit `MAX_PAYLOAD_BYTES` (8 MiB), so 4 MiB raw (~5.3 MiB encoded) leaves
+ * room for the prompt and envelope without ever closing the socket mid-frame.
+ * `limits.maxHandoffBytes` can be raised by an operator, but a remote handoff
+ * above this ceiling is refused rather than sent.
+ */
+export const MAX_HANDOFF_ARTIFACT_BYTES = 4 * 1024 * 1024;
 
 /** Default cap on total task attempts when `retry.maxAttempts` exceeds `limits.maxRetryAttempts`. */
 export const DEFAULT_MAX_RETRY_ATTEMPTS = 5;

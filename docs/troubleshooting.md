@@ -29,7 +29,8 @@ Every failure lands on the task record (`error.code`) *and* the event log, so
 | `handoff_predecessor_not_ready` | the predecessor is not `succeeded` yet | `task_wait` on it first; failed/cancelled output is never handed off |
 | `handoff_base_requires_worktree` | `base: "predecessor"` without a worktree | pass `worktree: true` or enable it on the profile |
 | `handoff_base_unavailable` | the predecessor's checkout is gone or in another repo | keep its worker alive until the successor starts |
-| `handoff_artifact_unavailable` | a `diff`/`predecessor` handoff targets a remote worker, or the checkout vanished | run the successor locally, or use `inject: "result"` |
+| `handoff_artifact_unavailable` | `base: "predecessor"` targets a remote worker, or the predecessor's checkout vanished | use `inject: "diff"` with `base: "repo"`, or run the successor locally |
+| `handoff_artifact_too_large` | a remote `diff` handoff exceeds the 4 MiB artifact ceiling | lower `handoff.maxBytes`, split the change, or run the successor locally |
 | `output_not_json` | `outputSchema` was set but the reply contains no parseable JSON | restate the contract in the task ("reply with JSON only"); `retryable`, so re-running is reasonable |
 | `output_schema_invalid` | the reply parsed but violates the schema | read `metadata.outputContract.errors` for the offending paths — usually one field the prompt never pinned down |
 | `output_schema_too_large` | the schema exceeds 16 KiB | trim descriptions/examples; the schema goes into the prompt |
@@ -45,6 +46,14 @@ Every failure lands on the task record (`error.code`) *and* the event log, so
 - **`cli submit` exits and the task never progresses.** Expected: the one-shot
   CLI's live run ends with the process. Use the long-lived `mcp` server for real
   async work (also called out in [`cli.md`](./cli.md)).
+- **A remote submit fails with `artifact_invalid`, `artifact_too_large` or
+  `artifact_checksum_mismatch`.** The daemon refused a handoff artifact before
+  creating a task: the name was not a bare `*.diff`, the decoded size was over
+  4 MiB, or the bytes did not match the SHA-256 the master sent. Nothing was
+  written to disk. These arrive as a submission error (the task record shows
+  `exception` with the code in the message), which means the client and daemon
+  disagree — check versions first. A `protocol_mismatch` in that message means the
+  daemon predates artifact staging: upgrade it, or run the successor locally.
 - **Daemon refuses the connection or returns 401.** Bind/TLS/token rules are in
   [`remote.md`](./remote.md#security-model); the token must come from the
   environment named by `--token-env`.

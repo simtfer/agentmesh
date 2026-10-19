@@ -19,7 +19,7 @@ anything else, with the same code.
                                                                                       └──────────────┘
 ```
 
-Node.js ≥ 22.13 · MIT · 119 offline tests · not published to npm yet
+Node.js ≥ 22.13 · MIT · 126 offline tests · not published to npm yet
 
 ## What this is
 
@@ -178,7 +178,9 @@ instead of being pasted into each agent's config. Full signatures:
 
 **Cross-worker handoff** — chain B onto a finished A: `inject: "result"` inlines
 A's text under an untrusted envelope, `inject: "diff"` writes a redacted patch
-sidecar, `base: "predecessor"` starts B's worktree from A's end state.
+sidecar (and, for a remote worker, ships the patch with the submit so the daemon
+stages it locally), `base: "predecessor"` starts B's worktree from A's end state
+— that last one stays same-host, since a commit is not bytes.
 [`docs/handoff.md`](docs/handoff.md)
 
 **Structured results and cost** — `outputSchema` enforces a JSON contract
@@ -260,14 +262,14 @@ non-error symptoms (daemon 401s, TLS failures):
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 119 tests, offline, no API cost, ~26s
+npm test            # 126 tests, offline, no API cost, ~26s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # real TLS/mTLS run over this host's LAN interface (not loopback)
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **119/119** across nine files, offline, in about 26 seconds. Every
+`npm test` is **126/126** across ten files, offline, in about 26 seconds. Every
 case drives a public surface (Orchestrator, MCP tools, or the daemon's HTTP/WS
 endpoints) and asserts the resulting task record, not a mock's internal calls.
 Last run on Windows with Node v22.22; real OpenCode and Pi workers have also been
@@ -278,14 +280,12 @@ driven end-to-end. Per-case breakdown and what is **not** covered yet:
 
 Working today: async 8-state lifecycle on SQLite, human-in-the-loop approvals,
 real ACP workers, bounded weighted-fair scheduling with deadlines and DAG retries,
-cross-worker handoff, enforced JSON contracts with cost roll-up, hard spend
-budgets, a self-hosted playbook, and a remote daemon with mutual TLS.
+cross-worker handoff (including a diff handed to a worker on another host),
+enforced JSON contracts with cost roll-up, hard spend budgets, a self-hosted
+playbook, and a remote daemon with mutual TLS.
 
 Next:
 
-- **Cross-host handoff artifacts** — a remote successor currently refuses a
-  `diff`/`predecessor` handoff (`handoff_artifact_unavailable`) because the
-  artifact is a file on the master's disk.
 - **Optional web console** — the audit trail and `scheduler_status` already expose
   the data a read-only view would render.
 

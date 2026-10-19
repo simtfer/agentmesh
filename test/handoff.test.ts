@@ -313,19 +313,14 @@ test("base 'predecessor' fails cleanly when the predecessor's checkout is gone",
 /* remote successors                                                   */
 /* ------------------------------------------------------------------ */
 
-test("artifact handoffs are refused for a remote successor", async () => {
+test("a predecessor-base handoff is refused for a remote successor", async () => {
   const ctx = setup();
   try {
     const pred = await run(ctx.orch, { profile: "writer", prompt: "add the feature" });
 
-    const diffSucc = await run(ctx.orch, {
-      profile: "remote-worker",
-      prompt: "review",
-      handoff: { fromTaskId: pred.taskId, inject: "diff" },
-    });
-    assert.equal(diffSucc.status, "failed");
-    assert.equal(diffSucc.error?.code, "handoff_artifact_unavailable");
-
+    // `base: "predecessor"` branches from a commit object that only exists in the
+    // master's repo, so it stays refused. A `diff` handoff is bytes and ships
+    // with the submit — that path is covered end-to-end in artifact.test.ts.
     const baseSucc = await run(ctx.orch, {
       profile: "remote-worker",
       prompt: "continue",

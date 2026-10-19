@@ -15,7 +15,7 @@
                                                                                       └──────────────┘
 ```
 
-Node.js ≥ 22.13 · MIT · 119 个离线测试 · 尚未发布到 npm
+Node.js ≥ 22.13 · MIT · 126 个离线测试 · 尚未发布到 npm
 
 ## 这是什么
 
@@ -139,7 +139,7 @@ stdio 上共 18 个工具。核心循环：
 
 ## 进阶
 
-**跨 Worker 交接**——把任务 B 接在已完成的 A 上：`inject: "result"` 把 A 的文本包进不可信信封内联，`inject: "diff"` 写成脱敏补丁旁挂文件，`base: "predecessor"` 让 B 的 worktree 从 A 的末态分叉。[`docs/handoff.md`](docs/handoff.md)
+**跨 Worker 交接**——把任务 B 接在已完成的 A 上：`inject: "result"` 把 A 的文本包进不可信信封内联；`inject: "diff"` 写成脱敏补丁旁挂文件（后继在远程时，补丁随提交一起过网，由 daemon 落到它自己的状态目录）；`base: "predecessor"` 让 B 的 worktree 从 A 的末态分叉——最后这一种仍然只在同一台机器上成立，因为 commit 不是字节。[`docs/handoff.md`](docs/handoff.md)
 
 **结构化结果与成本**——`outputSchema` 强制 JSON 契约（违约即失败；解析值从 `structured` 返回），ACP `usage_update` 则汇成逐任务与聚合的 token/成本。[`docs/contracts.md`](docs/contracts.md)
 
@@ -195,22 +195,21 @@ stdio 上共 18 个工具。核心循环：
 
 ```bash
 npm run typecheck   # tsc --noEmit，干净
-npm test            # 119 个测试，全离线，无 API 费用，约 26 秒
+npm test            # 126 个测试，全离线，无 API 费用，约 26 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
 npm run deploy:tls  # 在本机真实网卡上跑 TLS/mTLS（不走 loopback）
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **119/119**，分九个文件，全离线，约 26 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。最近一次在 Windows + Node v22.22 上运行；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](docs/verification.md)（英文）。
+`npm test` 为 **126/126**，分十个文件，全离线，约 26 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。最近一次在 Windows + Node v22.22 上运行；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](docs/verification.md)（英文）。
 
 ## 路线图
 
-已经可用：基于 SQLite 的异步 8 态生命周期、人在环路审批、真实 ACP worker、有界加权公平调度（含截止时间与 DAG 重试）、跨 Worker 交接、强制 JSON 契约与成本汇总、硬性花费预算、自托管委派手册，以及支持双向 TLS 的远程 daemon。
+已经可用：基于 SQLite 的异步 8 态生命周期、人在环路审批、真实 ACP worker、有界加权公平调度（含截止时间与 DAG 重试）、跨 Worker 交接（含把 diff 交给另一台机器上的 worker）、强制 JSON 契约与成本汇总、硬性花费预算、自托管委派手册，以及支持双向 TLS 的远程 daemon。
 
 接下来：
 
-- **跨机交接产物**——远程后继目前会拒绝 `diff`/`predecessor` 交接（`handoff_artifact_unavailable`），因为产物是 master 本地磁盘上的文件。
 - **可选 Web 控制台**——审计日志与 `scheduler_status` 已经提供了只读视图所需的数据。
 
 ## 贡献

@@ -57,8 +57,8 @@ src/
     acpxDriver.ts      real ACP workers via acpx runtime (+ permission/elicitation hooks)
     mockDriver.ts      deterministic offline worker (demo/tests, incl. requireApproval)
   remote/
-    protocol.ts        versioned wire messages (submit/approve/respond/cancel + events)
-    security.ts        token compare, cwd whitelist, TLS load, safe-bind guard
+    protocol.ts        versioned wire messages (submit/approve/respond/cancel + events + artifacts)
+    security.ts        token compare, cwd whitelist, artifact staging, TLS load, safe-bind guard
     daemon.ts          WorkerDaemon: HTTP+WS shim wrapping a local Orchestrator
     client.ts          RemoteWorkerDriver: a remote profile as a normal WorkerDriver
     audit.ts           append-only NDJSON audit log; secrets reduced to a fingerprint

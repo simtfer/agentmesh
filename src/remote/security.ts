@@ -11,9 +11,10 @@
  * env var NAME (e.g. `tokenEnv: AGENTMESH_DAEMON_TOKEN`), never the value, so
  * nothing sensitive lands in the config or in version control.
  */
-import { timingSafeEqual } from "node:crypto";
-import { readFileSync, existsSync } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { MAX_HANDOFF_ARTIFACT_BYTES } from "../types.js";
 
 export class SecurityError extends Error {
   constructor(message: string, readonly code: string) {
@@ -206,4 +207,78 @@ export function assertSafeBind(host: string, hasTls: boolean, allowInsecure: boo
       `configure daemon.tls (cert/key) or pass --allow-insecure to override`,
     "insecure_bind",
   );
+}
+
+/* ------------------------------ artifacts -------------------------------- */
+
+export interface StagedArtifact {
+  name: string;
+  /** absolute path handed to the daemon-side agent */
+  path: string;
+  bytes: number;
+  sha256: string;
+}
+
+/**
+ * A handoff artifact is a single file name, never a path: no separators, no
+ * `..`, no drive letter, and `.diff` only. The daemon owns the directory, which
+ * is what makes "write a file on someone else's machine" a bounded operation
+ * instead of a filesystem primitive.
+ */
+const ARTIFACT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.diff$/;
+const WINDOWS_DEVICE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+const MAX_ARTIFACTS_PER_SUBMIT = 8;
+
+/**
+ * Validate and write the artifacts a remote master shipped with a submit.
+ *
+ * Every check happens **before** anything touches disk: the name must be a bare
+ * `.diff` file name, the decoded size must be under the ceiling, and the SHA-256
+ * must match the bytes we actually decoded (base64 decoding is lenient, so a
+ * truncated or malformed payload would otherwise land as a corrupt patch). Files
+ * go to `<workdir>/handoffs/` with mode 0600 — not into the task's cwd, which
+ * may be any whitelisted repo on this host.
+ */
+export function stageArtifacts(
+  artifacts: { name: string; data: string; sha256: string }[] | undefined,
+  workdir: string,
+  maxBytes: number = MAX_HANDOFF_ARTIFACT_BYTES,
+): StagedArtifact[] {
+  if (!artifacts || artifacts.length === 0) return [];
+  if (artifacts.length > MAX_ARTIFACTS_PER_SUBMIT) {
+    throw new SecurityError(
+      `submit carries ${artifacts.length} artifacts; at most ${MAX_ARTIFACTS_PER_SUBMIT} are accepted`,
+      "artifact_invalid",
+    );
+  }
+
+  const dir = path.join(workdir, "handoffs");
+  const staged: StagedArtifact[] = [];
+  for (const a of artifacts) {
+    if (!ARTIFACT_NAME.test(a.name) || WINDOWS_DEVICE.test(a.name.replace(/\.diff$/i, ""))) {
+      throw new SecurityError(
+        `artifact name rejected: ${JSON.stringify(a.name)} (expected a bare *.diff file name)`,
+        "artifact_invalid",
+      );
+    }
+    const raw = Buffer.from(a.data, "base64");
+    if (raw.byteLength === 0) {
+      throw new SecurityError(`artifact ${a.name} is empty`, "artifact_invalid");
+    }
+    if (raw.byteLength > maxBytes) {
+      throw new SecurityError(
+        `artifact ${a.name} is ${raw.byteLength} bytes; the ceiling is ${maxBytes}`,
+        "artifact_too_large",
+      );
+    }
+    const digest = createHash("sha256").update(raw).digest("hex");
+    if (!/^[0-9a-f]{64}$/.test(a.sha256.toLowerCase()) || digest !== a.sha256.toLowerCase()) {
+      throw new SecurityError(`artifact ${a.name}: checksum mismatch`, "artifact_checksum_mismatch");
+    }
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, a.name);
+    writeFileSync(file, raw, { mode: 0o600 });
+    staged.push({ name: a.name, path: file, bytes: raw.byteLength, sha256: digest });
+  }
+  return staged;
 }

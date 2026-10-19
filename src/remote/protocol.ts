@@ -11,7 +11,11 @@
  * exposed, and only to authenticated callers over TLS (or loopback for dev).
  */
 
-export const PROTOCOL_VERSION = 1;
+/** v2: `submit` may carry handoff artifacts (base64 + sha256). */
+export const PROTOCOL_VERSION = 2;
+
+/** Oldest daemon a client may send `submit.artifacts` to. */
+export const ARTIFACT_PROTOCOL_VERSION = 2;
 export const WS_PATH = "/ws";
 export const HEALTH_PATH = "/healthz";
 export const PROFILES_PATH = "/profiles";
@@ -19,7 +23,24 @@ export const PROFILES_PATH = "/profiles";
 /** Reject absurd frames; task text/events are bounded well below this. */
 export const MAX_PAYLOAD_BYTES = 8 * 1024 * 1024;
 
+/** One task never needs more than a handful of files alongside it. */
+export const MAX_SUBMIT_ARTIFACTS = 8;
+
 /* ----------------------------- client → server ---------------------------- */
+
+/**
+ * A handoff artifact travelling with a submit (cross-host diff handoff).
+ *
+ * `name` is a bare file name, never a path: the daemon chooses the directory,
+ * so a master cannot ask it to write outside its own state dir. `data` is
+ * base64 (JSON has no bytes) and `sha256` is the hex digest of the *raw* bytes,
+ * checked before anything is written.
+ */
+export interface ArtifactMsg {
+  name: string;
+  data: string;
+  sha256: string;
+}
 
 export interface SubmitMsg {
   type: "submit";
@@ -32,6 +53,13 @@ export interface SubmitMsg {
   timeoutMs?: number;
   idempotencyKey?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Files the task needs staged on the daemon host. The prompt refers to them as
+   * `{{artifact:<index>}}`, which the daemon rewrites to the absolute staged
+   * path before the task is submitted — so the master never has to guess a path
+   * on a machine it cannot see.
+   */
+  artifacts?: ArtifactMsg[];
 }
 
 export interface ApproveMsg {
@@ -196,6 +224,23 @@ export function parseClientMsg(raw: string): ClientMsg | undefined {
     case "submit":
       if (typeof v.submitId !== "string" || typeof v.profile !== "string") return undefined;
       if (typeof v.prompt !== "string") return undefined;
+      if (v.artifacts !== undefined) {
+        // Structural check only: size, name shape and checksum are enforced by
+        // the daemon, which is the side that writes to disk.
+        if (!Array.isArray(v.artifacts) || v.artifacts.length > MAX_SUBMIT_ARTIFACTS) {
+          return undefined;
+        }
+        for (const a of v.artifacts) {
+          if (
+            !isRecord(a) ||
+            typeof a.name !== "string" ||
+            typeof a.data !== "string" ||
+            typeof a.sha256 !== "string"
+          ) {
+            return undefined;
+          }
+        }
+      }
       return v as unknown as SubmitMsg;
     case "approve":
       if (typeof v.approvalId !== "string" || typeof v.decision !== "string") return undefined;

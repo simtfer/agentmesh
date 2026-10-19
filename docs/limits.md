@@ -51,7 +51,10 @@ Two further guards bound the blast radius of a busy or runaway master.
   recorded as an event so the clip is observable rather than silent.
 - `limits.maxHandoffBytes` (default 256 KiB) caps how much of a predecessor's
   result a cross-worker handoff may inject into a successor prompt, using the same
-  UTF-8-safe clip.
+  UTF-8-safe clip. A diff handed to a **remote** worker is additionally bounded by
+  the wire protocol at `MAX_HANDOFF_ARTIFACT_BYTES` (4 MiB); raising
+  `handoff.maxBytes` past that only moves the failure to
+  `handoff_artifact_too_large`.
 
 ## Scheduler back-pressure
 

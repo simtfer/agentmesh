@@ -27,6 +27,7 @@ export class HandoffError extends Error {
   constructor(
     readonly code:
       | "handoff_artifact_unavailable"
+      | "handoff_artifact_too_large"
       | "handoff_base_unavailable"
       | "handoff_base_requires_worktree",
     message: string,
@@ -246,6 +247,15 @@ export async function sameRepository(a: string, b: string): Promise<boolean> {
 /** Absolute path of the sidecar file a diff handoff is written to. */
 export function handoffSidecarPath(workdir: string, taskId: string): string {
   return path.resolve(workdir, "handoffs", `${taskId}.diff`);
+}
+
+/**
+ * Bare file name of a diff artifact, used when the patch has to travel to
+ * another host. Deliberately a *name*, not a path: the receiving daemon decides
+ * which directory it lands in, so a master cannot steer a write anywhere.
+ */
+export function handoffArtifactName(taskId: string): string {
+  return `${taskId}.diff`;
 }
 
 /** Write the (already redacted, already capped) diff for a successor task. */

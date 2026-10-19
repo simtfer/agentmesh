@@ -35,6 +35,8 @@ import {
   bearerFromHeader,
   loadTls,
   resolveTokens,
+  stageArtifacts,
+  type StagedArtifact,
 } from "./security.js";
 import { openAuditLog, tokenFingerprint, type AuditLog } from "./audit.js";
 
@@ -68,6 +70,21 @@ export interface WorkerDaemonOptions {
 }
 
 const TERMINAL_EVENT_TYPES = new Set(["completed", "failed", "cancelled", "timed_out"]);
+
+/**
+ * Replace `{{artifact:N}}` in the master's prompt with the absolute path the
+ * daemon staged that artifact at. The master cannot know a path on this host, so
+ * the token is the contract; an index with nothing behind it is left as-is
+ * (visible in the task text) rather than silently blanked, so a version skew is
+ * debuggable instead of the agent hunting for a file that never existed.
+ */
+function substituteArtifacts(prompt: string, staged: StagedArtifact[]): string {
+  if (staged.length === 0) return prompt;
+  return prompt.replace(/\{\{artifact:(\d+)\}\}/g, (match, n: string) => {
+    const a = staged[Number(n)];
+    return a ? a.path : match;
+  });
+}
 
 interface SocketState {
   ws: WebSocket;
@@ -464,11 +481,41 @@ export class WorkerDaemon {
       return;
     }
 
+    // Artifacts travel with the submit (cross-host handoff). Stage them in the
+    // daemon's own state dir *before* the task exists: never into a whitelisted
+    // repo, and a rejected artifact costs neither a worker nor a scheduler slot.
+    let staged: StagedArtifact[] = [];
+    if (msg.artifacts && msg.artifacts.length > 0) {
+      try {
+        staged = stageArtifacts(msg.artifacts, orch.workdir);
+      } catch (e) {
+        const code = e instanceof SecurityError ? e.code : "artifact_invalid";
+        this.audit.record("submit_rejected", {
+          connId: state.connId,
+          reason: "artifact_rejected",
+          profile,
+          code,
+          artifacts: msg.artifacts.map((a) => a.name),
+        });
+        this.send(state, {
+          type: "error",
+          submitId: msg.submitId,
+          message: e instanceof Error ? e.message : String(e),
+          code,
+        });
+        return;
+      }
+    }
+
+    // The master refers to artifacts as `{{artifact:N}}` because it cannot know a
+    // path here; resolve them now that the bytes are on this host.
+    const prompt = substituteArtifacts(msg.prompt, staged);
+
     let record;
     try {
       record = orch.submitTask(
         {
-          prompt: msg.prompt,
+          prompt,
           profile,
           cwd,
           timeoutMs: msg.timeoutMs,
@@ -508,6 +555,9 @@ export class WorkerDaemon {
       taskId: record.taskId,
       profile,
       cwd,
+      ...(staged.length > 0
+        ? { artifacts: staged.length, artifactBytes: staged.reduce((n, a) => n + a.bytes, 0) }
+        : {}),
     });
     this.send(state, { type: "submitted", submitId: msg.submitId, taskId: record.taskId });
   }

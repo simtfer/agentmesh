@@ -50,8 +50,8 @@
 | CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 干净通过；`npm test` **119/119**（tasks(32) + handoff(12) + contract(10) +
-dag(18) + budget(11) + remote(18) + deploy(8) + orchestrator(6) + skill(4)）；
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **126/126**（tasks(32) + handoff(12) + artifact(7) +
+contract(10) + dag(18) + budget(11) + remote(18) + deploy(8) + orchestrator(6) + skill(4)）；
 `npm run demo` 双场景闭环 `CLOSED ✅`；`npm run smoke` 真实 MCP stdio 全生命周期
 （`accepted, started, output…, waiting, resumed, output…, completed`）；`npm run real`
 对**真实 opencode + pi** 走 `submit → wait → result`，均 `succeeded`（2 任务 / 27 事件入库）。
@@ -391,8 +391,14 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
    - ✅ Phase 3 `base:"predecessor"`：用 `git write-tree` + `commit-tree`（临时 index，不改前驱 HEAD/工作区）把前驱末态
      打成 commit，后继 worktree 从该 commit 分叉，直接继承未提交改动；无 worktree 时受理期拒
      `handoff_base_requires_worktree`，前驱工作树已消失/跨仓拒 `handoff_base_unavailable`。
-   - ✅ 远程后继：diff/snapshot 是 master 本地文件，远程 worker 看不到，受理期以 `handoff_artifact_unavailable` 拒绝
-     （而不是给一个读不到的路径）。daemon 侧 artifact 传输留待需要时再做。
+   - ✅ Phase 4 跨机 diff 交接：`inject:"diff"` 对 `driver: remote` 后继不再拒绝——补丁字节随 `submit` 过网
+     （协议 v2：`artifacts:[{name,data(base64),sha256}]`，单件上限 4 MiB，超出受理期拒 `handoff_artifact_too_large`），
+     daemon 先校验「裸 `*.diff` 文件名 + base64 解码后大小 + SHA-256」再把文件写进**自己的** `<workdir>/handoffs/`
+     （0600，绝不写进白名单仓库、绝不按调用方给的路径写），随后把 prompt 里的 `{{artifact:N}}` 重写成该绝对路径——
+     master 无从得知对面路径，所以不猜。校验失败以 `artifact_invalid` / `artifact_too_large` /
+     `artifact_checksum_mismatch` 拒收且不落盘，审计记 `submit_rejected{reason:artifact_rejected}`。
+   - ⏳ 远程后继的 `base:"predecessor"` 仍拒 `handoff_artifact_unavailable`：commit 只在 master 的对象库里可达，
+     不是可传输的字节；`git bundle` 只在两侧共享同一 base 时才有定义，故不做。
 5. ~~**结构化结果契约**~~ ✅ 已落地：`task_submit`/`dispatch_task` 的 `outputSchema`（JSON Schema，draft-07 语义，
    经 ajv 校验）在 run 时作为 `OUTPUT CONTRACT (enforced)` 区块追加到提示词末尾（瞬态，不落库），结束后解析
    （整段 → 代码围栏 → 首个平衡 `{…}`/`[…]`）并校验：解析不出 → `output_not_json`，违反 schema →

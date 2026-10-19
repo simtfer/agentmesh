@@ -21,6 +21,7 @@ master (machine A)                                  worker daemon (machine B)
 
 - [Start the daemon (machine B)](#start-the-daemon-machine-b)
 - [Point a master at it (machine A)](#point-a-master-at-it-machine-a)
+- [Handoff artifacts](#handoff-artifacts)
 - [Reconnect & reconciliation](#reconnect--reconciliation)
 - [Security model](#security-model)
 - [Remote tests](#remote-tests)
@@ -66,6 +67,29 @@ profiles:
 Then the master drives it exactly like a local worker — `task_submit { profile:
 "big-gpu-impl" }`, `task_wait`, `task_approve` when a remote permission request
 arrives. Remote events are streamed back and persisted locally.
+
+## Handoff artifacts
+
+`inject: "diff"` handoffs work across hosts: the patch travels with the submit
+instead of being named by a path the other machine cannot see.
+
+- The client sends `submit { …, artifacts: [{ name, data, sha256 }] }` (protocol
+  v2), where `name` is a bare `*.diff` file name and `data` is base64.
+- The daemon stages the bytes in `<workdir>/handoffs/` — its own state dir, not
+  the task's cwd — after checking that the name has no path segments, that the
+  decoded size is within `MAX_HANDOFF_ARTIFACT_BYTES` (4 MiB), and that the
+  SHA-256 matches the bytes it actually decoded. A rejection is audited as
+  `submit_rejected` with `reason: "artifact_rejected"` and one of
+  `artifact_invalid`, `artifact_too_large` or `artifact_checksum_mismatch`;
+  nothing is written and no task is created.
+- The prompt the master sent refers to `{{artifact:<index>}}`. The daemon rewrites
+  each token to the absolute staged path before submitting the task, so the agent
+  gets a path that exists on its own host and the master never has to invent one.
+- `base: "predecessor"` is still refused cross-host: a commit SHA is not a byte
+  payload. See [`handoff.md`](./handoff.md#what-still-stays-on-one-host).
+
+Staged files are untrusted data, are written with mode 0600, and live next to the
+task store; the daemon does not delete them on its own.
 
 ## Reconnect & reconciliation
 
@@ -145,6 +169,11 @@ profiles:
 - **Workdir whitelist.** `daemon.allowCwd` restricts where a remote task may run;
   a `cwd` outside it (including `../` traversal and sibling-prefix tricks like
   `/srv/repos_evil`) is rejected before any worker starts.
+- **Bounded artifact writes.** A submit may carry handoff patches, but only as a
+  bare `*.diff` *name* with a matching SHA-256, capped at 4 MiB, and always
+  written under `<workdir>/handoffs/` — never into a whitelisted repo and never at
+  a caller-chosen path. That keeps "write a file on another host" from becoming
+  an arbitrary filesystem primitive.
 - **TLS for anything non-loopback.** `assertSafeBind` refuses to bind a
   non-loopback host without TLS unless you pass `--allow-insecure`. Loopback
   `http://` is allowed for local dev/tests.
@@ -193,6 +222,13 @@ rotating live while refusing an empty set), a structured audit trail (records
 auth/submit/refusal decisions and asserts no token ever appears in cleartext),
 and unit coverage of `assertSafeBind` / `assertCwdAllowed`. 18 remote tests, no
 network, no API cost.
+
+Cross-host artifact delivery has its own file: `test/artifact.test.ts` (7 cases)
+ships a real redacted diff to a loopback daemon and asserts the staged path, the
+byte-identical copy, the rewritten prompt, the 4 MiB ceiling, every receiver
+guard (`artifact_invalid` / `artifact_too_large` / `artifact_checksum_mismatch`),
+and that a v1 daemon is refused at the handshake rather than sent an unusable
+prompt.
 
 `test/deploy.test.ts` covers the deployment path with committed throwaway
 certificates (see `test/fixtures/tls/README.md`): a client without a certificate

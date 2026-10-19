@@ -17,14 +17,14 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 119 tests, offline, ~26s
+npm test            # 126 tests, offline, ~26s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
 npm run real        # real local opencode + pi workers (needs both installed & authenticated)
 ```
 
-`npm test` runs the nine files below with `tsx --test`. Nothing is skipped, nothing
+`npm test` runs the ten files below with `tsx --test`. Nothing is skipped, nothing
 is marked `todo`, and no test asserts a mock's internal calls in place of
 observable behaviour — each one drives the public surface (Orchestrator, MCP
 tools, or the daemon's HTTP/WS endpoints) and checks the resulting task record.
@@ -94,9 +94,35 @@ repositories (each test gets its own repo with one commit):
   control does not inherit the file. Without a worktree the combination is refused
   at admission (`handoff_base_requires_worktree`) and no worker is spawned; if the
   predecessor's worktree was killed, it fails with `handoff_base_unavailable`.
-- **Remote successors.** Both artifact handoffs are refused with
-  `handoff_artifact_unavailable`, because the sidecar and the snapshot live on the
-  master's filesystem.
+- **Remote successors.** A `base: "predecessor"` handoff is refused with
+  `handoff_artifact_unavailable`, because the snapshot commit lives in the
+  master's repository. A `diff` handoff is *not* refused — it is covered
+  end-to-end in `test/artifact.test.ts`.
+
+## `test/artifact.test.ts` — 7 cases
+
+Cross-host diff handoff: the patch crosses the wire instead of being referenced
+by a path the other machine cannot see.
+
+- **End to end.** A mock predecessor writes a file containing secret-shaped
+  strings in a worktree; a real loopback daemon receives the successor's submit
+  with the patch attached, stages it under its own workdir, and runs the task.
+  The test asserts the staged file exists at `<daemon workdir>/handoffs/<taskId>.diff`,
+  that it matches the master's copy byte for byte, that the AWS key was redacted
+  before shipping, and that the daemon-side prompt names the staged **absolute**
+  path with no `{{artifact:}}` token left in it.
+- **Ceiling.** A 4.2 MiB patch with `handoff.maxBytes` raised past the protocol
+  limit fails the task with `handoff_artifact_too_large`, and nothing is staged on
+  the daemon.
+- **Receiver guards (unit, `stageArtifacts`).** A valid artifact is written under
+  `<workdir>/handoffs/`; `../evil.diff`, `sub/evil.diff`, an absolute path and a
+  non-`.diff` name are rejected (`artifact_invalid`); an oversized payload is
+  rejected before any directory is created (`artifact_too_large`); a checksum
+  mismatch and an empty payload are rejected (`artifact_checksum_mismatch`,
+  `artifact_invalid`).
+- **Version skew.** A fake daemon that announces protocol v1 is refused at the
+  handshake (`protocol_mismatch`) instead of being sent a patch it would silently
+  drop, leaving its agent with a literal `{{artifact:0}}` token.
 
 ## `test/contract.test.ts` — 10 cases
 
@@ -320,9 +346,11 @@ Honest limits of the evidence above — these are not covered by the suite yet:
   fields therefore mean "unknown", never zero.
 - **Long-running soak.** Queueing and fairness are tested as unit scenarios, not
   as a multi-hour soak.
-- **Diff handoffs are single-host.** A remote successor is refused rather than
-  shipped a sidecar it cannot read; there is no artifact transfer over the daemon
-  protocol yet.
+- **Cross-host artifacts are loopback-only so far.** Diff handoffs do cross the
+  wire now (verified against a real daemon on 127.0.0.1), but not yet over a
+  physical link or through TLS/mTLS; a single artifact is capped at 4 MiB by the
+  protocol frame, and `base: "predecessor"` stays single-host because a commit
+  object is not a byte payload.
 - **Redaction is a safety net, not a scanner.** It catches well-known key shapes
   and `key = value` assignments; a secret with no recognisable shape passes
   through, so the artifact is still untrusted data.

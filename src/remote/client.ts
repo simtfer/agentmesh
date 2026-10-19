@@ -28,6 +28,7 @@ import type {
   TaskRecord,
 } from "../types.js";
 import {
+  ARTIFACT_PROTOCOL_VERSION as REQUIRED_ARTIFACT_PROTOCOL,
   encode,
   isRecord,
   WS_PATH,
@@ -227,7 +228,26 @@ class RemoteWorkerHandle implements WorkerHandle {
               afterSequence: lastSeq,
             });
           } else {
-            send({ type: "submit", submitId, profile: remoteProfile, prompt: text, cwd: this.cwd });
+            // Handoff artifacts (cross-host diff) ride along with the submit: the
+            // daemon stages them and rewrites `{{artifact:N}}` in the prompt. A
+            // local driver never sees this path, so nothing changes for it.
+            const attachments = opts?.attachments;
+            send({
+              type: "submit",
+              submitId,
+              profile: remoteProfile,
+              prompt: text,
+              cwd: this.cwd,
+              ...(attachments && attachments.length > 0
+                ? {
+                    artifacts: attachments.map((a) => ({
+                      name: a.name,
+                      data: a.data.toString("base64"),
+                      sha256: a.sha256,
+                    })),
+                  }
+                : {}),
+            });
           }
         });
 
@@ -286,7 +306,16 @@ class RemoteWorkerHandle implements WorkerHandle {
   ): void {
     switch (msg.type) {
       case "welcome":
-        // informational; the daemon echoes its exposed profiles
+        // A v1 daemon cannot stage artifacts: it would ignore the attachments and
+        // hand the agent a literal `{{artifact:0}}` token. Fail loudly at the
+        // handshake instead of shipping a prompt that cannot work.
+        if ((ctx.opts?.attachments?.length ?? 0) > 0 && msg.protocol < REQUIRED_ARTIFACT_PROTOCOL) {
+          ctx.fail(
+            `the daemon speaks protocol v${msg.protocol}, but cross-host handoff artifacts need ` +
+              `v${REQUIRED_ARTIFACT_PROTOCOL}; upgrade the daemon, or run the successor locally`,
+            "protocol_mismatch",
+          );
+        }
         return;
       case "submitted":
         ctx.setTaskId(msg.taskId);
