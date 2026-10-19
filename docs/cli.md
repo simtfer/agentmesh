@@ -22,7 +22,6 @@ npx tsx src/cli.ts dispatch --profile pi --task "fix the auth bug" --worktree
 # async task lifecycle (persisted to SQLite)
 npx tsx src/cli.ts submit   --profile pi --prompt "fix the auth bug"   # prints taskId
 npx tsx src/cli.ts tasks    --config agentmesh.yaml
-npx tsx src/cli.ts approve  --approval-id A --decision allow_once
 
 # run workers on another machine (see remote.md)
 npx tsx src/cli.ts daemon   --config agentmesh.yaml --host 127.0.0.1 --port 8790 \
@@ -37,8 +36,13 @@ npx tsx src/cli.ts daemon   --config agentmesh.yaml --host 127.0.0.1 --port 8790
 | `dispatch` | submit and wait for the terminal result in one call |
 | `submit` | submit async, print the `taskId`, exit |
 | `tasks` | list persisted tasks from the store |
-| `approve` | resolve one pending approval by id |
 | `daemon` | run the Worker Daemon for cross-machine workers |
+
+**Approvals have no CLI subcommand.** A pending approval lives in the orchestrator
+that owns the running task; a second process holding the same SQLite file cannot
+answer it, so `agentmesh approve` would either lie or hang. Use the MCP surface
+(`task_approve`, or `task_pending_approvals` to list them) from the same process
+that submitted the task — that is the master agent's job.
 
 ## Attach a real master
 

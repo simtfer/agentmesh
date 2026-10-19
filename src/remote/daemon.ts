@@ -664,7 +664,18 @@ export class WorkerDaemon {
   /* ------------------------------ lifecycle ----------------------------- */
 
   async start(): Promise<{ host: string; port: number; url: string }> {
-    await new Promise<void>((resolve) => this.server.listen(this.port, this.host, resolve));
+    // A failed bind (port taken, address not local) arrives as an 'error' event,
+    // not as a thrown exception — without this the process dies on an unhandled
+    // event with a stack trace, which is the worst possible message for the most
+    // common two-host mistake: another daemon is already listening.
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: Error) => reject(err);
+      this.server.once("error", onError);
+      this.server.listen(this.port, this.host, () => {
+        this.server.off("error", onError);
+        resolve();
+      });
+    });
     const addr = this.server.address() as AddressInfo;
     this.port = addr.port;
 

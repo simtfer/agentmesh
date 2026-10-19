@@ -92,9 +92,9 @@ Usage:
   # async task lifecycle (8-state machine, persisted to SQLite)
   agentmesh submit --profile P --prompt "..." [--config f]     -> prints taskId
   agentmesh tasks  [--config f]                                -> list tasks
-  agentmesh status --task-id T [--config f]
-  agentmesh wait   --task-id T [--timeout ms] [--config f]
-  agentmesh approve --approval-id A --decision allow_once [--config f]
+  # approvals are answered through the MCP surface (task_approve): a pending
+  # approval lives in the orchestrator that owns the run, so a one-shot CLI
+  # process cannot answer one.
 
   # remote worker daemon (run on the worker host; ACP stdio never crosses the wire)
   agentmesh daemon [--config f] [--host h] [--port p]
