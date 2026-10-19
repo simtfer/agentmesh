@@ -59,6 +59,9 @@ agent_list ─▶ plan/decompose ─▶ scheduler_status ─▶ task_submit (×N
    approval-gated. Reuse a live worker with `workerId` for follow-ups that need
    its context — this holds across a remote daemon too: the daemon keeps that
    worker's session alive between turns, so the worker remembers the thread.
+   When the thread must outlive a restart, pass a `sessionKey` (or use a profile
+   with `session` set): the conversation is stored on the worker host and resumed
+   by the next task under the same key.
    Spawn fresh by `profile` for independent work, and `kill_worker` when a
    conversation is over (a reused worker is a live agent process on that host).
 2. **Decompose.** Split the goal into the smallest set of *independently

@@ -52,6 +52,7 @@ const Profile = z.object({
   env: z.record(z.string()).optional(),
   permissionMode: z.string().optional(),
   worktree: z.boolean().optional(),
+  session: z.string().min(1).optional(),
   weight: z.number().positive().optional(),
   mock: MockBehavior.optional(),
   remote: RemoteSettings.optional(),

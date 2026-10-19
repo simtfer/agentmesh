@@ -13,8 +13,9 @@
 
 /** v2: `submit` may carry handoff artifacts (base64 + sha256);
  *  `submit.workerRef` / `submitted.workerRef` add per-conversation worker reuse,
- *  and `release` frees one. Both additions are optional, so a peer that does not
- *  understand them degrades to "a fresh worker per task" instead of failing. */
+ *  and `release` frees one; `submit.sessionKey` adds a conversation identity that
+ *  outlives the daemon process. All additions are optional, so a peer that does
+ *  not understand them degrades to "a fresh worker per task" instead of failing. */
 export const PROTOCOL_VERSION = 2;
 
 /** Oldest daemon a client may send `submit.artifacts` to. */
@@ -70,6 +71,19 @@ export interface SubmitMsg {
    * capability: it is unguessable, and a daemon will refuse one it did not mint.
    */
   workerRef?: string;
+  /**
+   * Pin the task to a *stable* conversation key instead of a per-run handle.
+   * Unlike `workerRef` it survives a daemon restart: when no live worker holds
+   * the key, the daemon spawns one bound to it and the agent resumes the session
+   * stored on disk under that name.
+   *
+   * Precedence: `workerRef` wins when both are sent. If the key is already held
+   * by a live idle worker, that worker is reused; if it is busy, the submit is
+   * refused (`session_busy`) rather than queueing behind an unknown amount of
+   * work. Keys are plain strings, so they are *not* a capability — the daemon
+   * only lets a client reach keys for profiles it is allowed to submit to.
+   */
+  sessionKey?: string;
 }
 
 export interface ApproveMsg {
@@ -156,6 +170,12 @@ export interface SubmittedMsg {
    * from a daemon that predates worker reuse.
    */
   workerRef?: string;
+  /**
+   * The conversation key the task is bound to, echoed so the client learns the
+   * key even when it came from the daemon profile's `session` default. Absent
+   * when the task runs in an ordinary, unkeyed worker.
+   */
+  sessionKey?: string;
 }
 
 /**
@@ -221,6 +241,8 @@ export interface WorkerBoundMsg {
   type: "worker_bound";
   taskId: string;
   workerRef: string;
+  /** The pinned conversation key this worker holds, when it was spawned with one. */
+  sessionKey?: string;
 }
 
 /** Acknowledge a `release`. `ok` is false when the ref was already gone. */
@@ -290,6 +312,9 @@ export function parseClientMsg(raw: string): ClientMsg | undefined {
         }
       }
       if (v.workerRef !== undefined && typeof v.workerRef !== "string") return undefined;
+      if (v.sessionKey !== undefined && (typeof v.sessionKey !== "string" || v.sessionKey.length === 0)) {
+        return undefined;
+      }
       return v as unknown as SubmitMsg;
     case "approve":
       if (typeof v.approvalId !== "string" || typeof v.decision !== "string") return undefined;

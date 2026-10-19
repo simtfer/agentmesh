@@ -15,9 +15,9 @@ to itself.
 |---|---|
 | `agent_list` | configured worker profiles + live workers |
 | `agent_inspect` | one worker's status + recent event log |
-| `spawn_worker` | start a worker (optionally in a git worktree) |
+| `spawn_worker` | start a worker (optionally in a git worktree); `sessionKey` pins it to a named conversation that a later spawn with the same key attaches to |
 | `kill_worker` | close a worker and clean its worktree |
-| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call); `workerId` runs the turn on an existing worker — and on a remote worker that means the same agent session, i.e. a continuous conversation; `deadlineMs`/`deadlineAt` bound queue wait + execution; `dependsOn` gates it behind other tasks; `retry` re-runs transient failures; optional `handoff` chains onto a finished task; `outputSchema` enforces a JSON result contract |
+| `task_submit` | **submit a task, return a `taskId` immediately** (primary async call); `workerId` runs the turn on an existing worker — and on a remote worker that means the same agent session, i.e. a continuous conversation; `sessionKey` does the same by name, and survives a restart; `deadlineMs`/`deadlineAt` bound queue wait + execution; `dependsOn` gates it behind other tasks; `retry` re-runs transient failures; optional `handoff` chains onto a finished task; `outputSchema` enforces a JSON result contract |
 | `task_status` | current status of a task |
 | `task_wait` | block until terminal **or** `waiting` (needs approval) |
 | `task_result` | final text / status / error of a task, plus `structured` (contract result), `usage` (tokens/cost) and `contract` (verdict) |

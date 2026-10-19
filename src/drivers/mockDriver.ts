@@ -34,6 +34,7 @@ class MockWorkerHandle implements WorkerHandle {
     private profileName: string,
     /** this worker was born into one of the profile's "fail first N turns" slots */
     private failTurn = false,
+    readonly sessionKey: string = id,
   ) {}
 
   async runTurn(
@@ -187,7 +188,7 @@ export class MockWorkerDriver implements WorkerDriver {
 
   async createWorker(
     profile: WorkerProfile,
-    opts: { id: string; cwd: string },
+    opts: { id: string; cwd: string; sessionKey?: string },
   ): Promise<WorkerHandle> {
     let failTurn = false;
     if (profile.mock?.failFirst !== undefined) {
@@ -204,6 +205,7 @@ export class MockWorkerDriver implements WorkerDriver {
       profile.mock ?? {},
       profile.name,
       failTurn,
+      opts.sessionKey ?? opts.id,
     );
   }
 }

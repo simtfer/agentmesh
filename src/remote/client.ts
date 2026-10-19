@@ -101,15 +101,29 @@ class RemoteWorkerHandle implements WorkerHandle {
    * The daemon-side worker this handle is talking to. Sent back on every submit
    * so consecutive tasks stay in ONE agent session on the other host; that is
    * what turns "one task per dispatch" into an actual conversation.
+   *
+   * It is an optimization, not the identity: a ref dies with the daemon process,
+   * while `sessionKey` names the conversation that is stored on disk over there.
    */
   private workerRef?: string;
+
+  /**
+   * The pinned conversation this handle belongs to, when it was spawned with
+   * one. Unlike `workerRef` it survives a daemon restart: the daemon resumes the
+   * stored session under this name on the next turn. Mutable because a daemon
+   * may supply the key from its own profile default, which we cannot see here.
+   */
+  sessionKey?: string;
 
   constructor(
     readonly id: string,
     readonly profile: string,
     readonly cwd: string,
     private wp: WorkerProfile,
-  ) {}
+    sessionKey?: string,
+  ) {
+    this.sessionKey = sessionKey ?? wp.session;
+  }
 
   async runTurn(text: string, opts?: RunTurnOptions): Promise<TurnResult> {
     if (this.closed) throw new Error("remote worker is closed");
@@ -246,6 +260,7 @@ class RemoteWorkerHandle implements WorkerHandle {
               prompt: text,
               cwd: this.cwd,
               ...(this.workerRef ? { workerRef: this.workerRef } : {}),
+              ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}),
               ...(attachments && attachments.length > 0
                 ? {
                     artifacts: attachments.map((a) => ({
@@ -329,12 +344,14 @@ class RemoteWorkerHandle implements WorkerHandle {
         // Minted when the task starts; the next turn on this handle will reuse
         // that agent session instead of spawning a new one.
         this.workerRef = msg.workerRef;
+        if (typeof msg.sessionKey === "string") this.sessionKey = msg.sessionKey;
         return;
       case "submitted":
         // Keep the daemon's handle so the next turn continues this conversation.
         // An older daemon omits it; the next turn then starts a fresh worker,
         // which is exactly the pre-reuse behaviour.
         if (typeof msg.workerRef === "string") this.workerRef = msg.workerRef;
+        if (typeof msg.sessionKey === "string") this.sessionKey = msg.sessionKey;
         ctx.setTaskId(msg.taskId);
         return;
       case "task_event":
@@ -439,8 +456,11 @@ class RemoteWorkerHandle implements WorkerHandle {
 export class RemoteWorkerDriver implements WorkerDriver {
   readonly kind = "remote" as const;
 
-  async createWorker(profile: WorkerProfile, o: { id: string; cwd: string }): Promise<WorkerHandle> {
-    return new RemoteWorkerHandle(o.id, profile.name, o.cwd, profile);
+  async createWorker(
+    profile: WorkerProfile,
+    o: { id: string; cwd: string; sessionKey?: string },
+  ): Promise<WorkerHandle> {
+    return new RemoteWorkerHandle(o.id, profile.name, o.cwd, profile, o.sessionKey);
   }
 
   /**

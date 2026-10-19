@@ -107,10 +107,16 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         profile: z.string(),
         cwd: z.string().optional(),
         worktree: z.boolean().optional(),
+        sessionKey: z
+          .string()
+          .optional()
+          .describe(
+            "Pin this worker to a stable conversation key. Re-spawning with the same key resumes the stored conversation (also after a restart) instead of starting a new one. Cannot be combined with worktree, and only one live worker may hold a key.",
+          ),
       },
     },
-    wrap(async ({ profile, cwd, worktree }) => {
-      const workerId = await orch.spawnWorker(profile, { cwd, worktree });
+    wrap(async ({ profile, cwd, worktree, sessionKey }) => {
+      const workerId = await orch.spawnWorker(profile, { cwd, worktree, sessionKey });
       return { workerId, ...(orch.getWorker(workerId) ?? {}) };
     }),
   );
@@ -140,6 +146,12 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         prompt: z.string(),
         profile: z.string().optional(),
         workerId: z.string().optional(),
+        sessionKey: z
+          .string()
+          .optional()
+          .describe(
+            "Run this task in a pinned conversation, spawning a worker bound to it if none is live. The agent keeps its context across tasks that share the key. Ignored when workerId is given.",
+          ),
         cwd: z.string().optional(),
         worktree: z.boolean().optional(),
         timeoutMs: z.number().int().positive().optional(),
@@ -158,11 +170,12 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         budget: budgetSchema.optional(),
       },
     },
-    wrap(({ prompt, profile, workerId, cwd, worktree, timeoutMs, deadlineMs, deadlineAt, idempotencyKey, handoff, outputSchema, dependsOn, retry, budget }) =>
+    wrap(({ prompt, profile, workerId, sessionKey, cwd, worktree, timeoutMs, deadlineMs, deadlineAt, idempotencyKey, handoff, outputSchema, dependsOn, retry, budget }) =>
       orch.submitTask({
         prompt,
         profile,
         workerId,
+        sessionKey,
         cwd,
         worktree,
         timeoutMs,
@@ -348,6 +361,7 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         task: z.string(),
         workerId: z.string().optional(),
         profile: z.string().optional(),
+        sessionKey: z.string().optional(),
         cwd: z.string().optional(),
         worktree: z.boolean().optional(),
         deadlineMs: z.number().int().positive().optional(),
@@ -358,8 +372,8 @@ export function createMcpServer(orch: Orchestrator): McpServer {
         budget: budgetSchema.optional(),
       },
     },
-    wrap(async ({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry, budget }) => {
-      const r = await orch.dispatch({ task, workerId, profile, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry, budget });
+    wrap(async ({ task, workerId, profile, sessionKey, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry, budget }) => {
+      const r = await orch.dispatch({ task, workerId, profile, sessionKey, cwd, worktree, deadlineMs, handoff, outputSchema, dependsOn, retry, budget });
       return r;
     }),
   );

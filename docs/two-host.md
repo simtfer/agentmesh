@@ -138,7 +138,9 @@ profiles:
     driver: acpx
     agent: pi                      # acpx built-in -> `npx pi-acp`
     cwd: /srv/repos                # default working dir for this profile on B
-    worktree: true                 # isolate each task in a git worktree (optional)
+    session: pi-main               # optional: one long-lived conversation, resumed after a restart
+    # worktree: true               # isolate each task in a worktree — the opposite trade-off;
+                                   # cannot be combined with `session`
 
 daemon:
   host: 0.0.0.0                    # default 127.0.0.1 — must be reachable from A
@@ -178,6 +180,11 @@ Why each of the load-bearing ones exists:
 - **`workerIdleMs`** bounds a conversation. A reused worker is a live, logged-in
   agent on this host; `0` means "keep it until the daemon stops", the default 30
   minutes means an abandoned master costs you half an hour of that, not forever.
+- **`session`** pins the profile to one named conversation, stored on B and
+  resumed by the next turn under that name — including after a daemon restart or
+  an agent crash. It implies a fixed `cwd` (a session that moves cannot resume)
+  and one live worker of that profile at a time. Leave it out for fan-out work.
+  See [The loop](#the-loop-dispatch-result-continue).
 - **`workdir`** is B's state, not A's: the task store, worktrees and
   `<workdir>/handoffs/` for staged patches all live here. It does not have to be
   inside `allowCwd`.
@@ -331,6 +338,9 @@ to B, and it decides what happens next. What B *is* during that loop is a choice
 - **One worker for many turns** — `spawn_worker` once, then `task_submit` with that
   `workerId`. The daemon keeps the worker, and therefore its ACP session and its
   context, alive between tasks. That is the "A keeps talking to B" shape.
+- **A pinned session** — give the profile a `session` name, or pass `sessionKey` on
+  the submit. The conversation is stored under that name on B, so it outlives the
+  worker *and* the daemon process: the next turn under the same key resumes it.
 
 ```
 Claude Code (A)                                    daemon (B)
@@ -349,6 +359,31 @@ host. A second turn submitted while the first is still running is refused with
 `worker_ref_busy`, so the master waits for its own task rather than interleaving
 two prompts into one session.
 
+A pinned session trades that handle for a name, and gets restart survival:
+
+```yaml
+- name: worker-pi
+  driver: acpx
+  agent: pi
+  cwd: /srv/projects/demo        # fixed: a session that moves cannot resume
+  session: pi-main               # the conversation's name on this host
+```
+
+```
+  task_submit {profile: worker-pi, "read the failing test"}  -->  pi (session pi-main)
+  <--------------------------------------------------------  result
+  ... B restarts: daemon, agent process, everything ...
+  task_submit {profile: worker-pi, "now fix it"}            -->  pi, same session, remembers
+  <--------------------------------------------------------  result
+```
+
+`session` is per profile, so it also means one live worker of that profile at a
+time. Use `workerId` when you want to reuse a worker you just talked to; use a
+`session` when the conversation has to survive A restarting, B restarting, or
+another master taking over. See
+[`remote.md`](./remote.md#conversations-one-worker-many-turns) for the wire-level
+rules, and note that a pinned session cannot be combined with `worktree: true`.
+
 Five rules decide whether turn two actually continues turn one.
 
 1. **Reusing the worker is what keeps the conversation.** With a reused
@@ -363,7 +398,8 @@ Five rules decide whether turn two actually continues turn one.
    worker keeps its own worktree, so its turns stay coherent. The moment you
    start a fresh worker it branches from the repo's HEAD and cannot see the
    predecessor's uncommitted work — and `kill_worker` deletes the worktree, so
-   release after committing, not before.
+   release after committing, not before. A pinned session refuses `worktree` for
+   the same reason: a new worktree path every spawn would never resume.
 4. **Cross-host continuation is explicit.** If turn one ran on A and turn two runs
    on B, the patch is on the wrong machine: pass
    `handoff: {fromTaskId, inject: "diff"}` and it travels as bytes, or
@@ -372,8 +408,10 @@ Five rules decide whether turn two actually continues turn one.
    [`handoff.md`](./handoff.md#cross-host-handoff).
 5. **`resume: true` is about the socket, not the agent.** It re-attaches the
    event stream after a dropped connection. It does not keep a session alive
-   between tasks, and it does not survive a daemon restart — the conversation
-   does, as long as the daemon stays up and the ref has not expired.
+   between tasks by itself, and a `workerRef` does not survive a daemon restart.
+   What survives is the *stored session* behind a pinned `sessionKey`: after a
+   restart the next turn under that key resumes it, while a ref-only submit is
+   refused (`worker_ref_unknown`) rather than silently starting over.
 
 If the next step depends on *what* came back, give the task an `outputSchema`
 ([`contracts.md`](./contracts.md)): the verdict arrives as `structured`, so the
@@ -508,6 +546,7 @@ Messages below are the ones the code actually emits.
 | B runtime | `worker_ref_unknown` | the conversation expired (`workerIdleMs`) or was released | drop the `workerId` and spawn a new worker; the session is gone |
 | B runtime | `worker_ref_busy` | a turn on that worker is still running | `task_wait` for it; one session takes one prompt at a time |
 | B runtime | `worker_ref_cwd_mismatch` | a reused worker was asked to move directory | a conversation keeps its `cwd`; `kill_worker` and start elsewhere |
+| B runtime | `session_key_mismatch` | a `workerRef` was paired with a different `sessionKey` | a worker's session name is fixed at creation; drop the ref to start another conversation |
 | B audit | `tls_reject` with `peer did not return a certificate` | mTLS on, A sent no client cert | add `remote.cert`/`remote.key` |
 | A | `401` on upgrade | token mismatch | same secret on both sides |
 | A | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | A trusts a different CA | point `remote.ca` at B's `ca.pem` |
@@ -557,6 +596,14 @@ Stated plainly, because "it works" is not one claim:
   (`npm run real`). **Not** verified: a Claude Code session driving this stack
   end to end — the wiring above is the standard stdio MCP entry, but treat it as
   untested until you have seen `claude mcp list` report it healthy.
+- **A pinned session was verified against real `pi`, not just mock.** Two turns
+  were sent to one `sessionKey`; the daemon was then stopped, a new one started
+  from the same `workdir`, and the same key sent a third turn. pi answered with
+  the value it had been told two lifetimes earlier (`417`), and its ACP session
+  id was identical before and after. What that exercises: the session record on
+  B's disk, the `resume` path through acpx, and the client's `sessionKey` wire
+  field. What it does not: two physical machines, or a pi that has logged out in
+  between.
 - **Not** covered: two physical machines. DNS, routing and the worker's firewall
   are exactly what the checklist above is for, and they are the steps that fail
   first in practice. macOS is untested.

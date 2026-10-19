@@ -123,7 +123,8 @@ profiles:
     driver: acpx
     agent: pi                      # acpx 内置名 -> `npx pi-acp`
     cwd: /srv/repos                # 该 profile 在 B 上的默认工作目录
-    worktree: true                 # 每个任务隔离在独立 git worktree（可选）
+    session: pi-main               # 可选：一个长期会话，重启后会被接回来
+    # worktree: true               # 每个任务隔离在独立 worktree——另一种取舍，不能与 session 同用
 
 daemon:
   host: 0.0.0.0                    # 默认 127.0.0.1——必须让 A 能连上
@@ -156,6 +157,9 @@ daemon:
 - **`worktree: true`** 让每个任务在自己的、从仓库 HEAD 拉出的 worktree 里跑。并行*写*任务该开；
   串联链条只有**复用同一个 worker** 时才连贯，而释放该 worker 会删掉 worktree——先提交。
   见[闭环](#闭环下发回传再继续)。
+- **`session`** 把这个 profile 钉在一个具名会话上，会话存在 B 上，同一个名字的下一轮会把它接回来——
+  包括 daemon 重启、agent 进程崩掉之后。它隐含固定的 `cwd`（会换目录的会话恢复不了），
+  也隐含同一时刻只有一个该 profile 的 worker。做扇出任务时别配它。见[闭环](#闭环下发回传再继续)。
 - **`workerIdleMs`** 给会话兜底。被复用的 worker 是这台机器上一个活着的、已登录的 agent；
   `0` 表示留到 daemon 停止，默认 30 分钟表示“被遗忘的 master”最多占你半小时，而不是永久。
 - **`workdir`** 是 B 的状态，不是 A 的：任务库、worktree、暂存补丁的 `<workdir>/handoffs/` 都在这里。
@@ -296,6 +300,8 @@ master 是调度器：你跟它说话，它拆任务、下发给 B、再决定�
 - **每个任务一个新 worker**（默认）。B 每次拉一个新的 agent 进程，上一个任务学到的东西不留。
 - **一个 worker 跑很多轮**——先 `spawn_worker`，之后一直用同一个 `workerId` 调 `task_submit`。
   daemon 会把这个 worker 连着它的 ACP 会话和上下文一起留着。这才是“A 一直在跟 B 说话”的形态。
+- **固定会话（pinned session）**——给 profile 配一个 `session` 名字，或在提交时带 `sessionKey`。
+  会话以这个名字存在 B 上，所以它不止活过 worker，还活过 daemon 进程：同一个 key 的下一轮会把它接回来。
 
 ```
 Claude Code（A）                                   daemon（B）
@@ -312,6 +318,30 @@ Claude Code（A）                                   daemon（B）
 已登录的 agent 进程。上一轮还没跑完就提交下一轮，会被拒成 `worker_ref_busy`，
 master 应该先等自己的任务，而不是把两段 prompt 塞进同一个会话。
 
+固定会话则是拿句柄换一个名字，换到的是“重启也还在”：
+
+```yaml
+- name: worker-pi
+  driver: acpx
+  agent: pi
+  cwd: /srv/projects/demo        # 必须固定：换目录的会话恢复不了
+  session: pi-main               # 这个会话在 B 上的名字
+```
+
+```
+  task_submit {profile: worker-pi, "读一下挂掉的测试"}  ---->  pi（会话 pi-main）
+  <----------------------------------------------------  结果
+  ……B 重启：daemon、agent 进程，全都重来……
+  task_submit {profile: worker-pi, "现在把它修掉"}      ---->  pi，同一个会话，还记得
+  <----------------------------------------------------  结果
+```
+
+`session` 是挂在 profile 上的，所以它也意味着这个 profile 同时只能有一个活着的 worker。
+想接着刚聊过的 worker 说话，用 `workerId`；要让对话活过 A 重启、B 重启，或者交给另一个 master
+接手，用 `session`。线上协议层的规则见
+[`remote.md`](./remote.md#conversations-one-worker-many-turns)，另注意固定会话不能与
+`worktree: true` 组合。
+
 第二轮回不回得到第一轮，取决于五条：
 
 1. **复用 worker 才是“记得”的来源。** 用同一个 `workerId` 时，B 的 agent 看得到自己上一轮的
@@ -321,13 +351,16 @@ master 应该先等自己的任务，而不是把两段 prompt 塞进同一个�
    传不过去的是那些只存在于对话里的东西。
 3. **`worktree: true` 只在复用期间成立。** 被复用的 worker 一直待在自己的 worktree 里，多轮是连贯的；
    一旦换成新 worker，它就又从仓库 HEAD 拉一份，看不见前任没提交的改动——而 `kill_worker`
-   会删掉 worktree，所以要先提交再释放。
+   会删掉 worktree，所以要先提交再释放。固定会话出于同样的理由拒绝 `worktree`：
+   每次 spawn 都换一个 worktree 路径，就永远恢复不上。
 4. **跨机器的“继续”必须显式。** 第一轮在 A 上跑、第二轮在 B 上跑，补丁就在错的那台机器上：
    传 `handoff: {fromTaskId, inject: "diff"}` 让它按字节过去，或用 `inject: "result"` 把文本内联。
    远程后继用 `base: "predecessor"` 会被拒——commit 对象过不了主机边界。
    详见 [`handoff.md`](./handoff.md#cross-host-handoff)。
-5. **`resume: true` 管的是 socket，不是 agent。** 它只在掉线后把事件流接回来；不会让会话在任务之间
-   活着，也撑不过 daemon 重启——只要 daemon 还在、ref 没过期，会话本身是活的。
+5. **`resume: true` 管的是 socket，不是 agent。** 它只在掉线后把事件流接回来；它本身不会让会话
+   在任务之间活着，而 `workerRef` 也撑不过 daemon 重启。真正撑得过的是固定 `sessionKey` 背后
+   *落在磁盘上的会话*：重启后同一个 key 的下一轮会把它接回来，而只带一个死 ref 的提交会被拒成
+   `worker_ref_unknown`，不会假装从头开始。
 
 如果下一步取决于*回来的是什么*，给任务加 `outputSchema`（[`contracts.md`](./contracts.md)）：
 判定结果以 `structured` 回来，master 就能按数据分支，而不是从最终文本里抠字。
@@ -443,6 +476,7 @@ reload 会拒绝空集合，所以打错字既不会让 daemon 变成免鉴权�
 | B 运行 | `worker_ref_unknown` | 会话已过期（`workerIdleMs`）或被释放 | 丢掉 `workerId` 重新 spawn；那个会话已经没了 |
 | B 运行 | `worker_ref_busy` | 这个 worker 上一轮还在跑 | 先 `task_wait`；一个会话一次只吃一段 prompt |
 | B 运行 | `worker_ref_cwd_mismatch` | 想让被复用的 worker 换目录 | 会话的 `cwd` 固定；要换就 `kill_worker` 重开 |
+| B 运行 | `session_key_mismatch` | 拿一个 `workerRef` 配上另一个 `sessionKey` | 会话名在创建时就定了；想换会话就别带 ref，重新提交 |
 | B 审计 | `tls_reject` 带 `peer did not return a certificate` | 开了 mTLS，A 没带客户端证书 | 补 `remote.cert`/`remote.key` |
 | A | 升级连接时 `401` | token 不一致 | 两端同一个密钥 |
 | A | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | A 信任的 CA 不对 | `remote.ca` 指向 B 的 `ca.pem` |
@@ -481,6 +515,11 @@ reload 会拒绝空集合，所以打错字既不会让 daemon 变成免鉴权�
   驱动它跑完整任务生命周期，含审批），另外也在同一台机器上对真实的 `pi` 与 `opencode` worker
   跑过（`npm run real`）。**没有**验证的是：用一次真正的 Claude Code 会话把整套跑通——上面那段
   接法是标准的 stdio MCP 配置，但在你亲眼看到 `claude mcp list` 报健康之前，请按“未验证”对待。
+- **固定会话是拿真实 `pi` 验证的，不是 mock。** 同一个 `sessionKey` 连发两轮，然后停掉 daemon、
+  用同一个 `workdir` 起一个新的，再用同一个 key 发第三轮。pi 答出了两“辈子”之前被告知的数字
+  （`417`），而它的 ACP 会话 id 前后完全一致。这条覆盖的是：B 磁盘上的会话记录、acpx 的 resume
+  路径、以及客户端上的 `sessionKey` 这一段线格式。**没有**覆盖的是：两台物理机器，
+  或者这中间 pi 被登出。
 - **没有**覆盖的是：两台物理机器。DNS、路由、worker 的防火墙正是上面那份清单要解决的东西，
   也恰恰是实践中最先失败的部分。macOS 未验证。
 

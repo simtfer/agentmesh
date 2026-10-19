@@ -50,10 +50,12 @@
 | CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 干净通过；`npm test` **134/134**（tasks(32) + handoff(12) + artifact(7) +
-paths(3) + contract(10) + dag(18) + budget(11) + remote(23) + deploy(8) + orchestrator(6) + skill(4)）；
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **142/142**（tasks(32) + handoff(12) + artifact(7) +
+paths(3) + contract(10) + dag(18) + budget(11) + remote(26) + deploy(8) + orchestrator(11) + skill(4)）；
 （远程 daemon 支持**会话复用**：同一 `workerId` 连续 `task_submit` 复用 B 侧 agent 会话，
-`daemon.workerIdleMs` 兜底回收。）
+`daemon.workerIdleMs` 兜底回收；**固定会话**：profile 配 `session` 或提交带 `sessionKey`，
+会话落盘、daemon 重启后同 key 恢复——已用真实 pi 验证：停 daemon 再用同 key 提交，
+pi 仍记得上一「辈子」之前被告知的数字，ACP 会话 id 前后一致。）
 `npm run demo` 双场景闭环 `CLOSED ✅`；`npm run smoke` 真实 MCP stdio 全生命周期
 （`accepted, started, output…, waiting, resumed, output…, completed`）；`npm run real`
 对**真实 opencode + pi** 走 `submit → wait → result`，均 `succeeded`（2 任务 / 27 事件入库）。

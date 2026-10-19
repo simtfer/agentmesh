@@ -48,7 +48,7 @@ function numeric(v: unknown): number | undefined {
 export interface WorkerProvider {
   spawnWorker(
     profile: string,
-    opts?: { cwd?: string; worktree?: boolean; baseCommit?: string },
+    opts?: { cwd?: string; worktree?: boolean; baseCommit?: string; sessionKey?: string },
   ): Promise<string>;
   getWorkerRecord(workerId: string): WorkerRecord | undefined;
   cancelWorkerTurn(workerId: string): Promise<void>;
@@ -1327,6 +1327,7 @@ export class TaskManager {
           cwd: input.cwd,
           worktree: input.worktree,
           ...(baseCommit ? { baseCommit } : {}),
+          ...(input.sessionKey ? { sessionKey: input.sessionKey } : {}),
         });
       }
       live.workerId = workerId;
@@ -1337,7 +1338,7 @@ export class TaskManager {
       // worker is gone (the submitted `cwd` may be the repo root, not the worktree).
       this.store.updateTask(taskId, {
         workerId,
-        sessionId: workerId,
+        sessionId: wrec.sessionKey ?? workerId,
         ...(wrec.cwd ? { workingDirectory: wrec.cwd } : {}),
       });
 
@@ -1833,6 +1834,18 @@ export class TaskManager {
 
   listTasks(filter?: { status?: TaskStatus; limit?: number }): TaskRecord[] {
     return this.store.listTasks(filter);
+  }
+
+  /**
+   * Whether a task is currently running on this worker. Used to decide whether a
+   * pinned session may be attached to a second turn: a live task means the
+   * transcript is mid-turn, and a second prompt would interleave with it.
+   */
+  isWorkerBusy(workerId: string): boolean {
+    for (const live of this.live.values()) {
+      if (live.workerId === workerId) return true;
+    }
+    return false;
   }
 
   /**

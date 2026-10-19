@@ -29,7 +29,18 @@ class AcpxWorkerHandle implements WorkerHandle {
     readonly cwd: string,
     private runtime: AcpRuntime,
     private handle: AcpRuntimeHandle,
+    readonly sessionKey: string,
   ) {}
+
+  /**
+   * The agent's own session id, straight from the ACP handle. Exposed for
+   * diagnostics only — it is opaque, and it is *not* what you pass to resume a
+   * conversation (that is `sessionKey`). Absent when the adapter never reported
+   * one, which is legal.
+   */
+  get agentSessionId(): string | undefined {
+    return this.handle.agentSessionId ?? this.handle.backendSessionId;
+  }
 
   async runTurn(
     text: string,
@@ -211,15 +222,20 @@ export class AcpxWorkerDriver implements WorkerDriver {
 
   async createWorker(
     profile: WorkerProfile,
-    o: { id: string; cwd: string },
+    o: { id: string; cwd: string; sessionKey?: string },
   ): Promise<WorkerHandle> {
     const agent = profile.agent ?? profile.name;
+    // A pinned session key is what makes a conversation outlive the process:
+    // acpx keys its on-disk session record by this string, and `ensureSession`
+    // resumes that record when the key, agent, argv and cwd all still match.
+    // Without one, every spawn is a fresh conversation.
+    const sessionKey = o.sessionKey ?? o.id;
     if (profile.permissionMode) {
-      this.permBySessionKey.set(o.id, profile.permissionMode as PermissionMode);
+      this.permBySessionKey.set(sessionKey, profile.permissionMode as PermissionMode);
     }
 
     const handle = await this.runtime.ensureSession({
-      sessionKey: o.id,
+      sessionKey,
       agent,
       mode: "persistent",
       cwd: o.cwd,
@@ -233,7 +249,7 @@ export class AcpxWorkerDriver implements WorkerDriver {
       }
     }
 
-    return new AcpxWorkerHandle(o.id, profile.name, o.cwd, this.runtime, handle);
+    return new AcpxWorkerHandle(o.id, profile.name, o.cwd, this.runtime, handle, sessionKey);
   }
 
   async dispose(): Promise<void> {

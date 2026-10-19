@@ -132,7 +132,7 @@ export class WorkerDaemon {
    */
   private conversations = new Map<
     string,
-    { workerId: string; lastUsedAt: number; active: Set<string> }
+    { workerId: string; sessionKey?: string; lastUsedAt: number; active: Set<string> }
   >();
   /** task → conversation, so a terminal event frees the worker for the next turn */
   private taskRef = new Map<string, string>();
@@ -483,21 +483,28 @@ export class WorkerDaemon {
       return;
     }
 
+    // Echo the effective key, including a profile-level default the client
+    // cannot see. Same precedence as the orchestrator: per-submit wins.
+    let sessionKey: string | undefined =
+      msg.sessionKey ?? this.opts.config.profiles.find((p) => p.name === profile)?.session;
+
     // A `workerRef` turns this submit into the next turn of an existing
     // conversation: same worker, same agent session, same directory.
-    const conv = msg.workerRef ? this.conversations.get(msg.workerRef) : undefined;
+    let conv = msg.workerRef ? this.conversations.get(msg.workerRef) : undefined;
+    let ref = msg.workerRef;
     const reject = (code: string, message: string, reason = code) => {
       this.audit.record("submit_rejected", {
         connId: state.connId,
         reason,
         profile,
         ...(msg.workerRef ? { workerRef: msg.workerRef } : {}),
+        ...(msg.sessionKey ? { sessionKey: msg.sessionKey } : {}),
         ...(msg.cwd ? { requestedCwd: msg.cwd } : {}),
       });
       this.send(state, { type: "error", submitId: msg.submitId, message, code });
     };
 
-    if (msg.workerRef && !conv) {
+    if (msg.workerRef && !conv && !msg.sessionKey) {
       // Expired, released, or minted by another daemon: never silently fall back
       // to a fresh worker — the master would believe it was continuing a thread.
       reject(
@@ -507,6 +514,21 @@ export class WorkerDaemon {
       );
       return;
     }
+    // A `sessionKey` names a conversation, not a handle. It is the one thing
+    // that survives a daemon restart (the ACP session record is on disk keyed by
+    // it), so it is resolved here into the live conversation when one exists —
+    // then this turn goes through the same profile, cwd and busy checks as a
+    // workerRef turn instead of taking a second path.
+    if (!conv && msg.sessionKey) {
+      const found = [...this.conversations].find(([, c]) => c.sessionKey === msg.sessionKey);
+      if (found) {
+        ref = found[0];
+        conv = found[1];
+      }
+    }
+    // The ref may have died with a previous daemon process while the key still
+    // names a stored session: continue by key rather than echo a dead handle.
+    if (!conv && ref && !this.conversations.has(ref)) ref = undefined;
     if (conv && conv.active.size > 0) {
       reject(
         "worker_ref_busy",
@@ -514,6 +536,20 @@ export class WorkerDaemon {
         "worker_ref_busy",
       );
       return;
+    }
+    if (conv) {
+      // Never let a client relabel an existing conversation: the worker keeps
+      // the session it was spawned with, so accepting a different key here would
+      // make the master believe it holds a conversation it does not.
+      if (msg.sessionKey && msg.sessionKey !== conv.sessionKey) {
+        reject(
+          "session_key_mismatch",
+          `this worker belongs to session "${conv.sessionKey ?? "(unkeyed)"}", not "${msg.sessionKey}"`,
+          "session_key_mismatch",
+        );
+        return;
+      }
+      if (conv.sessionKey) sessionKey = conv.sessionKey;
     }
 
     // Confine the working directory to the whitelist before any agent starts.
@@ -523,7 +559,7 @@ export class WorkerDaemon {
     if (conv) {
       const wrec = orch.getWorkerRecord(conv.workerId);
       if (!wrec) {
-        this.conversations.delete(msg.workerRef!);
+        if (ref) this.conversations.delete(ref);
         reject("worker_ref_unknown", "the worker behind this conversation is gone", "worker_ref_lost");
         return;
       }
@@ -611,6 +647,9 @@ export class WorkerDaemon {
           prompt,
           profile,
           ...(conv ? { workerId: conv.workerId } : {}),
+          // A pinned key is only meaningful when this turn spawns: with a live
+          // conversation the worker is already bound to the same session.
+          ...(!conv && msg.sessionKey ? { sessionKey: msg.sessionKey } : {}),
           cwd,
           timeoutMs: msg.timeoutMs,
           idempotencyKey: msg.idempotencyKey,
@@ -647,14 +686,14 @@ export class WorkerDaemon {
     if (conv) {
       // A reused worker is busy until this turn's terminal event.
       conv.active.add(record.taskId);
-      this.taskRef.set(record.taskId, msg.workerRef!);
+      if (ref) this.taskRef.set(record.taskId, ref);
     }
     this.audit.record("submit_ok", {
       connId: state.connId,
       taskId: record.taskId,
       profile,
       cwd,
-      ...(conv ? { workerRef: msg.workerRef, reused: true } : { reused: false }),
+      ...(conv ? { workerRef: ref, reused: true } : { reused: false }),
       ...(staged.length > 0
         ? { artifacts: staged.length, artifactBytes: staged.reduce((n, a) => n + a.bytes, 0) }
         : {}),
@@ -663,7 +702,8 @@ export class WorkerDaemon {
       type: "submitted",
       submitId: msg.submitId,
       taskId: record.taskId,
-      ...(conv ? { workerRef: msg.workerRef } : {}),
+      ...(ref ? { workerRef: ref } : {}),
+      ...(sessionKey ? { sessionKey } : {}),
     });
   }
 
@@ -790,22 +830,45 @@ export class WorkerDaemon {
     if (ev.type === "started" && !this.taskRef.has(ev.taskId)) {
       const workerId = ev.workerId ?? this.opts.orchestrator.taskStatus(ev.taskId)?.workerId;
       if (workerId) {
-        const ref = `w-${randomUUID()}`;
-        this.conversations.set(ref, {
-          workerId,
-          lastUsedAt: Date.now(),
-          active: new Set([ev.taskId]),
-        });
+        // A worker can already have a conversation: it was spawned under a
+        // pinned `sessionKey` and this is its second turn. Minting a second ref
+        // would leave two handles on one worker, and releasing either would kill
+        // the other — so reuse the existing one.
+        const existing = [...this.conversations].find(([, c]) => c.workerId === workerId);
+        const sessionKey = this.opts.orchestrator.getWorkerRecord(workerId)?.sessionKey;
+        let ref: string;
+        let conv: { workerId: string; sessionKey?: string; lastUsedAt: number; active: Set<string> };
+        if (existing) {
+          [ref, conv] = existing;
+          conv.active.add(ev.taskId);
+          conv.lastUsedAt = Date.now();
+          if (sessionKey) conv.sessionKey = sessionKey;
+        } else {
+          ref = `w-${randomUUID()}`;
+          conv = {
+            workerId,
+            ...(sessionKey ? { sessionKey } : {}),
+            lastUsedAt: Date.now(),
+            active: new Set([ev.taskId]),
+          };
+          this.conversations.set(ref, conv);
+          this.audit.record("worker_created", {
+            connId: state.connId,
+            workerRef: ref,
+            workerId,
+            taskId: ev.taskId,
+            ...(sessionKey ? { sessionKey } : {}),
+          });
+        }
         this.taskRef.set(ev.taskId, ref);
         if (!state.closed) {
-          this.send(state, { type: "worker_bound", taskId: ev.taskId, workerRef: ref });
+          this.send(state, {
+            type: "worker_bound",
+            taskId: ev.taskId,
+            workerRef: ref,
+            ...(conv.sessionKey ? { sessionKey: conv.sessionKey } : {}),
+          });
         }
-        this.audit.record("worker_created", {
-          connId: state.connId,
-          workerRef: ref,
-          workerId,
-          taskId: ev.taskId,
-        });
       }
     }
 

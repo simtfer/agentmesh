@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 134 tests, offline, ~27s
+npm test            # 142 tests, offline, ~27s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -288,7 +288,7 @@ Two guards on what a fan-out costs *while it runs*: approval width and spend.
   the budget open: `budget.spentCost` shows `[{ USD, 10 }]` and the next submit is
   admitted.
 
-## `test/remote.test.ts` — 23 cases
+## `test/remote.test.ts` — 26 cases
 
 Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
 
@@ -312,6 +312,10 @@ Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
   separate; an unknown `workerRef` is refused instead of silently starting over;
   a second turn while the first is running is refused (`worker_ref_busy`);
   `kill_worker` releases the daemon-side session.
+- **Pinned sessions.** A `sessionKey` keeps one daemon worker across two separate
+  connections (the ref cannot do that); a dead `workerRef` sent alongside a live
+  `sessionKey` continues the conversation instead of failing; a `workerRef` paired
+  with a different `sessionKey` is refused (`session_key_mismatch`).
 - **Audit.** The daemon writes a structured NDJSON trail and never the token in
   cleartext.
 
@@ -348,12 +352,18 @@ The same path driven over a *real interface* (not loopback) is `npm run
 deploy:tls`; it is a script rather than a test because it needs `openssl` and a
 non-internal IPv4 address, which a hermetic suite cannot assume.
 
-## `test/orchestrator.test.ts` — 6 cases
+## `test/orchestrator.test.ts` — 11 cases
 
 The synchronous façade: dispatch spawns a worker and completes the loop; a spawned
 worker is reusable for follow-ups via `workerId`; events surface as task output
 events; a failing worker reports `failed`; `kill_worker` removes it from the
 registry; `listProfiles` reflects config.
+
+Pinned sessions at the same layer: spawning twice under one `sessionKey` attaches
+to the live worker instead of starting a second; different keys stay separate; a
+profile-level `session` applies with no per-spawn key; a pinned session refuses
+`worktree`; attaching while the conversation is mid-turn is refused (`is busy`)
+rather than queued.
 
 ## `test/skill.test.ts` — 4 cases
 
@@ -379,6 +389,13 @@ as browsable resources.
   completes over TLS, the daemon observes the peer on that address, wrong CA
   refused, mTLS without a certificate refused, mTLS with one completes. Run on
   Windows with address `192.168.110.27`.
+- **Pinned session against real `pi`** (ad-hoc run, not part of `npm test` because
+  it needs a logged-in agent and spends tokens). Turn one told pi to remember
+  `417`; the daemon was stopped; a new daemon was started from the same `workdir`;
+  turn two on the same `sessionKey` asked for the number and pi answered `417`.
+  The ACP session id was byte-identical across the restart. This exercises the
+  three things the unit suite can only mock: the session record on disk, acpx's
+  `resume` path, and the client's `sessionKey` wire field.
 
 ## Known gaps
 

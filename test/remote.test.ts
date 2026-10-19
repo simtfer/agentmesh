@@ -722,7 +722,7 @@ test("an unknown workerRef is refused instead of silently starting over", async 
 function submitAndBind(
   url: string,
   body: Record<string, unknown>,
-): Promise<{ taskId: string; workerRef: string }> {
+): Promise<{ taskId: string; workerRef: string; sessionKey?: string }> {
   return new Promise((resolve, reject) => {
     const ws = new WS(`${url.replace(/^http/, "ws")}/ws`, {
       headers: { authorization: `Bearer ${TOKEN}` },
@@ -735,12 +735,33 @@ function submitAndBind(
     ws.on("error", reject);
     ws.on("open", () => ws.send(JSON.stringify({ type: "submit", submitId: randomUUID(), ...body })));
     ws.on("message", (d) => {
-      const m = JSON.parse(d.toString()) as { type: string; taskId?: string; workerRef?: string };
-      if (m.type === "submitted" && m.taskId) taskId = m.taskId;
+      const m = JSON.parse(d.toString()) as {
+        type: string;
+        taskId?: string;
+        workerRef?: string;
+        sessionKey?: string;
+        message?: string;
+        code?: string;
+      };
+      if (m.type === "submitted" && m.taskId) {
+        taskId = m.taskId;
+        // A reused conversation answers with the ref inline; only a brand-new
+        // worker needs the later `worker_bound` (it is minted when it starts).
+        if (m.workerRef) {
+          clearTimeout(timer);
+          ws.close();
+          resolve({ taskId, workerRef: m.workerRef, sessionKey: m.sessionKey });
+        }
+      }
+      if (m.type === "error") {
+        clearTimeout(timer);
+        ws.close();
+        reject(new Error(`daemon refused the submit: ${m.code} ${m.message ?? ""}`));
+      }
       if (m.type === "worker_bound" && taskId && m.workerRef) {
         clearTimeout(timer);
         ws.close();
-        resolve({ taskId, workerRef: m.workerRef });
+        resolve({ taskId, workerRef: m.workerRef, sessionKey: m.sessionKey });
       }
     });
   });
@@ -782,6 +803,92 @@ test("closing a remote worker releases the session on the daemon", async () => {
     await until(() => harness.dOrch.listWorkers().length === 0);
   } finally {
     await orch.shutdown();
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a pinned sessionKey keeps ONE daemon worker across separate connections", async () => {
+  // The master may reconnect (or a different process may take over) between
+  // turns. A workerRef cannot survive that; a sessionKey names the conversation
+  // itself, so the second submit lands on the same worker on machine B.
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir], { orphanGraceMs: 500 });
+  try {
+    const first = await submitAndBind(harness.url, {
+      profile: "fast",
+      prompt: "first question",
+      cwd: dir,
+      sessionKey: "conv-1",
+    });
+    assert.equal(first.sessionKey, "conv-1", "the daemon should echo the key it bound");
+    await until(() => harness.dOrch.listTasks({ status: "succeeded" }).length === 1);
+
+    const second = await submitAndBind(harness.url, {
+      profile: "fast",
+      prompt: "second question",
+      cwd: dir,
+      sessionKey: "conv-1",
+    });
+    assert.equal(harness.dOrch.listWorkers().length, 1, "same key must not spawn a second worker");
+    assert.equal(second.workerRef, first.workerRef, "the ref identifies the one conversation");
+    assert.equal(second.sessionKey, "conv-1");
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a dead workerRef falls back to the sessionKey instead of failing", async () => {
+  // After a daemon restart every ref is gone, but the conversation is still on
+  // disk under its key. Sending both must continue the thread, not error out.
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir], { orphanGraceMs: 500 });
+  try {
+    await submitAndBind(harness.url, {
+      profile: "fast",
+      prompt: "warm the session",
+      cwd: dir,
+      sessionKey: "conv-2",
+    });
+    await until(() => harness.dOrch.listTasks({ status: "succeeded" }).length === 1);
+
+    const res = await submitFrame(harness.url, {
+      profile: "fast",
+      prompt: "after the restart",
+      cwd: dir,
+      sessionKey: "conv-2",
+      workerRef: "w-from-the-previous-process",
+    });
+    assert.equal(res.code, undefined, `expected the key to carry the turn, got ${res.code}`);
+    assert.equal(harness.dOrch.listWorkers().length, 1);
+  } finally {
+    await harness.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a workerRef cannot be relabelled with a different sessionKey", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-shared-"));
+  const harness = await startDaemon([dir], { orphanGraceMs: 500 });
+  try {
+    const bound = await submitAndBind(harness.url, {
+      profile: "fast",
+      prompt: "start",
+      cwd: dir,
+      sessionKey: "conv-a",
+    });
+    await until(() => harness.dOrch.listTasks({ status: "succeeded" }).length === 1);
+
+    const res = await submitFrame(harness.url, {
+      profile: "fast",
+      prompt: "pretend to be another conversation",
+      cwd: dir,
+      workerRef: bound.workerRef,
+      sessionKey: "conv-b",
+    });
+    assert.equal(res.code, "session_key_mismatch");
+  } finally {
     await harness.stop();
     rmSync(dir, { recursive: true, force: true });
   }

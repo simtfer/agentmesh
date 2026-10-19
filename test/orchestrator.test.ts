@@ -77,3 +77,64 @@ test("listProfiles reflects config", async () => {
   assert.deepEqual(names, ["analyst", "worker", "flaky"]);
   await orch.shutdown();
 });
+
+/* ------------------------- pinned sessions ------------------------- */
+
+test("spawning under the same sessionKey attaches to the live worker", async () => {
+  const orch = new Orchestrator(config);
+  const first = await orch.spawnWorker("worker", { sessionKey: "main" });
+  const again = await orch.spawnWorker("worker", { sessionKey: "main" });
+  assert.equal(again, first, "a pinned key must not start a second worker on the same session");
+  assert.equal(orch.listWorkers().length, 1);
+  assert.equal(orch.getWorker(first)?.sessionKey, "main");
+  await orch.shutdown();
+});
+
+test("different sessionKeys are different conversations", async () => {
+  const orch = new Orchestrator(config);
+  const a = await orch.spawnWorker("worker", { sessionKey: "a" });
+  const b = await orch.spawnWorker("worker", { sessionKey: "b" });
+  assert.notEqual(a, b);
+  assert.equal(orch.listWorkers().length, 2);
+  await orch.shutdown();
+});
+
+test("a profile-pinned session applies without a per-spawn key", async () => {
+  const cfg = parseConfig({
+    profiles: [{ name: "pinned", driver: "mock", session: "long-lived" }],
+  });
+  const orch = new Orchestrator(cfg);
+  const id = await orch.spawnWorker("pinned");
+  assert.equal(orch.getWorker(id)?.sessionKey, "long-lived");
+  await orch.shutdown();
+});
+
+test("a pinned session refuses worktree isolation", async () => {
+  // A fresh worktree path every spawn would never match the stored session, so
+  // the conversation would silently restart — refuse rather than pretend.
+  const orch = new Orchestrator(config);
+  await assert.rejects(
+    () => orch.spawnWorker("worker", { sessionKey: "main", worktree: true }),
+    /cannot be combined with worktree/,
+  );
+  assert.equal(orch.listWorkers().length, 0);
+  await orch.shutdown();
+});
+
+test("attaching to a session that is mid-turn is refused, not queued", async () => {
+  const cfg = parseConfig({
+    profiles: [{ name: "slow", driver: "mock", mock: { delayMs: 300 } }],
+  });
+  const orch = new Orchestrator(cfg);
+  const running = orch.dispatch({ profile: "slow", sessionKey: "main", task: "long one" });
+  // Wait for the worker to actually be bound and busy.
+  while (!orch.listTasks({ status: "running" }).length) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  await assert.rejects(
+    () => orch.spawnWorker("slow", { sessionKey: "main" }),
+    /is busy/,
+  );
+  assert.equal((await running).status, "completed");
+  await orch.shutdown();
+});

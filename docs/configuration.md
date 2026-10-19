@@ -65,6 +65,7 @@ fails before any worker starts.
 | `driver` | all | `mock`, `acpx`, or `remote` |
 | `description` | all | human label surfaced by `agent_list` |
 | `worktree` | all | run in an isolated git worktree (required for `handoff.base: "predecessor"`) |
+| `session` | all | pin the profile to one named conversation, stored under the state dir and resumed by the next turn with that key — even after a restart. Cannot be combined with `worktree`, and `cwd` must stay fixed |
 | `weight` | all | queue weight; `1` (default) is strict FIFO, any other value turns on weighted fair queueing |
 | `agent` | `acpx` | an acpx built-in name: `pi`, `opencode`, `codex`, `claude`, `gemini`, `cursor`, `qwen`, `qoder`, … |
 | `command` | `acpx` | explicit argv, for an agent acpx does not know by name (pairs with a custom `agent` key) |
@@ -83,6 +84,10 @@ Notes that save debugging time:
   env var is unset.
 - `worktree: true` is what makes parallel edits safe; without it two workers edit
   the same checkout.
+- `session` is the opposite trade-off and the two do not compose: a worktree path
+  changes on every spawn, so a session pinned to one could never resume. The
+  orchestrator refuses the combination at spawn time (and a per-task
+  `sessionKey` on a submit has the same rule).
 
 ## Limits
 

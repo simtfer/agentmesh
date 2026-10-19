@@ -44,6 +44,8 @@ export interface DispatchInput {
   task: string;
   workerId?: string;
   profile?: string;
+  /** Pinned conversation key; ignored when `workerId` is given. */
+  sessionKey?: string;
   cwd?: string;
   worktree?: boolean;
   timeoutMs?: number;
@@ -187,7 +189,7 @@ export class Orchestrator {
 
   async spawnWorker(
     profileName: string,
-    opts: { cwd?: string; worktree?: boolean; baseCommit?: string } = {},
+    opts: { cwd?: string; worktree?: boolean; baseCommit?: string; sessionKey?: string } = {},
   ): Promise<string> {
     const profile = getProfile(this.config, profileName);
     const id = this.registry.nextId(profile.name);
@@ -195,6 +197,41 @@ export class Orchestrator {
     const useWorktree = opts.worktree ?? profile.worktree ?? false;
     let cwd = path.resolve(opts.cwd ?? profile.cwd ?? this.baseCwd);
     let worktree: WorkerRecord["worktree"];
+
+    // A pinned session is a promise about *where* the conversation lives: acpx
+    // resumes a stored record only when sessionKey, agent, argv and cwd all
+    // still match. A worktree gets a brand-new path on every spawn, so the two
+    // would silently produce a fresh conversation every time — refuse instead
+    // of pretending the session is stable.
+    const sessionKey = opts.sessionKey ?? profile.session;
+    if (sessionKey) {
+      if (useWorktree) {
+        throw new Error(
+          `session "${sessionKey}" cannot be combined with worktree: every spawn gets a new ` +
+            `worktree path, so the stored conversation would never match and would silently restart`,
+        );
+      }
+      // Spawning under a key that a live worker already holds means "attach to
+      // that conversation", not "start a second one on the same key": the ACP
+      // layer would hand back the same stored session, and two tasks would then
+      // interleave inside one transcript. Attach when it is free, refuse when it
+      // is mid-turn — never queue, because the wait is unbounded and invisible.
+      const holder = this.registry.bySessionKey(sessionKey);
+      if (holder) {
+        if (this.tasks.isWorkerBusy(holder.id)) {
+          throw new Error(
+            `session "${sessionKey}" is busy: worker ${holder.id} is still running a task; ` +
+              `wait for it before the next turn`,
+          );
+        }
+        this.registry.pushEvent(holder.id, {
+          t: Date.now(),
+          type: "status",
+          text: `attached: session ${sessionKey}`,
+        });
+        return holder.id;
+      }
+    }
 
     if (useWorktree) {
       const info = await createWorktree(this.baseCwd, id, this.workdir, {
@@ -205,7 +242,11 @@ export class Orchestrator {
     }
 
     const driver = this.drivers.forProfile(profile);
-    const handle = await driver.createWorker(profile, { id, cwd });
+    const handle = await driver.createWorker(profile, {
+      id,
+      cwd,
+      ...(sessionKey ? { sessionKey } : {}),
+    });
 
     this.registry.register({
       id,
@@ -215,13 +256,14 @@ export class Orchestrator {
       status: "idle",
       cwd,
       worktree,
+      sessionKey: handle.sessionKey ?? sessionKey,
       createdAt: Date.now(),
       events: [],
     });
     this.registry.pushEvent(id, {
       t: Date.now(),
       type: "spawn",
-      text: `${profile.name} @ ${cwd}`,
+      text: `${profile.name} @ ${cwd}${sessionKey ? ` (session ${sessionKey})` : ""}`,
     });
     return id;
   }
@@ -292,6 +334,7 @@ export class Orchestrator {
         prompt: input.task,
         profile: input.profile,
         workerId: input.workerId,
+        sessionKey: input.sessionKey,
         cwd: input.cwd,
         worktree: input.worktree,
         timeoutMs: input.timeoutMs,

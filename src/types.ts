@@ -103,6 +103,14 @@ export interface WorkerHandle {
   readonly id: string;
   readonly profile: string;
   readonly cwd: string;
+  /**
+   * The stable conversation key this handle was created under. Equal to the
+   * worker id unless a `session` was pinned (profile or per-spawn), in which
+   * case re-creating the handle with the same key resumes the conversation.
+   */
+  readonly sessionKey?: string;
+  /** The agent's own session id, when the driver learns it. Opaque; for diagnostics. */
+  readonly agentSessionId?: string;
   /** Run one prompt turn to completion, collecting streamed output. */
   runTurn(text: string, opts?: RunTurnOptions): Promise<TurnResult>;
   /** Cancel the currently running turn (worker stays alive). */
@@ -199,6 +207,18 @@ export interface WorkerProfile {
   permissionMode?: string;
   /** run each spawn in an isolated git worktree of the base repo */
   worktree?: boolean;
+  /**
+   * Stable session name for this profile. The ACP layer persists sessions to
+   * disk keyed by this name, so spawning again with the same `session` — even
+   * in a brand-new process after a daemon restart — resumes the *same* agent
+   * conversation instead of starting a fresh one.
+   *
+   * Omit it and every spawn gets a unique key (a new conversation); that is the
+   * right default for one-shot fan-out, and the wrong one for a long-lived
+   * worker you keep talking to. A `session` pinned here is per profile, so it
+   * also implies only one live worker of that profile at a time.
+   */
+  session?: string;
   /**
    * Scheduler weight for this profile's queued tasks (default 1). All weights at
    * 1 keep the classic strict-FIFO queue; any other weight opts the scheduler
@@ -409,7 +429,7 @@ export interface WorkerDriver {
   readonly kind: "acpx" | "mock" | "remote";
   createWorker(
     profile: WorkerProfile,
-    opts: { id: string; cwd: string },
+    opts: { id: string; cwd: string; sessionKey?: string },
   ): Promise<WorkerHandle>;
   dispose?(): Promise<void>;
 }
@@ -598,6 +618,15 @@ export interface TaskSubmitInput {
   prompt: string;
   profile?: string;
   workerId?: string;
+  /**
+   * Pin this task to a stable conversation key. Spawning a worker with this key
+   * resumes the conversation stored under it — in this process, or in a new one
+   * after a restart — instead of starting a fresh one. Ignored when `workerId`
+   * names a live worker. A key already held by a live worker is reused only via
+   * the remote daemon; locally the second spawn is refused, so two tasks can
+   * never interleave inside one conversation.
+   */
+  sessionKey?: string;
   cwd?: string;
   worktree?: boolean;
   timeoutMs?: number;

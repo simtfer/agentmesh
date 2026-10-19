@@ -13,6 +13,11 @@ export interface WorkerRecord {
   status: WorkerStatus;
   cwd: string;
   worktree?: { path: string; branch: string; baseRepo: string };
+  /**
+   * The stable conversation key this worker holds, when one was pinned. Absent
+   * for ordinary workers, whose conversation lives and dies with them.
+   */
+  sessionKey?: string;
   createdAt: number;
   lastTurnAt?: number;
   /** bounded ring buffer of recent events */
@@ -50,6 +55,11 @@ export class WorkerRegistry {
     return [...this.workers.values()];
   }
 
+  /** The live worker holding a pinned session key, if any. */
+  bySessionKey(sessionKey: string): WorkerRecord | undefined {
+    return this.list().find((r) => r.sessionKey === sessionKey);
+  }
+
   pushEvent(id: string, ev: WorkerEvent): void {
     const rec = this.workers.get(id);
     if (!rec) return;
@@ -83,6 +93,8 @@ export function describeWorker(rec: WorkerRecord, recentEvents = 0) {
     status: rec.status,
     cwd: rec.cwd,
     worktree: rec.worktree?.path,
+    sessionKey: rec.sessionKey,
+    agentSessionId: rec.handle.agentSessionId,
     createdAt: rec.createdAt,
     lastTurnAt: rec.lastTurnAt,
     lastError: rec.lastError,

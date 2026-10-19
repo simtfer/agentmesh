@@ -104,14 +104,26 @@ That is the right default for independent work, and the wrong one for a
 conversation — where the master wants to say "now do X" and have the worker
 remember what it just did.
 
-The wire keeps that possible without inventing a session object:
+The wire keeps that possible without inventing a session object. Two things make
+a conversation, and they die differently:
+
+| | lives in | survives a daemon restart | what it means |
+|---|---|---|---|
+| `workerRef` | daemon memory | no | a **capability**: "this exact live worker" |
+| `sessionKey` | the ACP session record on disk | yes | an **identity**: "this conversation" |
+
+Send a `workerRef` when you have one — it is the cheapest way to reach the same
+worker. Send a `sessionKey` when the conversation has to outlive the process, or
+when you are a master that never saw a ref. When both are sent, the ref is tried
+first and the key is the fallback if the ref is unknown.
 
 | frame | direction | meaning |
 |---|---|---|
-| `worker_bound { taskId, workerRef }` | daemon → client | the task started on a worker; this opaque ref is your handle to it |
+| `worker_bound { taskId, workerRef, sessionKey? }` | daemon → client | the task started on a worker; this opaque ref is your handle to it |
 | `submit { …, workerRef }` | client → daemon | run this turn on that same worker (same ACP session, same cwd) |
+| `submit { …, sessionKey }` | client → daemon | run this turn in the named conversation; spawn one (resuming the stored session) only if no live worker holds the key |
 | `release { workerRef }` | client → daemon | close it; `released { workerRef, ok }` answers |
-| `submitted { …, workerRef }` | daemon → client | echoed when the submit reused an existing conversation |
+| `submitted { …, workerRef, sessionKey }` | daemon → client | echoed when the submit reused an existing conversation, or when the daemon supplied the key from a profile default |
 
 The client half is automatic: a `RemoteWorkerHandle` stores the ref it was given
 and sends it on the next `runTurn`, so `spawn_worker` + repeated
@@ -126,21 +138,33 @@ Rules the daemon enforces:
 - **A conversation cannot move.** `cwd` and profile are fixed when the worker is
   created; a submit that asks for a different one is refused
   (`worker_ref_cwd_mismatch`, `worker_ref_profile_mismatch`). Release and start a
-  new worker instead.
+  new worker instead. This applies doubly to a pinned key: the ACP layer only
+  resumes a stored session when the key, agent, argv *and* cwd all still match, so
+  a key that changed directory would silently start over.
 - **Refs are capabilities.** They are random, minted only by this daemon, and
-  never reconstructed from a worker id. An unknown or expired ref is refused
-  (`worker_ref_unknown`) — never silently replaced by a fresh worker, which would
-  let a master believe it was continuing a thread it had actually lost.
+  never reconstructed from a worker id. An unknown or expired ref with no
+  `sessionKey` alongside it is refused (`worker_ref_unknown`) — never silently
+  replaced by a fresh worker, which would let a master believe it was continuing
+  a thread it had actually lost.
+- **Keys are not capabilities.** A `sessionKey` is a plain string that names a
+  stored session, so treat it as configuration, not a secret: a client that can
+  submit to a profile can name any key on it. What it buys you is continuity, not
+  authorization.
+- **A ref cannot be relabelled.** Sending a `sessionKey` that differs from the one
+  the worker was created with is refused (`session_key_mismatch`), rather than
+  letting a master believe it holds a conversation it does not.
 - **Conversations expire.** `daemon.workerIdleMs` (default 30 minutes, `0` = until
   shutdown) reaps a worker that has had no turn. A reused worker is a live,
-  authenticated agent, so this is a resource bound, not a cache eviction.
-- **Nothing survives a daemon restart.** Refs live in memory; after a restart the
-  master starts a new conversation (task records, and any files the worker
-  committed, are still there).
+  authenticated agent, so this is a resource bound, not a cache eviction. A pinned
+  session is not lost by reaping — the next turn under the same key resumes it.
+- **Refs die with the daemon; keys do not.** A submit carrying a dead ref *and* a
+  key continues the conversation (the daemon ignores the stale ref). Task records
+  and anything the worker committed were never at risk either way.
 
 Optional, so version skew degrades instead of failing: a daemon that predates
 `workerRef` ignores it and runs a fresh worker; a client that predates
-`worker_bound` ignores the frame and behaves exactly as before.
+`worker_bound` ignores the frame and behaves exactly as before; a daemon that
+predates `sessionKey` ignores the field and runs a fresh worker per task.
 
 ## Reconnect & reconciliation
 
