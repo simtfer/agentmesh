@@ -182,6 +182,8 @@ stdio 上共 18 个工具。核心循环：
 | | |
 |---|---|
 | [`configuration.md`](https://github.com/simtfer/agentmesh/blob/main/docs/configuration.md) | `agentmesh.yaml` 的每一个键 |
+| [`quickstart.md`](https://github.com/simtfer/agentmesh/blob/main/docs/quickstart.md) · [`quickstart.zh.md`](https://github.com/simtfer/agentmesh/blob/main/docs/quickstart.zh.md) | 十五分钟跑通 A（master）+ B（worker） |
+| [`two-host.md`](https://github.com/simtfer/agentmesh/blob/main/docs/two-host.md) · [`two-host.zh.md`](https://github.com/simtfer/agentmesh/blob/main/docs/two-host.zh.md) | A、B 两侧的完整配置与启动 |
 | [`cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md) | 命令 + 接入 OpenCode / Pi |
 | [`lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md) | 8 态机、委派方式、审批 |
 | [`mcp-tools.md`](https://github.com/simtfer/agentmesh/blob/main/docs/mcp-tools.md) | 18 个工具 + 自托管手册 |

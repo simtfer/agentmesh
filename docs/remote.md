@@ -28,6 +28,9 @@ master (machine A)                                  worker daemon (machine B)
 
 > Two real hosts, a private CA, mutual TLS, firewall and boot-time start are a
 > separate runbook: [`deploy.md`](./deploy.md). What follows is the mechanism.
+> If you are wiring up A and B for the first time, start with
+> [`quickstart.md`](./quickstart.md) (fifteen minutes) or
+> [`two-host.md`](./two-host.md) (every key on both sides).
 
 ## Start the daemon (machine B)
 

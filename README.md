@@ -249,6 +249,8 @@ non-error symptoms (daemon 401s, TLS failures):
 | | |
 |---|---|
 | [`configuration.md`](https://github.com/simtfer/agentmesh/blob/main/docs/configuration.md) | every key in `agentmesh.yaml` |
+| [`quickstart.md`](https://github.com/simtfer/agentmesh/blob/main/docs/quickstart.md) | master A + worker B in fifteen minutes |
+| [`two-host.md`](https://github.com/simtfer/agentmesh/blob/main/docs/two-host.md) | configuring and starting A and B, in full |
 | [`cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md) | commands + attaching OpenCode / Pi |
 | [`lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md) | 8 states, delegating modes, approvals |
 | [`mcp-tools.md`](https://github.com/simtfer/agentmesh/blob/main/docs/mcp-tools.md) | the 18 tools + the self-hosted playbook |

@@ -5,6 +5,10 @@ the operator's runbook: two real machines, a private CA, mutual TLS, a firewall,
 boot-time start and log rotation — the difference between "it works on loopback"
 and "it is running on the build box".
 
+For the configuration of both hosts key by key (including the `cwd` contract and
+a verification ladder), see [`two-host.md`](./two-host.md); for the short path,
+[`quickstart.md`](./quickstart.md).
+
 ```
  machine A — master                              machine B — worker
 ┌──────────────────────────────┐                ┌───────────────────────────────┐
