@@ -29,13 +29,19 @@ jobs:
       matrix:
         # Linux catches path/case/separator assumptions that case-insensitive
         # Windows hides; Windows catches the reverse (shell, .cmd shims).
+        # The labels float on purpose: when the images roll forward (ubuntu-latest
+        # already announces an Ubuntu 26 migration) the first red build here is
+        # cheaper than the same breakage in a user's install.
         os: [ubuntu-latest, windows-latest]
         # 22 is the floor declared in engines; 24 is the current LTS line.
         node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
+      # v7 rather than v4: the v4 line declares the Node 20 runtime, which GitHub
+      # already forces onto Node 24 and warns about on every run. A warning that
+      # appears on every green build is training people to ignore the log.
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
