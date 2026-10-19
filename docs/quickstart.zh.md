@@ -216,7 +216,15 @@ claude mcp add --scope user --transport stdio agentmesh -- \
 > 让 B 上那个 pi worker 在 `/srv/repos/api` 里加一个 `/health` 端点，并跑它的测试。
 
 Claude Code 会调 `task_submit`、跟任务事件，最后把 worker 的结果汇报给你。想要异步形态就直说
-（“先起任务，完了告诉我”），它就会用 `task_wait` / `task_result`。
+（“先起任务，完了告诉我”），它就会用 `task_wait` / `task_result`。然后在同一个会话里接着来：
+
+> 让它给刚修好的这个问题补一个回归测试。
+
+这是**第二个任务**，不是给第一个任务补一句话：pi 会拿到新会话。它能接着干，是因为它跑在 B 上同一个
+`cwd` 里，刚才的改动还在磁盘上——worker 的记忆不跨网络。反过来，如果第一单是在 A 上跑的，那份补丁就在
+错的那台机器上，得用 `handoff: {fromTaskId, inject: "diff"}` 送过去
+（[`handoff.md`](./handoff.md#cross-host-handoff)）。四条规则见
+[`two-host.zh.md`](./two-host.zh.md#闭环下发回传再继续)。
 
 > MCP server 是 **Claude Code 会话的子进程**：会话在它在，会话关它关。退出 `claude` 时还在跑的任务
 > 会失去持有它的那个进程（记录还在，这一轮不会再有结果）。长任务就等它跑完，或者让同一个 `mcp`

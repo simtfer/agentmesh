@@ -4,6 +4,8 @@
 
 一个**协议原生适配器**：让一个编码 agent 充当 **master**，指挥一池**异构 worker agent**（OpenCode、Pi、Codex、Gemini、Claude Code 等）。角色由*配置*决定，而不是由 agent 类型决定——所以 Claude Code 可以当 master 驱动 Pi worker，OpenCode 可以驱动 Pi，Pi 也可以驱动 OpenCode，代码完全一样。
 
+一个任务就是一次往返——下发、回传、决定下一步——这个循环属于 master，不属于适配器。worker 在任务之间不留记忆；能延续下来的只有它运行的那份 checkout，或者一次显式的 `handoff`。
+
 ```
 ┌─────────────┐   MCP tools    ┌──────────────────────────┐   ACP (JSON-RPC/stdio)   ┌──────────────┐
 │ master agent │ ─────────────▶ │ agentmesh adapter        │ ───────────────────────▶ │ worker: pi   │

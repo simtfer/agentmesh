@@ -240,7 +240,18 @@ Then just ask, in a normal Claude Code session:
 
 Claude Code calls `task_submit`, follows the task's events and reports the
 worker's result. Ask it for the async shape — "start it, tell me when it is
-done" — and it uses `task_wait` / `task_result` instead.
+done" — and it uses `task_wait` / `task_result` instead. Then keep going in the
+same conversation:
+
+> Now have it add a regression test for the bug it just fixed.
+
+That is a **second task**, not another message to the first one: pi gets a fresh
+session. It can pick up where it left off because it runs in the same `cwd` on B,
+where the edit is still on disk — worker memory never crosses the network. If
+task 1 had run on A instead, that patch would be on the wrong machine; that is
+what `handoff: {fromTaskId, inject: "diff"}` is for
+([`handoff.md`](./handoff.md#cross-host-handoff)). All four rules:
+[`two-host.md`](./two-host.md#the-loop-dispatch-result-continue).
 
 > The MCP server is a **child of the Claude Code session**: it lives and dies
 > with it. A task still running when you quit `claude` loses the process that

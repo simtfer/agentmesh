@@ -74,6 +74,11 @@ worker*.
 
 ## Cross-host handoff
 
+If the successor runs on the same host in the same `cwd`, none of this is needed:
+the checkout *is* the state, and the next task sees the previous task's files
+because they are still there. A handoff exists for state the successor cannot
+see — a different host, a different directory, or a worktree branched from HEAD.
+
 `inject: "diff"` works with a `driver: remote` successor. The patch is bytes, so
 it travels with the submit instead of being referenced by a path the other host
 cannot see:

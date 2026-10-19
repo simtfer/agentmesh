@@ -16,6 +16,7 @@
 - [两台机器各自需要什么](#两台机器各自需要什么)
 - [B 机：worker](#b-机worker)
 - [A 机：master](#a-机master)
+- [闭环：下发、回传、再继续](#闭环下发回传再继续)
 - [`cwd` 的契约](#cwd-的契约)
 - [逐级验证](#逐级验证)
 - [开机自启](#开机自启)
@@ -151,6 +152,9 @@ daemon:
   给个宽限窗口，A 就能用 `resume: true` 重连并把同一轮跑完。
 - **`tls.ca`** 就是双向 TLS 的开关。填了之后，daemon 在握手阶段（解析任何请求之前）就要求由该 CA
   签发的客户端证书。
+- **`worktree: true`** 让每个任务在从仓库 HEAD 拉出的新 worktree 里跑。并行*写*任务该开，
+  串行链条不该开：下一个任务看不见上一个任务还没提交的文件。链式的活儿就关掉它——
+  见[闭环](#闭环下发回传再继续)。
 - **`workdir`** 是 B 的状态，不是 A 的：任务库、worktree、暂存补丁的 `<workdir>/handoffs/` 都在这里。
   它不必位于 `allowCwd` 之内。
 
@@ -263,7 +267,8 @@ claude mcp add --scope user --transport stdio agentmesh -- \
 
 JSON 放在你运行 `claude` 的目录下的 `.mcp.json`（project scope，跟着目录走），或者让
 `claude mcp add` 写到别处。然后在会话里说：*“让 B 上那个 pi worker 在 /srv/repos/api 里跑一遍测试，
-把失败的修掉。”* 剩下的由 Claude Code 用 `task_submit` / `task_wait` 完成。
+把失败的修掉。”* 剩下的由 Claude Code 用 `task_submit` / `task_wait` 完成，读完结果再由它决定下一步——
+也就是下一节的[闭环](#闭环下发回传再继续)。
 
 这个安排有三条性质值得先说清，因为“它停了”这类问题大多是它们引起的：
 
@@ -279,6 +284,45 @@ JSON 放在你运行 `claude` 的目录下的 `.mcp.json`（project scope，跟�
 审批是唯一只能在常驻模式下走完的事。待审批项活在持有该任务的 orchestrator 进程里，第二个 CLI
 进程没法回答它——对需要授权的任务用 `dispatch`，它会一直停在 `waiting`，直到任务超时（默认十分钟）
 并以 `timed_out` 结束。Claude Code 用 `task_approve` 回答，因为提交它的就是同一个进程。
+
+## 闭环：下发、回传、再继续
+
+一个任务就是一次往返。master 发出自包含的 prompt，B 上的 pi 用自己的工具、凭据和模型跑完，
+最终文本回到 A，由 master 决定下一步。除此之外没有共享：每个任务在 B 上都是新的 ACP 会话，
+跨机器过去的只有 prompt，以及你额外附上的 handoff 产物。
+
+```
+Claude Code（A）                                   daemon（B）
+  |  task_submit {profile: worker-pi, prompt}  -->  拉起 pi，新开 ACP 会话
+  |                                                   |  干活；可能请求授权
+  |  <-- waiting {approvalId} ------------------------|
+  |  task_approve ---------------------------------->|  继续
+  |  <-- task_event ... succeeded --------------------|
+  |  task_result -> {text, structured?, usage}
+  |
+  +-- master 读完，决定：收工，还是再发一单
+```
+
+第二单能不能真的接上第一单，取决于四条：
+
+1. **B 上的 pi 不记得 A 的对话。** 每个任务都是新会话，所以“就按刚才说的”在对面等于没说。
+   目标、约束、期望的输出形态都得写进 prompt——和本地委派是同一条规矩，只是共享上下文更少。
+2. **B 上那份 checkout 才是真正的记忆。** 两个任务在同一个 `cwd` 里看到的是同一批文件，
+   所以“给刚修好的问题补个回归测试”能成立——原因是改动还在磁盘上，不是 agent 记得。
+   这也正是 B 侧 profile 开 `worktree: true` 会打断链条的原因：每个任务都从仓库 HEAD 拉一个新
+   worktree，看不见上一个任务还没提交的改动。并行独立任务用 worktree，串行链条用共享的 `cwd`。
+3. **跨机器的“继续”必须显式。** 第一单在 A 上跑、第二单在 B 上跑，文件就在错的那台机器上：
+   传 `handoff: {fromTaskId, inject: "diff"}` 让补丁按字节过去，或用 `inject: "result"` 把文本内联。
+   远程后继用 `base: "predecessor"` 会被拒——commit 对象过不了主机边界。
+   详见 [`handoff.md`](./handoff.md#cross-host-handoff)。
+4. **`resume: true` 管的是 socket，不是 agent。** 它只在连接掉线后把事件流重新接上；不会让 pi 的
+   会话在任务之间活着，也撑不过 daemon 重启。
+
+如果下一步取决于*回来的是什么*，给任务加 `outputSchema`（[`contracts.md`](./contracts.md)）：
+判定结果以 `structured` 回来，master 就能按数据分支，而不是从最终文本里抠字。
+
+落到双机部署上的结论：**链条**要一个共享的 `cwd` + B 侧 `worktree: false`；**扇出**多个独立写任务
+才要 `worktree: true`。一种形态一个 profile，比事后 debug“第二单为什么看不见第一单的文件”便宜。
 
 ## `cwd` 的契约
 

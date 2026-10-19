@@ -19,6 +19,7 @@ here depends on that pair; swap either side's agent and only the config changes.
 - [What each host needs](#what-each-host-needs)
 - [Machine B: the worker](#machine-b-the-worker)
 - [Machine A: the master](#machine-a-the-master)
+- [The loop: dispatch, result, continue](#the-loop-dispatch-result-continue)
 - [The `cwd` contract](#the-cwd-contract)
 - [Verification ladder](#verification-ladder)
 - [Starting it at boot](#starting-it-at-boot)
@@ -169,6 +170,10 @@ Why each of the load-bearing ones exists:
   a grace window lets A re-attach (`resume: true`) and keep the same run.
 - **`tls.ca`** is the mTLS switch. Present ⇒ the daemon requires a client
   certificate signed by that CA at the handshake, before any request is parsed.
+- **`worktree: true`** isolates each task in a fresh worktree branched from the
+  repo's HEAD. Right for parallel *write* tasks, wrong for a chain: the next task
+  cannot see the previous task's uncommitted files. Leave it off when the loop is
+  sequential — see [The loop](#the-loop-dispatch-result-continue).
 - **`workdir`** is B's state, not A's: the task store, worktrees and
   `<workdir>/handoffs/` for staged patches all live here. It does not have to be
   inside `allowCwd`.
@@ -287,7 +292,9 @@ claude mcp add --scope user --transport stdio agentmesh -- \
 Put the JSON in `.mcp.json` where you run `claude` (project scope, so it travels
 with the directory) or let `claude mcp add` write it elsewhere. Then, in a session:
 *"have the pi worker on B run the test suite in /srv/repos/api and fix what
-fails."* Claude Code does the rest with `task_submit` / `task_wait`.
+fails."* Claude Code does the rest with `task_submit` / `task_wait`, reads the
+result, and decides the next task — [the loop](#the-loop-dispatch-result-continue)
+in the next section.
 
 Three properties of that arrangement are worth stating plainly, because they
 explain most "it stopped" reports:
@@ -309,6 +316,57 @@ process cannot answer it: `dispatch` on a task that needs permission parks in
 `waiting` until the task timeout (ten minutes by default) and then ends
 `timed_out`. Claude Code answers with `task_approve`, because that is the same
 process that submitted.
+
+## The loop: dispatch, result, continue
+
+One task is one round trip. The master sends a self-contained prompt, B's pi runs
+it with its own tools, credentials and model, the final text comes back to A, and
+the master decides what happens next. Nothing else is shared: each task is a new
+ACP session on B, and the only state that crosses the machine is the prompt —
+plus any handoff artifact the master attaches.
+
+```
+Claude Code (A)                                    daemon (B)
+  |  task_submit {profile: worker-pi, prompt}  -->  spawns pi, new ACP session
+  |                                                   |  works; may need permission
+  |  <-- waiting {approvalId} ------------------------|
+  |  task_approve ---------------------------------->|  continues
+  |  <-- task_event ... succeeded --------------------|
+  |  task_result -> {text, structured?, usage}
+  |
+  +-- master reads it, then decides: done, or one more task_submit
+```
+
+Four rules decide whether the second task actually continues the first.
+
+1. **B's pi does not remember A's conversation.** Every task starts a fresh
+   session, so "as we discussed" means nothing on the other side. The prompt has
+   to carry the objective, the constraints and the expected output shape — the
+   same rule as local delegation, with even less shared context.
+2. **The checkout on B is the real memory.** Two tasks in the same `cwd` see the
+   same files, so *"now add a regression test for what you just fixed"* works
+   because the edit is still on disk, not because the agent remembers it. That is
+   also why `worktree: true` on B's profile breaks a chain: each task branches
+   from the repo's HEAD and cannot see the previous task's uncommitted work. Use
+   worktrees for parallel independent tasks, a shared `cwd` for a sequence.
+3. **Continuation across hosts is explicit.** If task 1 ran on A and task 2 runs
+   on B, the file is on the wrong machine: pass
+   `handoff: {fromTaskId, inject: "diff"}` and the patch travels as bytes, or
+   `inject: "result"` to inline the text. `base: "predecessor"` is refused for a
+   remote successor — a commit object does not cross a host boundary.
+   [`handoff.md`](./handoff.md#cross-host-handoff).
+4. **`resume: true` is about the socket, not the agent.** It re-attaches the
+   event stream after a dropped connection. It does not keep pi's session alive
+   between tasks, and it does not survive a daemon restart.
+
+If the next step depends on *what* came back, give the task an `outputSchema`
+([`contracts.md`](./contracts.md)): the verdict arrives as `structured`, so the
+master branches on data instead of parsing prose out of the final text.
+
+The practical consequence for the two-host setup: a *chain* wants one shared
+`cwd` with `worktree: false` on B, while a *fan-out* of independent writers wants
+`worktree: true`. One profile per shape is cheaper than debugging why the second
+task cannot see the first task's files.
 
 ## The `cwd` contract
 

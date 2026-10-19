@@ -8,6 +8,10 @@ Claude Code, …). Roles are decided by *configuration*, not by agent type — s
 Claude Code master can drive Pi workers, an OpenCode master can drive Pi workers,
 a Pi master can drive OpenCode workers, or anything else, with the same code.
 
+A task is one round trip — dispatch, result, decide — and that loop lives in the
+master, not in the adapter. Workers keep no memory between tasks; what carries
+over is the checkout they run in, or an explicit `handoff`.
+
 ```
 ┌─────────────┐   MCP tools    ┌──────────────────────────┐   ACP (JSON-RPC/stdio)   ┌──────────────┐
 │ master agent │ ─────────────▶ │ agentmesh adapter        │ ───────────────────────▶ │ worker: pi   │
