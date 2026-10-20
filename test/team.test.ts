@@ -12,6 +12,8 @@ import { TeamStore } from "../src/team/store.js";
 import { startTeamServer } from "../src/team/server.js";
 import { renderConsoleHtml } from "../src/team/console.js";
 import { extractHandles } from "../src/team/mentions.js";
+import { WorkerDaemon } from "../src/remote/daemon.js";
+import { NoopAuditLog } from "../src/remote/audit.js";
 import type { TeamConfig } from "../src/team/types.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -147,6 +149,107 @@ test("a group mention hands work down the chain and every reply lands in the cha
     assert.ok(ceo.workerId, "the CEO should have a live worker after speaking");
   } finally {
     await cleanup(h, dir);
+  }
+});
+
+/**
+ * The roster knows nothing about *where* a member runs. This is the contract
+ * that lets a team outgrow one box: the middle member lives in another process
+ * (a Worker Daemon over loopback WebSocket), the two around it are local, and
+ * the hand-off chain behaves exactly the same.
+ */
+const REMOTE_TEAM_TOKEN_ENV = "AGENTMESH_TEAM_REMOTE_TOKEN";
+process.env[REMOTE_TEAM_TOKEN_ENV] = "team-remote-test-token";
+
+test("a member can live on another process and still pass work down the chain", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-remote-"));
+  const daemonConfig = parseConfig({
+    workdir: path.join(dir, "daemon-state"),
+    profiles: [
+      {
+        name: "remote-dev",
+        driver: "mock",
+        mock: {
+          delayMs: 2,
+          toolCalls: 2,
+          replies: ["Built /health on the far side. @qa please verify it."],
+        },
+      },
+    ],
+  });
+  const dOrch = new Orchestrator(daemonConfig, { baseCwd: dir, persist: false });
+  const daemon = new WorkerDaemon({
+    config: daemonConfig,
+    orchestrator: dOrch,
+    host: "127.0.0.1",
+    port: 0,
+    token: process.env[REMOTE_TEAM_TOKEN_ENV]!,
+    allowCwd: [dir],
+    audit: new NoopAuditLog(),
+  });
+  const info = await daemon.start();
+
+  const config = parseConfig({
+    workdir: path.join(dir, ".agentmesh"),
+    profiles: [
+      { name: "ceo-h", driver: "mock", mock: { delayMs: 2, replies: ["@dev please implement /health"] } },
+      {
+        name: "dev-h",
+        driver: "remote",
+        remote: { endpoint: info.url, tokenEnv: REMOTE_TEAM_TOKEN_ENV, remoteProfile: "remote-dev" },
+      },
+      { name: "qa-h", driver: "mock", mock: { delayMs: 2, replies: ["Verified — it returns 200."] } },
+    ],
+    team: {
+      name: "acme",
+      members: [
+        { id: "ceo", name: "Mira", role: "chief executive", profile: "ceo-h" },
+        { id: "dev", name: "Sam", role: "engineer", profile: "dev-h" },
+        { id: "qa", name: "Lin", role: "verifier", profile: "qa-h" },
+      ],
+      channels: [{ id: "general", description: "the whole team" }],
+    },
+  });
+  const orch = new Orchestrator(config, { baseCwd: dir, persist: false });
+  const team = new Team({
+    config: config.team as TeamConfig,
+    orchestrator: orch,
+    baseCwd: dir,
+    stateDir: path.join(dir, "team"),
+    persist: false,
+  });
+
+  try {
+    team.post({ channel: "general", text: "@ceo we need a /health endpoint" });
+    await team.idle(20_000);
+
+    const log = chat(team.messages("general"));
+    assert.deepEqual(log.map((m) => m.author), ["user", "ceo", "dev", "qa"]);
+    assert.match(log[2]!.text, /far side/, "the middle reply has to come back over the socket");
+
+    // Proof it really crossed the boundary: the task exists on the far side
+    // under the daemon-side profile name, and locally the member is one proxied
+    // task rather than a second run.
+    const far = dOrch.listTasks({ limit: 5 });
+    assert.equal(far.length, 1, "exactly one task ran on the daemon");
+    assert.equal(far[0]!.profile, "remote-dev");
+    assert.equal(far[0]!.status, "succeeded");
+    assert.equal(
+      orch.listTasks({ limit: 20 }).filter((t) => t.profile === "dev-h").length,
+      1,
+      "a remote member is one proxied task, not a local duplicate",
+    );
+
+    // Everything downstream still treats it as an ordinary member.
+    const dev = team.status().members.find((m) => m.id === "dev")!;
+    assert.equal(dev.sessionKey, "team:acme:dev");
+    assert.equal(team.transcript("dev", 5)[0]!.status, "succeeded");
+  } finally {
+    await team.shutdown().catch(() => {});
+    await orch.shutdown().catch(() => {});
+    await daemon.stop().catch(() => {});
+    await dOrch.shutdown().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

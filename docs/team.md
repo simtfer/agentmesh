@@ -31,6 +31,10 @@ Each member is a pinned agentmesh worker: `sessionKey = team:<name>:<member id>`
 That single detail is what makes the person persistent — the same agent session,
 with its history, is resumed on the next turn and after a process restart.
 
+A member is *just a profile*, and a profile is just a driver, so one roster can mix
+harnesses: a CEO on pi, an engineer on opencode, a verifier on a third box through
+`driver: remote`. The room does not know or care which CLI answered; it sees members.
+
 ## Quick start
 
 ```yaml
@@ -135,6 +139,15 @@ agentmesh task on that member's pinned session.
 
 Both caps are counted, and hitting one posts a system message in the room ("not
 queued: @dev (hand-off depth 6 reached)") instead of failing silently.
+
+**Mentions fan out; they do not queue.** One message naming two people starts both
+at once. That is where the parallelism comes from, and it is also why a verifier
+named in the same breath as the builder can run before the artifact exists: there
+is no dependency graph behind a room, so *ordering* has to come from the wording —
+address one teammate per step when the sequence matters. A live pi + opencode run
+made this concrete: the CEO named both, the verifier honestly reported
+`ERR_MODULE_NOT_FOUND`, and the chain only converged when the builder's own message
+re-raised the mention — six member messages for a three-step job, two of them noise.
 
 Each turn's prompt contains: the member's identity and role, the current room and
 its people, the recent transcript, the triggering message, the member's `notes`,
@@ -285,11 +298,13 @@ local shell access:
 
 Honest boundaries, so nobody expects more than is there:
 
-- **No GUI.** `team chat`, `team log`, and the HTTP API are the interface. The API
-  is shaped so a read-only web console can be built on it.
-- **No heartbeat.** Members speak when addressed or mentioned; they do not wake up
-  on a timer to report progress. Proactive behaviour would need a scheduled
-  "pulse" turn and a budget for it — not built.
+- **The console is read-only.** `team chat`, `team log`, the HTTP API and the page at
+  `/` are the interface. The page shows the room and the turns behind each message;
+  it cannot post, approve, or wake anyone — that stays in the CLI.
+- **Proactivity has to be switched on.** By default a member still only speaks when
+  addressed or mentioned. `pulse` lets one wake on a timer, but every wake-up is a
+  real billed turn. What is *not* built is a member claiming work off a queue by
+  itself — the room is the queue.
 - **A shared checkout, by default.** Members default to the same `cwd`, so they see
   each other's files. For isolated trees, create one stable worktree directory per
   member and set it as `cwd` — do **not** use `worktree: true`, which is refused

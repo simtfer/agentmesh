@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 163 tests, offline, ~27s
+npm test            # 164 tests, offline, ~27s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -323,7 +323,7 @@ The remote *security* model (flags, deployment shape, rotation drill) is documen
 in [remote.md](remote.md#security-model); the coverage list above mirrors
 [remote.md#remote-tests](remote.md#remote-tests).
 
-## `test/team.test.ts` — 21 cases
+## `test/team.test.ts` — 22 cases
 
 The team layer, driven end-to-end over the mock harness (deterministic, offline)
 plus a real HTTP server on an ephemeral port:
@@ -377,10 +377,17 @@ plus a real HTTP server on an ephemeral port:
   transcript round-trip.
 - **Roster guards.** Two members claiming the same handle abort construction
   instead of making `@dev` ambiguous.
+- **A member on another process.** A roster of three where the middle member is a
+  `driver: remote` profile: the chain still walks CEO → engineer → verifier, the
+  daemon-side task list holds exactly one `succeeded` task under the *daemon's*
+  profile name, the local side holds exactly one proxied task, and the member
+  keeps its ordinary `sessionKey` and transcript. The room never learns that one
+  of its colleagues lives in a different process.
 
-A real-harness run (Pi as a member, two turns, same session) is **not** covered by
-the suite; the session-resume mechanism it relies on is verified separately in
-[`verification.md`](#beyond-the-unit-suite) and `test/orchestrator.test.ts`.
+A real mixed-harness team run (pi + opencode in one room) is **not** part of the
+suite — it needs logged-in agents and spends tokens. It was run by hand; see
+[Beyond the unit suite](#beyond-the-unit-suite). The session-resume mechanism a
+member relies on is verified separately in `test/orchestrator.test.ts`.
 
 ## `test/deploy.test.ts` — 8 cases
 
@@ -455,6 +462,17 @@ as browsable resources.
   The ACP session id was byte-identical across the restart. This exercises the
   three things the unit suite can only mock: the session record on disk, acpx's
   `resume` path, and the client's `sessionKey` wire field.
+- **A mixed-harness room** (ad-hoc run, 2026-10-20, not in `npm test`: it needs
+  logged-in agents and spends tokens). Three members, two harnesses: CEO on **pi**,
+  engineer on **opencode**, verifier on **pi**. One message walked the chain; the
+  engineer wrote `greet.mjs` with its own tools, the verifier ran it with `node` and
+  quoted the output plus the file's md5. Seven messages (six from members) and six
+  member turns, every turn `succeeded` — no harness-specific code anywhere in the
+  team layer. The run
+  also produced the finding now written into `team.md`: mentions **fan out**, so
+  naming the verifier in the same reply as the builder started verification before
+  the file existed; the verifier honestly reported `ERR_MODULE_NOT_FOUND`, and the
+  chain only converged when the engineer's own message re-raised the mention.
 
 ## Known gaps
 
