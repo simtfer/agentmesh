@@ -533,8 +533,8 @@ as browsable resources.
   produce: `Opening handshake has timed out`.
   Both directions authenticate: the daemon requires a client certificate
   (`tls.ca`), and the master pins the CA. The ladder, all over the public path:
-  no CA `SELF_SIGNED_CERT_IN_CHAIN`; no client certificate `ERR_SSL_TLSV13_ALERT_
-  CERTIFICATE_REQUIRED`; a client certificate signed by a *different* CA
+  no CA `SELF_SIGNED_CERT_IN_CHAIN`; no client certificate a TLS alert
+  (`certificate required`); a client certificate signed by a *different* CA
   `ECONNRESET`; no token `401`; the right pair `200` with the daemon id. RTT to
   `/profiles` was ~100 ms.
   A task then ran on the far disk: `from-cloud.txt` was written under
