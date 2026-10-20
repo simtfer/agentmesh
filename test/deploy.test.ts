@@ -28,6 +28,13 @@ const TOKEN_ENV = "AGENTMESH_DEPLOY_TOKEN";
 const TOKEN = "deploy-test-token";
 process.env[TOKEN_ENV] = TOKEN;
 
+// Some sandboxes and dev containers export NODE_TLS_REJECT_UNAUTHORIZED=0,
+// which switches certificate verification off process-wide. These tests exist to
+// prove that a wrong CA *is* refused, so verification is restored here — leaving
+// it off would let them pass for the opposite reason (and hide a real regression).
+// `process.env` is re-read at connect time, so deleting it is enough.
+delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+
 const daemonConfig = parseConfig({
   // Keep state out of the repo: the suite must not leave directories behind.
   workdir: path.join(tmpdir(), "agentmesh-deploy-state"),
