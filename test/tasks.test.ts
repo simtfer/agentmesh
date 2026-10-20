@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseConfig } from "../src/config.js";
@@ -156,6 +157,91 @@ test("SqliteTaskStore update merges without clobbering unset columns", () => {
     assert.equal(rec.text, "hello");
     assert.equal(rec.startedAt, now, "startedAt must survive later updates");
     store.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ----------------------- multi-writer contract ------------------------- */
+
+test("two processes appending events to one task lose nothing", async () => {
+  // `MAX(sequence)+1` and the INSERT are one decision, so they have to be one
+  // transaction. Without it two writers read the same maximum and race for the
+  // same number: the loser dies on `UNIQUE(events.taskId, events.sequence)`, and
+  // because nothing downstream retries, its line is simply missing from the
+  // history — while the surviving sequence is still contiguous, which is exactly
+  // what makes the gap invisible afterwards. Measured before the fix with four
+  // processes appending 200 events each: 18 collisions, 18 lines gone.
+  //
+  // One process cannot express this: the two statements never interleave on a
+  // single event loop, so the writers have to be separate processes.
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-multiwriter-"));
+  const dbPath = path.join(dir, "state.db");
+  const taskId = "t-shared";
+
+  const seed = new SqliteTaskStore(dbPath);
+  seed.createTask({
+    taskId, profile: "fast", prompt: "shared", workingDirectory: dir,
+    status: "running", timeoutMs: 1000, createdAt: Date.now(), updatedAt: Date.now(),
+  });
+  seed.close();
+
+  const storeUrl = new URL("../src/store/sqlite.ts", import.meta.url).href;
+  const writer = path.join(dir, "writer.mts");
+  writeFileSync(
+    writer,
+    `import { SqliteTaskStore } from ${JSON.stringify(storeUrl)};
+const [dbPath, taskId, who, count] = process.argv.slice(2);
+const store = new SqliteTaskStore(dbPath);
+try {
+  for (let i = 0; i < Number(count); i++) {
+    store.appendEvent(taskId, {
+      eventId: who + "-" + i, taskId, timestamp: new Date().toISOString(),
+      type: "output", text: who + ":" + i,
+    });
+  }
+} finally {
+  store.close();
+}
+`,
+  );
+
+  const WRITERS = 4;
+  const PER_WRITER = 50;
+  const children = await Promise.all(
+    Array.from({ length: WRITERS }, (_, i) => {
+      const p = spawn(
+        process.execPath,
+        ["--import", "tsx", writer, dbPath, taskId, `w${i}`, String(PER_WRITER)],
+        { stdio: ["ignore", "ignore", "pipe"] },
+      );
+      let stderr = "";
+      p.stderr.on("data", (c) => (stderr += c));
+      return new Promise<{ code: number | null; stderr: string }>((resolve) =>
+        p.on("close", (code) => resolve({ code, stderr })),
+      );
+    }),
+  );
+  try {
+    const crashed = children.filter((c) => c.code !== 0);
+    assert.deepEqual(
+      crashed.map((c) => c.stderr.split("\n").find((l) => l.includes("Error")) ?? c.stderr.trim()),
+      [],
+      "every writer must finish; a lock timeout is a fact about contention, not a licence to drop the line",
+    );
+
+    const store = new SqliteTaskStore(dbPath);
+    const events = store.listEvents(taskId);
+    store.close();
+
+    const total = WRITERS * PER_WRITER;
+    assert.equal(events.length, total, "no writer's event may go missing");
+    assert.equal(new Set(events.map((e) => e.eventId)).size, total, "and none may be written twice");
+    assert.deepEqual(
+      events.map((e) => e.sequence),
+      Array.from({ length: total }, (_, i) => i + 1),
+      "sequences are handed out one at a time, with no gap and no repeat",
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 176 tests, offline, ~45s
+npm test            # 177 tests, offline, ~45s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -62,7 +62,7 @@ refused because two spellings of one temp directory compared unequal, and a skil
 frontmatter assertion that assumed LF in a CRLF checkout. Both were real defects
 in the product and the test respectively, not runner quirks.
 
-## `test/tasks.test.ts` — 32 cases
+## `test/tasks.test.ts` — 33 cases
 
 The lifecycle core. Covers, in order:
 
@@ -102,6 +102,12 @@ The lifecycle core. Covers, in order:
   while the stored prompt stays original; a non-succeeded or unknown source is
   refused without spawning a worker; the artifact is capped to `maxBytes` and
   flagged `truncated`.
+- **Multi-writer.** Four **separate processes** append 50 events each to one task
+  in one SQLite file; every event lands, none twice, and the sequence runs 1..200
+  with no gap. One process cannot express this — the two statements never
+  interleave on a single event loop, which is why the check spawns processes.
+  Before the fix the same run died with `UNIQUE constraint failed:
+  events.taskId, events.sequence` in every writer.
 
 ## `test/handoff.test.ts` — 12 cases
 
@@ -615,9 +621,17 @@ Honest limits of the evidence above — these are not covered by the suite yet:
   **name** rather than by IP (so certificate SANs must match DNS, not an address),
   a link that actually drops packets mid-stream, and a clock that is not
   NTP-disciplined. `docs/deploy.md` has the checklist.
-- **Concurrent processes sharing one SQLite file.** Two processes *can* open the
-  same DB safely (`busy_timeout` + WAL), but the suite tests this incidentally
-  rather than as a documented multi-writer contract.
+- **Concurrent processes sharing one SQLite file.** Every write path that reads
+  before it writes (`appendEvent`'s `MAX(sequence)+1`, `updateTask`'s
+  read-patch-write) runs under `BEGIN IMMEDIATE`, so writers serialize instead of
+  racing; the four-process case above is tested. Two boundaries remain, and both
+  are about *contention* rather than correctness: a writer that cannot get the
+  lock within `busy_timeout` (5 s) fails with `database is locked` rather than
+  waiting forever — measured under a deliberately extreme load of eight processes
+  writing 2400 events to one task, where roughly one round in three lost a single
+  writer to it — and `updateTask` still writes the whole row from its patch, so
+  two processes editing the *same* task is last-writer-wins per column set. Share
+  a database between processes; do not share one task between them.
 - **Concurrent editors on one repo.** Worktree isolation is verified, but two
   workers editing the *same* worktree concurrently is not.
 - **Cost and usage are only as good as the adapter.** The roll-up is exercised

@@ -173,6 +173,29 @@ export class SqliteTaskStore implements TaskStore {
     this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
   }
 
+  /**
+   * Run a read-then-write under one write lock.
+   *
+   * SQLite has a single writer, so `IMMEDIATE` is what turns "two processes each
+   * read the current state and both write" into "one of them reads the state the
+   * other just committed". `IMMEDIATE` (rather than the default deferred) takes
+   * the lock *before* the SELECT: a deferred transaction would read, then have to
+   * upgrade on the write, which SQLite can refuse with `SQLITE_BUSY` without
+   * consulting `busy_timeout` — a lock wait that does not wait.
+   */
+  private write<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const out = fn();
+      this.db.exec("COMMIT");
+      return out;
+    } catch (err) {
+      // A failure can leave nothing to undo; that must not replace the real reason.
+      try { this.db.exec("ROLLBACK"); } catch { /* nothing left to roll back */ }
+      throw err;
+    }
+  }
+
   createTask(rec: TaskRecord): void {
     this.db
       .prepare(
@@ -200,37 +223,44 @@ export class SqliteTaskStore implements TaskStore {
       );
   }
 
+  /**
+   * Read-patch-write, under the same lock: without it a second process can commit
+   * a field this one never touched, and this one then writes back the snapshot it
+   * read before that happened — losing a change it had no opinion about.
+   */
   updateTask(taskId: string, patch: Partial<TaskRecord>): TaskRecord | undefined {
-    const cur = this.getTask(taskId);
-    if (!cur) return undefined;
-    const next: TaskRecord = { ...cur, ...patch, taskId, updatedAt: patch.updatedAt ?? Date.now() };
-    this.db
-      .prepare(
-        `UPDATE tasks SET profile=?, workerId=?, prompt=?, workingDirectory=?, status=?,
+    return this.write(() => {
+      const cur = this.getTask(taskId);
+      if (!cur) return undefined;
+      const next: TaskRecord = { ...cur, ...patch, taskId, updatedAt: patch.updatedAt ?? Date.now() };
+      this.db
+        .prepare(
+          `UPDATE tasks SET profile=?, workerId=?, prompt=?, workingDirectory=?, status=?,
           sessionId=?, idempotencyKey=?, timeoutMs=?, deadlineAt=?, createdAt=?, updatedAt=?,
           startedAt=?, finishedAt=?, text=?, structured=?, usage=?, budget=?, stopReason=?, waitingReason=?,
           errorCode=?, errorMessage=?, errorRetryable=?, dependsOn=?, blockedBy=?, attempt=?,
           maxAttempts=?, retryAt=?, metadata=?
          WHERE taskId=?`,
-      )
-      .run(
-        next.profile, next.workerId ?? null, next.prompt, next.workingDirectory, next.status,
-        next.sessionId ?? null, next.idempotencyKey ?? null, next.timeoutMs, next.deadlineAt ?? null,
-        next.createdAt, next.updatedAt,
-        next.startedAt ?? null, next.finishedAt ?? null, next.text ?? null,
-        next.structured === undefined ? null : JSON.stringify(next.structured),
-        next.usage ? JSON.stringify(next.usage) : null,
-        next.budget ? JSON.stringify(next.budget) : null,
-        next.stopReason ?? null,
-        next.waitingReason ?? null, next.error?.code ?? null, next.error?.message ?? null,
-        next.error ? (next.error.retryable ? 1 : 0) : null,
-        next.dependsOn ? JSON.stringify(next.dependsOn) : null,
-        next.blockedBy ? JSON.stringify(next.blockedBy) : null,
-        next.attempt ?? null, next.maxAttempts ?? null, next.retryAt ?? null,
-        next.metadata ? JSON.stringify(next.metadata) : null,
-        taskId,
-      );
-    return next;
+        )
+        .run(
+          next.profile, next.workerId ?? null, next.prompt, next.workingDirectory, next.status,
+          next.sessionId ?? null, next.idempotencyKey ?? null, next.timeoutMs, next.deadlineAt ?? null,
+          next.createdAt, next.updatedAt,
+          next.startedAt ?? null, next.finishedAt ?? null, next.text ?? null,
+          next.structured === undefined ? null : JSON.stringify(next.structured),
+          next.usage ? JSON.stringify(next.usage) : null,
+          next.budget ? JSON.stringify(next.budget) : null,
+          next.stopReason ?? null,
+          next.waitingReason ?? null, next.error?.code ?? null, next.error?.message ?? null,
+          next.error ? (next.error.retryable ? 1 : 0) : null,
+          next.dependsOn ? JSON.stringify(next.dependsOn) : null,
+          next.blockedBy ? JSON.stringify(next.blockedBy) : null,
+          next.attempt ?? null, next.maxAttempts ?? null, next.retryAt ?? null,
+          next.metadata ? JSON.stringify(next.metadata) : null,
+          taskId,
+        );
+      return next;
+    });
   }
 
   getTask(taskId: string): TaskRecord | undefined {
@@ -259,20 +289,30 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   appendEvent(taskId: string, ev: Omit<TaskEvent, "sequence">): TaskEvent {
-    const row = this.db
-      .prepare("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM events WHERE taskId=?")
-      .get(taskId) as Row;
-    const sequence = num(row.n) ?? 1;
-    this.db
-      .prepare(
-        `INSERT INTO events (taskId, sequence, eventId, workerId, timestamp, type, text, data)
-         VALUES (?,?,?,?,?,?,?,?)`,
-      )
-      .run(
-        taskId, sequence, ev.eventId, ev.workerId ?? null, ev.timestamp, ev.type,
-        ev.text ?? null, ev.data ? JSON.stringify(ev.data) : null,
-      );
-    return { ...ev, sequence };
+    // Reading `MAX(sequence)` and inserting the next row is one decision, so it
+    // has to be one transaction. Two writers otherwise read the same maximum and
+    // race for the same number: the loser dies on
+    // `UNIQUE(events.taskId, events.sequence)`, and a caller that swallows the
+    // error loses the line from the history instead — measured with four
+    // processes appending 200 events each: 18 collisions, 18 events missing,
+    // and the surviving sequence still contiguous, which is precisely what makes
+    // the loss invisible afterwards.
+    return this.write(() => {
+      const row = this.db
+        .prepare("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM events WHERE taskId=?")
+        .get(taskId) as Row;
+      const sequence = num(row.n) ?? 1;
+      this.db
+        .prepare(
+          `INSERT INTO events (taskId, sequence, eventId, workerId, timestamp, type, text, data)
+           VALUES (?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          taskId, sequence, ev.eventId, ev.workerId ?? null, ev.timestamp, ev.type,
+          ev.text ?? null, ev.data ? JSON.stringify(ev.data) : null,
+        );
+      return { ...ev, sequence };
+    });
   }
 
   listEvents(taskId: string, afterSequence = 0): TaskEvent[] {
