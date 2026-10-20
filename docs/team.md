@@ -196,6 +196,11 @@ agent turn**, so minutes are the sane range and `limits.maxTotalTokens` /
 `maxTotalCost` are the backstop. Pulses are off unless configured — a roster that
 does not mention `pulse` behaves exactly as before.
 
+A pulse has the member's normal tool permissions — it is the same agent, woken
+by a timer instead of a message — so an unprompted turn **can** edit files. The
+guardrails are the profile's `permissionMode`, the spend ceilings, and the fact
+that every pulse is visible in that member's transcript afterwards.
+
 Wake one member by hand with `agentmesh team pulse <member>` (same guards: if the
 room is busy, it stays asleep and says so). `team status` marks who wakes on their
 own, and `team transcript` labels those turns `(pulse)`.

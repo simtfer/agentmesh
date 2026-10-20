@@ -169,6 +169,10 @@ pulse 是一轮**没有触发消息**的普通轮次：成员看到当前房间�
 `limits.maxTotalTokens` / `maxTotalCost` 是兜底。不配置 `pulse` 的成员行为与之前完全一样——
 默认关闭。
 
+pulse 用的是成员**正常的工具权限**——它还是同一个 agent，只是被定时器叫醒而不是被消息叫醒，
+所以一次没人要求的轮次**可以**改文件。护栏是 profile 的 `permissionMode`、花费天花板，以及每次 pulse
+事后都能在该成员的 transcript 里看到。
+
 想手动戳一下，用 `agentmesh team pulse <member>`（同样受守卫：房间在忙就继续睡，并如实告诉你）。
 `team status` 会标出谁有自己的节奏，`team transcript` 会把这类轮次标成 `(pulse)`。
 
