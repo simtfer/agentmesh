@@ -382,7 +382,7 @@ worker：
 | `cwd: /srv/repos`，而 B 的 `allowCwd: [/srv/repos]` | 在那里跑 |
 | `cwd: /srv/repos`，而 B 的 `allowCwd: [/srv/work]` | 拒绝：`working directory not in whitelist: /srv/repos (cwd_not_whitelisted)` |
 | `repos/acme`（相对路径） | 相对的是 **B 的**基准目录，不是 A 的 |
-| 不写——一个字节都不发 | B 用自己默认的目录，它同样要落在 `allowCwd` 里 |
+| 不写——一个字节都不发 | B 用该 profile 在 **B 上**配置的 `cwd`；没配才用 daemon 启动时所在目录。两者同样要落在 `allowCwd` 里 |
 | `../repos` 或 `/srv/repos/../..` | 先解析再校验：逃不出根目录 |
 
 结论：远程 profile 一定要显式写 `cwd`，写成 B 白名单内的路径。同一个任务可能落在两台机器上时，

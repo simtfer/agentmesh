@@ -526,7 +526,27 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
       修复后 remote 的 `cwd` 原样过线，不写就一个字节都不发（由 daemon 用自己默认的），
       dispatch 结果里的 `cwd: ""` 就是「master 不知道」的诚实表示。
     - 1 项新用例（remote 的 cwd 不解析、同值在本地 profile 上会被解析），测试总数 171 → 172。
+18. ~~**Stage 15 · 跨公网链路**~~ ✅ 已落地：两台机器、两个时钟、一条要改的防火墙规则。
+    - **拓扑**：Windows master → 阿里云 ECS（Alinux 3，kernel `5.10.134-19.1.al8.x86_64`，
+      NAT 后的 `172.24.24.182` / 公网 EIP `101.133.157.228`）。Node 22.20 从 tarball 装进
+      独立的 `agentmesh` 账号，systemd 托管，`0.0.0.0:8790`，**双向 TLS**（`tls.ca`）+ Bearer token。
+    - **补上的正是「网络边界」**：安全组不放行时客户端只会看到 `Opening handshake has timed out`，
+      而服务器自己的 `firewalld` 早已放行——两层防火墙只有一层是 agentmesh 能看见的。
+      审计日志里对端是 `171.83.30.166`（master 的公网地址），不是 loopback：这一跑确实出了机器。
+    - **信任阶梯全绿**：无 CA `SELF_SIGNED_CERT_IN_CHAIN`；无客户端证书 `CERTIFICATE_REQUIRED`；
+      用**别的 CA** 签的客户端证书 `ECONNRESET`；无 token `401`；双证齐 `200`，RTT ~100ms。
+    - **跨机产物**：614433 字节的 `.diff` 作为交接附件发过去，落到 `<workdir>/handoffs/big.diff`，
+      md5 一致，端到端 432ms（~1.4MB/s），审计记 `artifacts:1, artifactBytes:614433`。
+    - **两个真 bug**（同机上都不可能暴露）：
+      ① `make-certs.sh` 在 OpenSSL 1.1.1 上生成了带**两个** `basicConstraints` 的 CA
+      （宿主机 `openssl.cnf` 的 `v3_ca` 与 `-addext` 各写一份），OpenSSL 因此不认它是 CA，
+      `verify` 报「unable to get local issuer certificate」而文件看上去全对。改为用私有 config 文件
+      指定扩展集，不再受宿主机 `openssl.cnf` 影响（Windows/OpenSSL 3.5 同时验证过）。
+      ② 不带 `cwd` 的 submit 落在 **daemon 进程自己的目录**（systemd 下就是安装目录），
+      而它一定不在 `allowCwd` 里，于是一个诚实说「我不知道对端布局」的 master 被
+      `cwd_not_whitelisted` 拒掉。改为回落到该 profile 在 daemon 侧配置的 `cwd`。
+    - 1 项新用例（不带 cwd 时用 daemon 侧 profile 的目录），测试总数 172 → 173。
 
-> Stage 0–3 已完成并通过 172 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算、团队层与自主心跳、混合 harness 实跑、会话轮换、白板认领、跨 OS 链路）。
-> 下一步：两台真机（各自时钟与磁盘、真实时延、要动的防火墙规则）、跨机交接产物传输、认领的下一步
-> （一条被拒的活要不要升级成「派给最合适的人」而不是一直躺在白板上）。
+> Stage 0–3 已完成并通过 173 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算、团队层与自主心跳、混合 harness 实跑、会话轮换、白板认领、跨 OS 链路、跨公网链路）。
+> 下一步：按**域名**而不是 IP 访问（证书 SAN 得对上 DNS）、真正会丢包的链路、未做 NTP 对时的时钟；
+> 认领的下一步（一条被拒的活要不要升级成「派给最合适的人」而不是一直躺在白板上）。

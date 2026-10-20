@@ -581,8 +581,17 @@ export class WorkerDaemon {
       }
       cwd = wrec.cwd;
     } else {
+      // The master may say nothing about `cwd` — it cannot always know how this
+      // host is laid out. In that case the profile's own `cwd` is the answer: it
+      // is the directory the operator configured for this profile HERE, which is
+      // what "the default working directory on B" means (docs/two-host.md, "The
+      // `cwd` contract"). Falling back to the daemon PROCESS's cwd instead would
+      // silently depend on how the service was started (systemd
+      // `WorkingDirectory`), and would then usually fail the whitelist check
+      // against a directory nobody chose.
+      const profileCwd = this.opts.config.profiles.find((p) => p.name === profile)?.cwd;
+      const requested = msg.cwd ?? profileCwd ?? orch.baseCwd;
       try {
-        const requested = msg.cwd ?? orch.baseCwd;
         cwd = assertCwdAllowed(requested, this.allowCwd);
       } catch (e) {
         // The prompt is untrusted master content and is never logged; the
@@ -591,7 +600,7 @@ export class WorkerDaemon {
           connId: state.connId,
           reason: "cwd_not_whitelisted",
           profile,
-          requestedCwd: msg.cwd ?? orch.baseCwd,
+          requestedCwd: requested,
         });
         this.send(state, {
           type: "error",

@@ -436,7 +436,7 @@ resolving would apply A's path rules to a path A cannot see (a Windows master tu
 | `cwd: /srv/repos` and B's `allowCwd: [/srv/repos]` | runs there |
 | `cwd: /srv/repos` and B's `allowCwd: [/srv/work]` | refuses: `working directory not in whitelist: /srv/repos (cwd_not_whitelisted)` |
 | `repos/acme` (relative) | relative to **B's** base directory, not A's |
-| nothing set — nothing is sent | B uses its own default directory, which still has to be inside `allowCwd` |
+| nothing set — nothing is sent | B uses that profile's own `cwd` on B; with none configured, the directory the daemon was started in. Either way it must be inside `allowCwd` |
 | `../repos` or `/srv/repos/../..` | resolved first, then checked: cannot escape a root |
 
 So: always set `cwd` explicitly on a remote profile, to a path inside B's

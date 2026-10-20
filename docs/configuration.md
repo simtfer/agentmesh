@@ -66,6 +66,7 @@ fails before any worker starts.
 | `name` | all | the id used in `task_submit { profile }` |
 | `driver` | all | `mock`, `acpx`, or `remote` |
 | `description` | all | human label surfaced by `agent_list` |
+| `cwd` | all | working directory for the worker. A local profile's value is resolved on this machine; on a `remote` profile it is a path **on the daemon host** and crosses the wire untouched. Omit it and the daemon uses that profile's own `cwd` on its side — see [`two-host.md#the-cwd-contract`](./two-host.md#the-cwd-contract) |
 | `worktree` | all | run in an isolated git worktree (required for `handoff.base: "predecessor"`) |
 | `session` | all | pin the profile to one named conversation, stored under the state dir and resumed by the next turn with that key — even after a restart. Cannot be combined with `worktree`, and `cwd` must stay fixed |
 | `weight` | all | queue weight; `1` (default) is strict FIFO, any other value turns on weighted fair queueing |

@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { WebSocket as WS } from "ws";
@@ -953,6 +953,62 @@ test("a remote profile's cwd belongs to the daemon, not to this machine", async 
       await orch.shutdown();
     }
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a submit that names no cwd uses the profile's cwd on the daemon host", async () => {
+  // The master is allowed to know nothing about the far side's layout: it can
+  // leave `cwd` unset and send nothing. The answer must be the directory the
+  // OPERATOR configured for that profile on B -- not whatever directory the
+  // daemon process happened to be started in (under systemd that is the install
+  // dir, which nobody chose and which no whitelist would contain).
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-remote-default-cwd-"));
+  const work = path.join(dir, "work");
+  mkdirSync(work, { recursive: true });
+  const dCfg = parseConfig({
+    workdir: path.join(dir, ".state"),
+    profiles: [{ name: "pinned", driver: "mock", cwd: work, mock: { delayMs: 1 } }],
+  });
+  const dOrch = new Orchestrator(dCfg, { baseCwd: dir, persist: false });
+  const daemon = new WorkerDaemon({
+    config: dCfg,
+    orchestrator: dOrch,
+    host: "127.0.0.1",
+    port: 0,
+    token: TOKEN,
+    // `work` only: the daemon's own baseCwd (dir) is deliberately NOT allowed,
+    // so falling back to it fails the whitelist instead of passing quietly.
+    allowCwd: [work],
+    audit: new NoopAuditLog(),
+  });
+  const info = await daemon.start();
+  try {
+    const cCfg = parseConfig({
+      profiles: [
+        {
+          name: "r-default",
+          driver: "remote",
+          remote: { endpoint: info.url, tokenEnv: TOKEN_ENV, remoteProfile: "pinned" },
+        },
+      ],
+    });
+    const orch = new Orchestrator(cCfg, { baseCwd: dir, persist: false });
+    try {
+      const res = await orch.dispatch({ profile: "r-default", task: "no cwd on this side" });
+      assert.equal(res.status, "completed", res.error?.message);
+      // A never learns the path (it sent none), so its own record keeps an empty
+      // cwd; the proof of where the work ran comes from the worker's own reply.
+      assert.ok(
+        res.text.includes(path.resolve(work)),
+        `expected the far side's profile cwd ${path.resolve(work)} in: ${res.text}`,
+      );
+    } finally {
+      await orch.shutdown();
+    }
+  } finally {
+    await daemon.stop().catch(() => {});
+    await dOrch.shutdown().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
 });

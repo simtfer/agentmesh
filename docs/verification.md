@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 172 tests, offline, ~27s
+npm test            # 173 tests, offline, ~34s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -288,7 +288,7 @@ Two guards on what a fan-out costs *while it runs*: approval width and spend.
   the budget open: `budget.spentCost` shows `[{ USD, 10 }]` and the next submit is
   admitted.
 
-## `test/remote.test.ts` — 27 cases
+## `test/remote.test.ts` — 28 cases
 
 Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
 
@@ -302,7 +302,10 @@ Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
   resolved on the master — a relative value stays relative (so it means the
   daemon's base directory), while the same value on a local profile is resolved
   here. That is the whole difference, and it is the bug that only showed up when
-  the two hosts ran different operating systems.
+  the two hosts ran different operating systems. A submit that carries **no**
+  `cwd` at all lands in the directory the daemon profile configures for itself,
+  not in whatever directory the daemon process was started in — under systemd that
+  is the install dir, and no `allowCwd` list contains it.
 - **Confinement.** The daemon refuses a working directory outside `allowCwd`;
   `assertSafeBind` refuses a non-loopback bind without TLS; `assertCwdAllowed`
   confines by path segment (not by string prefix).
@@ -518,6 +521,44 @@ as browsable resources.
   turn and **zero** messages, with the item still open on the board and the
   engineer recorded as having passed. Both halves are in `team.md`: the escape
   hatch exists, and a model will not use it unless it is told why.
+- **A worker on another machine, over the public internet** (ad-hoc run,
+  2026-10-21, not in `npm test`: it needs a second host). A Windows master drove a
+  daemon on an Alibaba Cloud ECS — Alibaba Cloud Linux 3, kernel
+  `5.10.134-19.1.al8.x86_64`, Node 22.20 installed from the packed tarball into a
+  dedicated `agentmesh` account, started by systemd on `0.0.0.0:8790`. Unlike the
+  WSL run below this one crosses a *network*: the host sits behind a NAT'd EIP
+  (`172.24.24.182` on `eth0`, `101.133.157.228` as the public address) and the
+  port had to be opened in the cloud security group — `firewalld` alone was not
+  enough, and with it closed the client reported exactly what a firewall should
+  produce: `Opening handshake has timed out`.
+  Both directions authenticate: the daemon requires a client certificate
+  (`tls.ca`), and the master pins the CA. The ladder, all over the public path:
+  no CA `SELF_SIGNED_CERT_IN_CHAIN`; no client certificate `ERR_SSL_TLSV13_ALERT_
+  CERTIFICATE_REQUIRED`; a client certificate signed by a *different* CA
+  `ECONNRESET`; no token `401`; the right pair `200` with the daemon id. RTT to
+  `/profiles` was ~100 ms.
+  A task then ran on the far disk: `from-cloud.txt` was written under
+  `/home/agentmesh/work` (41 bytes, `agentmesh`-owned), and the audit trail records
+  the peer as the master's **public** address `171.83.30.166`, not a loopback —
+  the run really left the machine. A 614433-byte `.diff` was submitted as a
+  handoff artifact and staged at `<workdir>/handoffs/big.diff` with an identical
+  md5, 432 ms end-to-end (~1.4 MB/s), and `submit_ok` records
+  `artifacts:1, artifactBytes:614433`. `cwd: /etc` was refused
+  (`cwd_not_whitelisted`) and recorded with `requestedCwd` and the peer.
+  The run found two real defects, both invisible on one host. First:
+  `make-certs.sh` produced a CA with **two** `basicConstraints` extensions on
+  OpenSSL 1.1.1 (the host's `openssl.cnf` contributes `v3_ca`, and `-addext`
+  appended a second copy), and OpenSSL then refused to treat it as a CA at all —
+  `openssl verify` failed with "unable to get local issuer certificate" while
+  every file looked correct. The extension set now comes from a private config
+  file, so the result no longer depends on the host's `openssl.cnf`. Second: a
+  submit that carried no `cwd` was resolved against the **daemon's own process
+  directory**; under systemd that is the install dir, which no `allowCwd` list
+  contains, so a master that honestly said "I don't know the far side's layout"
+  was refused with `working directory not in whitelist: /home/agentmesh/daemon`.
+  It now falls back to the profile's own `cwd` on the daemon host, as
+  `docs/configuration.md` always claimed, with a regression case in
+  `test/remote.test.ts`.
 - **A worker on another operating system** (ad-hoc run, 2026-10-21, not in
   `npm test`: it needs a second host and spends tokens). A Windows master drove a
   WSL2 daemon: agentmesh was installed from the packed tarball into WSL's ext4,
@@ -543,15 +584,16 @@ Honest limits of the evidence above — these are not covered by the suite yet:
 - **macOS.** CI covers Linux and Windows only; nothing here has been run on
   Darwin, where `node:sqlite`, the `ws` TLS stack and git are all the same but
   path handling and the default shell are not.
-- **Another kernel is not another machine.** The WSL run above crosses an OS
-  boundary — two TCP/IP stacks, two filesystems with different case and locking
-  rules, a certificate chain built on the far side — but not a network one. WSL's
-  mirrored networking hands the distro the host's own address, so there is no DNS
-  to resolve, no route to choose, no intermediate firewall to open and no
-  distance. A run between two machines (separate clocks and disks, real latency
-  and retransmits, a firewall rule that has to be changed) is still unexercised
-  end-to-end; `docs/deploy.md` has the checklist, and every key in it has been
-  exercised on one host over its real interface with a real CA and mTLS.
+- **A kernel boundary and a network boundary are not the same test.** The WSL run
+  crosses an OS boundary — two TCP/IP stacks, two filesystems with different case
+  and locking rules, a certificate chain built on the far side — but not a network
+  one: mirrored networking hands the distro the host's own address, so there is no
+  DNS to resolve, no route to choose, no intermediate firewall to open and no
+  distance. The cloud run closes that gap for a *direct* public connection with a
+  firewall rule that had to be changed. Still unexercised: a host reached by
+  **name** rather than by IP (so certificate SANs must match DNS, not an address),
+  a link that actually drops packets mid-stream, and a clock that is not
+  NTP-disciplined. `docs/deploy.md` has the checklist.
 - **Concurrent processes sharing one SQLite file.** Two processes *can* open the
   same DB safely (`busy_timeout` + WAL), but the suite tests this incidentally
   rather than as a documented multi-writer contract.
