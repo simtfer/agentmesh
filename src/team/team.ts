@@ -5,7 +5,7 @@ import type { TaskEvent, TaskRecord } from "../types.js";
 import { isTerminal } from "../statemachine.js";
 import { TeamStore } from "./store.js";
 import { extractHandles, resolveMentions } from "./mentions.js";
-import { renderTurnPrompt } from "./prompt.js";
+import { renderPulsePrompt, renderTurnPrompt, SILENT } from "./prompt.js";
 import type {
   TeamChannelConfig,
   TeamChannelState,
@@ -27,6 +27,14 @@ const MAX_MESSAGE_CHARS = 20_000;
 const MAX_MEMORY_CHARS = 4_000;
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
+/** Floor on a pulse interval: a member that wakes every 50ms is a money leak. */
+const MIN_PULSE_MS = 1_000;
+
+/** Did the member answer "nothing to add"? Tolerates `SILENT`, **SILENT**, "SILENT." */
+function isSilent(text: string): boolean {
+  const bare = text.replace(/[`*_"'“”]/g, "").trim();
+  return /^SILENT[\s.!]*$/i.test(bare);
+}
 
 export interface TeamOptions {
   config: TeamConfig;
@@ -93,6 +101,8 @@ export class Team {
   private readonly maxContextChars: number;
   /** memberId → turnId currently in flight in this process */
   private readonly running = new Map<string, string>();
+  /** memberId → pulse timer, for members that wake on their own */
+  private readonly pulseTimers = new Map<string, ReturnType<typeof setInterval>>();
   private closed = false;
   private pumpScheduled = false;
 
@@ -148,6 +158,15 @@ export class Team {
         sessionKey: `team:${this.name}:${m.id}`,
         memoryFile: path.join(this.stateDir, "members", m.id, "MEMORY.md"),
         ...(m.notes ? { notes: m.notes } : {}),
+        ...(m.pulse
+          ? {
+              pulse: {
+                everyMs: Math.max(MIN_PULSE_MS, Math.trunc(m.pulse.everyMs)),
+                idleOnly: m.pulse.idleOnly ?? true,
+                channel: m.pulse.channel ?? "",
+              },
+            }
+          : {}),
       } satisfies TeamMember;
     });
     if (this.members.length === 0) throw new Error("team.members is empty: a team needs at least one member");
@@ -165,6 +184,28 @@ export class Team {
       for (const id of c.members ?? []) {
         if (!ids.has(id)) throw new Error(`channel "${c.id}" lists unknown member "${id}"`);
       }
+    }
+
+    // A pulse needs a room, and the room has to accept the member: waking up to
+    // talk in a channel you were not invited to is a broken roster, not a
+    // runtime surprise.
+    for (const m of this.members) {
+      if (!m.pulse) continue;
+      const wanted = m.pulse.channel;
+      const candidates = this.channelConfigs.filter((c) =>
+        c.members ? c.members.includes(m.id) : true,
+      );
+      const room = wanted
+        ? candidates.find((c) => c.id === wanted)
+        : (candidates.find((c) => c.id === "general") ?? candidates[0]);
+      if (!room) {
+        throw new Error(
+          `team member "${m.id}" has a pulse but is in no channel${
+            wanted ? ` "${wanted}"` : ""
+          }; add it to a channel or set pulse.channel`,
+        );
+      }
+      m.pulse.channel = room.id;
     }
 
     this.store = new TeamStore(
@@ -191,6 +232,7 @@ export class Team {
     }
 
     this.schedulePump();
+    this.startPulses();
   }
 
   /* ----------------------------- read side ----------------------------- */
@@ -255,6 +297,7 @@ export class Team {
         ...(current?.taskId ? { taskId: current.taskId } : {}),
         ...(workerId ? { workerId } : {}),
         ...(lastSpoke.has(m.id) ? { lastMessageAt: lastSpoke.get(m.id) } : {}),
+        ...(m.pulse ? { pulseEveryMs: m.pulse.everyMs } : {}),
       };
     });
     return {
@@ -522,6 +565,55 @@ export class Team {
 
   /* ---------------------------- scheduling ---------------------------- */
 
+  /**
+   * Timers, one per member that opted in. They are deliberately unref'd: a
+   * pulse must never be the reason a process stays alive, and a team that
+   * restarts should not fire a burst of overdue check-ins on the way up — each
+   * timer starts counting from now.
+   */
+  private startPulses(): void {
+    for (const member of this.members) {
+      if (!member.pulse) continue;
+      const timer = setInterval(() => {
+        try {
+          this.pulseNow(member.id);
+        } catch {
+          // A pulse is best-effort by definition; never let it take down the team.
+        }
+      }, member.pulse.everyMs);
+      timer.unref?.();
+      this.pulseTimers.set(member.id, timer);
+    }
+  }
+
+  /**
+   * Wake one member now, subject to the same guards the timer uses. Public
+   * because "check in on the room" is a legitimate manual move — and because a
+   * timer is a terrible thing to have to wait for in a test.
+   *
+   * Returns the turn it queued, or `undefined` when the member stayed asleep.
+   * Staying asleep is the normal outcome, not an error: a pulse while the room
+   * is busy, or while the member already has work, would just add noise.
+   */
+  pulseNow(memberId: string): TeamTurn | undefined {
+    if (this.closed) return undefined;
+    const member = this.member(memberId);
+    if (!member?.pulse) return undefined;
+    if (this.running.has(member.id) || this.store.countQueued(member.id) > 0) return undefined;
+    if (member.pulse.idleOnly) {
+      const open = this.store.openTurnCounts();
+      if (open.queued > 0 || open.running > 0 || open.waiting > 0) return undefined;
+    }
+    const turn = this.store.createTurn({
+      memberId: member.id,
+      channel: member.pulse.channel,
+      kind: "pulse",
+      hops: 0,
+    });
+    this.schedulePump();
+    return turn;
+  }
+
   private schedulePump(): void {
     if (this.pumpScheduled || this.closed) return;
     this.pumpScheduled = true;
@@ -552,20 +644,32 @@ export class Team {
 
   private async runTurn(turn: TeamTurn, member: TeamMember): Promise<void> {
     const channel = this.channelState(turn.channel);
-    const trigger = this.store.getMessage(turn.messageId);
+    const pulse = turn.kind === "pulse";
+    const trigger = turn.messageId ? this.store.getMessage(turn.messageId) : undefined;
     let final: TaskRecord | undefined;
     let taskId: string | undefined;
 
     try {
-      if (!trigger) throw new Error(`the message this turn answers is gone (${turn.messageId})`);
-      const prompt = this.buildPrompt(member, channel, trigger);
+      if (!pulse && !trigger) {
+        throw new Error(`the message this turn answers is gone (${turn.messageId})`);
+      }
+      const prompt =
+        pulse || !trigger
+          ? this.buildPulsePrompt(member, channel)
+          : this.buildPrompt(member, channel, trigger);
       const submitted = this.orch.submitTask({
         prompt,
         profile: member.profile,
         sessionKey: member.sessionKey,
         cwd: member.cwd,
         timeoutMs: this.turnTimeoutMs,
-        metadata: { team: this.name, memberId: member.id, turnId: turn.id, channel: turn.channel },
+        metadata: {
+          team: this.name,
+          memberId: member.id,
+          turnId: turn.id,
+          channel: turn.channel,
+          kind: turn.kind,
+        },
       });
       taskId = submitted.taskId;
       this.patchTurn(turn.id, { taskId, status: "running", startedAt: Date.now() });
@@ -599,6 +703,10 @@ export class Team {
       // Release the slot before posting: the reply may mention a teammate, and
       // the pump must be free to start whoever is next.
       this.finish(member.id, turn.id);
+      // A pulse that has nothing to say posts nothing at all. Not even a system
+      // line: the room did not ask, so "checked, nothing new" is noise by
+      // definition (and the turn is still visible in the member's transcript).
+      if (pulse && (text.length === 0 || isSilent(text))) return;
       if (text.length === 0) {
         this.systemMessage(
           channel.id,
@@ -613,8 +721,11 @@ export class Team {
         authorName: member.name,
         kind: "chat",
         hops: turn.hops + 1,
-        rootId: turn.rootId,
-        replyTo: turn.messageId,
+        // A pulse answers nothing, so its message starts its own thread: the
+        // mentions in it get their own allowance instead of eating the budget
+        // of whatever conversation happened to be last in the room.
+        ...(turn.rootId ? { rootId: turn.rootId } : {}),
+        ...(turn.messageId ? { replyTo: turn.messageId } : {}),
         turnId: turn.id,
       });
       return;
@@ -716,6 +827,29 @@ export class Team {
       trigger,
       memory: this.readMemory(member),
       maxContextChars: this.maxContextChars,
+    });
+  }
+
+  /**
+   * A pulse prompt has no trigger: the member is shown the room as it stands
+   * and asked whether anything is worth saying. `lastActivityAt` is passed so
+   * it can tell "three minutes of quiet" from "three days" — the same words
+   * mean different things.
+   */
+  private buildPulsePrompt(member: TeamMember, channel: ResolvedChannel): string {
+    const recent = this.store.listMessages(channel.id, this.contextMessages, 0);
+    return renderPulsePrompt({
+      teamName: this.name,
+      member,
+      channelId: channel.id,
+      channelTitle: channel.title,
+      ...(channel.description ? { channelDescription: channel.description } : {}),
+      audience: channel.members,
+      transcript: recent,
+      memory: this.readMemory(member),
+      maxContextChars: this.maxContextChars,
+      everyMs: member.pulse?.everyMs ?? MIN_PULSE_MS,
+      lastActivityAt: recent.length > 0 ? recent[recent.length - 1]!.createdAt : 0,
     });
   }
 
@@ -836,6 +970,8 @@ export class Team {
   async shutdown(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    for (const timer of this.pulseTimers.values()) clearInterval(timer);
+    this.pulseTimers.clear();
     for (const turnId of this.running.values()) {
       const turn = this.store.getTurn(turnId);
       if (turn?.taskId) await this.orch.cancelTask(turn.taskId).catch(() => {});

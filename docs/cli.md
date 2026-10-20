@@ -133,6 +133,7 @@ npx tsx src/cli.ts team dm qa "Any risk before we ship?" --wait
 npx tsx src/cli.ts team log general --limit 20 [--follow]
 npx tsx src/cli.ts team members | channels | status
 npx tsx src/cli.ts team transcript dev --limit 5
+npx tsx src/cli.ts team pulse ceo            # wake one member now (same guards as its timer)
 npx tsx src/cli.ts team approve <approvalId> allow_once
 npx tsx src/cli.ts team respond <approvalId> accept --content '{"answer":"yes"}'
 ```
@@ -145,6 +146,7 @@ npx tsx src/cli.ts team respond <approvalId> accept --content '{"answer":"yes"}'
 | `log` | the room transcript, including system notices; `--follow` tails it |
 | `status` | per-member state, queue depth, live worker, channels, pending approvals |
 | `transcript` | one member's turns **with the task events behind them** (tool calls, waiting, failures); streamed deltas are folded into one line |
+| `pulse` | wake one member by hand; refuses (and says so) while the room is busy |
 | `approve` | resolve a permission request blocking a turn (`allow_once`, `reject_always`, …) |
 | `respond` | answer an elicitation (`accept` / `decline` / `cancel`, optional `--content` JSON) |
 

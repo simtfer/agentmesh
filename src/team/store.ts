@@ -6,6 +6,7 @@ import type {
   TeamMessage,
   TeamMessageKind,
   TeamTurn,
+  TeamTurnKind,
   TeamTurnStatus,
 } from "./types.js";
 
@@ -31,8 +32,9 @@ CREATE TABLE IF NOT EXISTS turns (
   id TEXT NOT NULL UNIQUE,
   memberId TEXT NOT NULL,
   channel TEXT NOT NULL,
-  messageId TEXT NOT NULL,
-  rootId TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'message',
+  messageId TEXT,
+  rootId TEXT,
   hops INTEGER NOT NULL,
   taskId TEXT,
   status TEXT NOT NULL,
@@ -51,7 +53,33 @@ CREATE INDEX IF NOT EXISTS idx_turns_status ON turns(status, seq);
 const ADDED_COLUMNS: Array<{ table: string; column: string; decl: string }> = [
   { table: "messages", column: "hops", decl: "INTEGER NOT NULL DEFAULT 0" },
   { table: "messages", column: "rootId", decl: "TEXT" },
+  { table: "turns", column: "kind", decl: "TEXT NOT NULL DEFAULT 'message'" },
 ];
+
+/**
+ * The first release declared `turns.messageId`/`rootId` NOT NULL, because every
+ * turn answered a message. A pulse has nothing to answer, and SQLite cannot
+ * relax a constraint in place, so that table has to be rebuilt once. Copied
+ * column-by-column (not `SELECT *`) so a database from any earlier shape lands
+ * in the current one.
+ */
+const TURNS_COLUMNS = [
+  "seq",
+  "id",
+  "memberId",
+  "channel",
+  "kind",
+  "messageId",
+  "rootId",
+  "hops",
+  "taskId",
+  "status",
+  "queuedAt",
+  "startedAt",
+  "endedAt",
+  "approvalId",
+  "error",
+] as const;
 
 type Row = Record<string, unknown>;
 
@@ -94,17 +122,20 @@ function rowToTurn(r: Row): TeamTurn {
     id: String(r.id),
     memberId: String(r.memberId),
     channel: String(r.channel),
-    messageId: String(r.messageId),
-    rootId: String(r.rootId),
+    kind: (str(r.kind) ?? "message") as TeamTurnKind,
     hops: num(r.hops) ?? 0,
     status: String(r.status) as TeamTurnStatus,
     queuedAt: num(r.queuedAt) ?? 0,
   };
+  const messageId = str(r.messageId);
+  const rootId = str(r.rootId);
   const taskId = str(r.taskId);
   const startedAt = num(r.startedAt);
   const endedAt = num(r.endedAt);
   const approvalId = str(r.approvalId);
   const error = str(r.error);
+  if (messageId) t.messageId = messageId;
+  if (rootId) t.rootId = rootId;
   if (taskId) t.taskId = taskId;
   if (startedAt !== undefined) t.startedAt = startedAt;
   if (endedAt !== undefined) t.endedAt = endedAt;
@@ -132,9 +163,12 @@ export interface NewMessage {
 export interface NewTurn {
   memberId: string;
   channel: string;
-  messageId: string;
-  rootId: string;
+  /** omitted for a pulse: nothing was said to answer */
+  messageId?: string;
+  /** omitted for a pulse: it starts its own thread instead of continuing one */
+  rootId?: string;
   hops: number;
+  kind?: TeamTurnKind;
   status?: TeamTurnStatus;
 }
 
@@ -159,12 +193,41 @@ export class TeamStore {
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec(SCHEMA);
     for (const c of ADDED_COLUMNS) this.ensureColumn(c.table, c.column, c.decl);
+    this.relaxTurnsMessageId();
   }
 
   private ensureColumn(table: string, column: string, decl: string): void {
     const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
     if (cols.some((c) => String(c.name) === column)) return;
     this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+
+  /**
+   * Rebuild `turns` once if `messageId` is still NOT NULL, so a turn can exist
+   * without a message (a pulse). Runs inside a transaction: either the old rows
+   * survive in the new shape or nothing changes.
+   */
+  private relaxTurnsMessageId(): void {
+    const cols = this.db.prepare("PRAGMA table_info(turns)").all() as Row[];
+    const messageId = cols.find((c) => String(c.name) === "messageId");
+    if (!messageId || Number(messageId.notnull) === 0) return;
+    const copied = cols.map((c) => String(c.name)).filter((n) => (TURNS_COLUMNS as readonly string[]).includes(n));
+    const list = TURNS_COLUMNS.filter((c) => copied.includes(c)).join(", ");
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec("ALTER TABLE turns RENAME TO turns_v1");
+      // Index names follow the renamed table, so re-create them under the real name.
+      this.db.exec("DROP INDEX IF EXISTS idx_turns_member");
+      this.db.exec("DROP INDEX IF EXISTS idx_turns_root");
+      this.db.exec("DROP INDEX IF EXISTS idx_turns_status");
+      this.db.exec(SCHEMA);
+      this.db.exec(`INSERT INTO turns (${list}) SELECT ${list} FROM turns_v1`);
+      this.db.exec("DROP TABLE turns_v1");
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   /* ---------------------------- messages ---------------------------- */
@@ -275,19 +338,31 @@ export class TeamStore {
     const id = `turn-${randomUUID()}`;
     const queuedAt = Date.now();
     const status = input.status ?? "queued";
+    const kind = input.kind ?? "message";
     const res = this.db
       .prepare(
-        `INSERT INTO turns (id, memberId, channel, messageId, rootId, hops, status, queuedAt)
-         VALUES (?,?,?,?,?,?,?,?)`,
+        `INSERT INTO turns (id, memberId, channel, kind, messageId, rootId, hops, status, queuedAt)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
       )
-      .run(id, input.memberId, input.channel, input.messageId, input.rootId, input.hops, status, queuedAt);
+      .run(
+        id,
+        input.memberId,
+        input.channel,
+        kind,
+        input.messageId ?? null,
+        input.rootId ?? null,
+        input.hops,
+        status,
+        queuedAt,
+      );
     return {
       seq: Number(res.lastInsertRowid),
       id,
       memberId: input.memberId,
       channel: input.channel,
-      messageId: input.messageId,
-      rootId: input.rootId,
+      kind,
+      ...(input.messageId ? { messageId: input.messageId } : {}),
+      ...(input.rootId ? { rootId: input.rootId } : {}),
       hops: input.hops,
       status,
       queuedAt,
@@ -311,8 +386,8 @@ export class TeamStore {
       .run(
         next.memberId,
         next.channel,
-        next.messageId,
-        next.rootId,
+        next.messageId ?? null,
+        next.rootId ?? null,
         next.hops,
         next.taskId ?? null,
         next.status,

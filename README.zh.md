@@ -21,7 +21,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/simtfer/agentmesh/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](https://github.com/simtfer/agentmesh/blob/main/package.json)
 
-155 个离线测试，覆盖 Linux 与 Windows · 尚未发布到 npm
+160 个离线测试，覆盖 Linux 与 Windows · 尚未发布到 npm
 
 ## 这是什么
 
@@ -111,7 +111,8 @@ queued ─▶ starting ─▶ running ─▶ succeeded
 
 **团队**把 worker 变成有名字的同事。每个成员是一个固定会话的 agent 进程，有自己的 harness profile、
 工作区和 `MEMORY.md`；成员共享房间，`@提及` 把下一轮交给某位队友。成员之间并行，单个成员串行，
-每一轮的工具调用都可查看——群聊本身就是界面，而不是它的总结。
+每一轮的工具调用都可查看——群聊本身就是界面，而不是它的总结。配了 `pulse` 的成员还会按自己的节奏
+醒来，只在真有事说的时候才开口。
 
 ```bash
 agentmesh team serve &        # 常驻：保住名册与各自的会话
@@ -223,7 +224,7 @@ stdio 上共 18 个工具。核心循环：
 
 ```bash
 npm run typecheck   # tsc --noEmit，干净
-npm test            # 155 个测试，全离线，无 API 费用，约 27 秒
+npm test            # 160 个测试，全离线，无 API 费用，约 27 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
 npm run check:pack  # 发布包里有 dist/，且不含源码与测试
@@ -231,16 +232,16 @@ npm run deploy:tls  # 在本机真实网卡上跑 TLS/mTLS（不走 loopback）
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **155/155**，分十二个文件，全离线，约 27 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。CI 在 Linux 与 Windows × Node 22 / 24 上跑同一套关卡（[`.github/workflows/ci.yml`](https://github.com/simtfer/agentmesh/blob/main/.github/workflows/ci.yml)）；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md)（英文）。
+`npm test` 为 **160/160**，分十二个文件，全离线，约 27 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。CI 在 Linux 与 Windows × Node 22 / 24 上跑同一套关卡（[`.github/workflows/ci.yml`](https://github.com/simtfer/agentmesh/blob/main/.github/workflows/ci.yml)）；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md)（英文）。
 
 ## 路线图
 
-已经可用：基于 SQLite 的异步 8 态生命周期、人在环路审批、真实 ACP worker、有界加权公平调度（含截止时间与 DAG 重试）、跨 Worker 交接（含把 diff 交给另一台机器上的 worker）、强制 JSON 契约与成本汇总、硬性花费预算、自托管委派手册、支持双向 TLS 的远程 daemon，以及团队层（有名字的成员、房间、@ 交接、逐成员过程记录）。
+已经可用：基于 SQLite 的异步 8 态生命周期、人在环路审批、真实 ACP worker、有界加权公平调度（含截止时间与 DAG 重试）、跨 Worker 交接（含把 diff 交给另一台机器上的 worker）、强制 JSON 契约与成本汇总、硬性花费预算、自托管委派手册、支持双向 TLS 的远程 daemon，以及团队层（有名字的成员、房间、@ 交接、逐成员过程记录、让成员自己开口的 pulse）。
 
 接下来：
 
-- **自主性与控制台**——给空闲成员一个心跳，让它们能主动汇报或认领工作；以及在团队 API
-  与审计日志之上的只读 Web 控制台。
+- **只读控制台**——在团队 API 与审计日志之上的 Web 视图，看团队不必再 tail 一个终端。
+- **汇报之外的自主**——成员从队列里自己认领活，而不是等着被点名。
 
 ## 贡献
 

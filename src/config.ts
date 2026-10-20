@@ -84,6 +84,12 @@ const DaemonSettings = z.object({
   auditKeep: z.number().int().nonnegative().optional(),
 });
 
+const TeamPulse = z.object({
+  everyMs: z.number().int().positive(),
+  idleOnly: z.boolean().optional(),
+  channel: z.string().optional(),
+});
+
 const TeamMember = z.object({
   id: z.string().min(1),
   name: z.string().optional(),
@@ -92,6 +98,7 @@ const TeamMember = z.object({
   mention: z.string().optional(),
   cwd: z.string().optional(),
   notes: z.string().optional(),
+  pulse: TeamPulse.optional(),
 });
 
 const TeamChannel = z.object({

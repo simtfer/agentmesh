@@ -30,7 +30,7 @@ explicit `handoff`.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/simtfer/agentmesh/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](https://github.com/simtfer/agentmesh/blob/main/package.json)
 
-155 offline tests on Linux and Windows · not published to npm yet
+160 offline tests on Linux and Windows · not published to npm yet
 
 ## What this is
 
@@ -147,7 +147,8 @@ A **team** turns workers into named colleagues. Each member is a pinned agent
 session with its own harness profile, workspace and `MEMORY.md`; members share
 rooms where an `@mention` hands the next turn to a teammate. Members run in
 parallel, one turn at a time each, and every turn's tool calls are inspectable —
-the group chat is the interface, not a summary of it.
+the group chat is the interface, not a summary of it. A member with a `pulse` also
+wakes on its own schedule and says something only when there is something to say.
 
 ```bash
 agentmesh team serve &        # keeps the roster and its sessions alive
@@ -296,7 +297,7 @@ non-error symptoms (daemon 401s, TLS failures):
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 155 tests, offline, no API cost, ~27s
+npm test            # 160 tests, offline, no API cost, ~27s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run check:pack  # publish tarball contains dist/, and no sources or tests
@@ -304,7 +305,7 @@ npm run deploy:tls  # real TLS/mTLS run over this host's LAN interface (not loop
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **155/155** across twelve files, offline, in about 27 seconds. Every
+`npm test` is **160/160** across twelve files, offline, in about 27 seconds. Every
 case drives a public surface (Orchestrator, MCP tools, or the daemon's HTTP/WS
 endpoints) and asserts the resulting task record, not a mock's internal calls.
 CI runs the same gate on Linux and Windows × Node 22 and 24
@@ -319,12 +320,15 @@ real ACP workers, bounded weighted-fair scheduling with deadlines and DAG retrie
 cross-worker handoff (including a diff handed to a worker on another host),
 enforced JSON contracts with cost roll-up, hard spend budgets, a self-hosted
 playbook, a remote daemon with mutual TLS, and a team layer (named members,
-rooms, @mention hand-offs, per-member transcripts).
+rooms, @mention hand-offs, per-member transcripts, and pulses so a member can
+speak unprompted).
 
 Next:
 
-- **Autonomy and a console** — a heartbeat so idle members can report or pick up
-  work unprompted, and a read-only web console over the team API and audit trail.
+- **A read-only console** — a web view over the team API and audit trail, so
+  watching the team is not a matter of tailing a terminal.
+- **Autonomy beyond reporting** — members picking work off a queue instead of
+  waiting to be named.
 
 ## Contributing
 

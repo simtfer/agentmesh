@@ -9,6 +9,28 @@
  * restarted without losing the conversation.
  */
 
+/**
+ * A member that wakes up on its own.
+ *
+ * Without this a team only moves when a human speaks, which is the difference
+ * between colleagues and a very responsive tool. A pulse is a normal turn with
+ * no triggering message: the member is shown the room and asked whether it has
+ * anything worth saying. It is off by default because every pulse is a real,
+ * paid agent turn.
+ */
+export interface TeamPulseConfig {
+  /** wake this member every N ms (floor: 1s; production wants minutes) */
+  everyMs: number;
+  /**
+   * Only pulse when the whole team is quiet (default `true`). With `false` the
+   * member may cut in while teammates work — right for a lead reporting
+   * progress, wrong for everyone else.
+   */
+  idleOnly?: boolean;
+  /** room to pulse in; defaults to `general`, else the member's first room */
+  channel?: string;
+}
+
 /** One member, as declared in `team.members` in agentmesh.yaml. */
 export interface TeamMemberConfig {
   /** stable id, used for channel addresses, session keys and state paths */
@@ -25,6 +47,8 @@ export interface TeamMemberConfig {
   cwd?: string;
   /** standing instructions, prepended to every turn (keep it small) */
   notes?: string;
+  /** let this member speak unprompted; omitted = it only answers */
+  pulse?: TeamPulseConfig;
 }
 
 /**
@@ -85,6 +109,8 @@ export interface TeamMember {
   /** file the member may append durable facts to; injected on every turn */
   memoryFile: string;
   notes?: string;
+  /** resolved pulse settings; absent = this member only answers */
+  pulse?: { everyMs: number; idleOnly: boolean; channel: string };
 }
 
 export type TeamMessageKind = "chat" | "system";
@@ -124,6 +150,12 @@ export type TeamTurnStatus =
   | "cancelled";
 
 /**
+ * Why a turn exists. `message` answers something someone said; `pulse` is the
+ * member waking up on its own schedule, with nothing to answer.
+ */
+export type TeamTurnKind = "message" | "pulse";
+
+/**
  * One member working on one message. A turn is the unit that maps onto an
  * agentmesh task; keeping it separate means the channel can show *who is
  * thinking* without exposing task internals to the conversation.
@@ -133,10 +165,11 @@ export interface TeamTurn {
   id: string;
   memberId: string;
   channel: string;
-  /** the message being answered */
-  messageId: string;
-  /** the originating user message, for hop/turn accounting */
-  rootId: string;
+  kind: TeamTurnKind;
+  /** the message being answered; absent for a pulse, which answers nothing */
+  messageId?: string;
+  /** the originating message, for hop/turn accounting; absent for a pulse */
+  rootId?: string;
   /** distance from the root message (0 = the user addressed this member) */
   hops: number;
   taskId?: string;
@@ -156,6 +189,8 @@ export interface TeamMemberState extends TeamMember {
   taskId?: string;
   workerId?: string;
   lastMessageAt?: number;
+  /** set on members that wake on their own, so the room can see who does */
+  pulseEveryMs?: number;
 }
 
 export interface TeamChannelState {

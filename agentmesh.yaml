@@ -190,6 +190,9 @@ profiles:
 #       role: splits goals, assigns work, reports to the user
 #       profile: pi
 #       notes: Keep updates short.
+#       # Optional: let this member wake on its own schedule. Every pulse is a
+#       # real, paid turn; answering SILENT posts nothing.
+#       # pulse: { everyMs: 600000, idleOnly: true }
 #     - id: dev
 #       name: Sam
 #       role: engineer, writes and fixes code

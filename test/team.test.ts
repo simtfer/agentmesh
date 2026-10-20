@@ -2,10 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { parseConfig } from "../src/config.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { Team } from "../src/team/team.js";
+import { TeamStore } from "../src/team/store.js";
 import { startTeamServer } from "../src/team/server.js";
 import { extractHandles } from "../src/team/mentions.js";
 import type { TeamConfig } from "../src/team/types.js";
@@ -29,6 +31,8 @@ interface TeamHarnessOptions {
   requireApproval?: boolean;
   /** split every reply into this many streaming deltas, like a real driver */
   stream?: number;
+  /** per-member pulse settings, keyed by member id */
+  pulse?: Record<string, { everyMs: number; idleOnly?: boolean }>;
   replies?: { ceo?: string[]; dev?: string[]; qa?: string[] };
 }
 
@@ -62,9 +66,27 @@ function makeTeam(dir: string, opts: TeamHarnessOptions = {}) {
     team: {
       name: "acme",
       members: [
-        { id: "ceo", name: "Mira", role: "chief executive, splits goals into work", profile: "ceo-h" },
-        { id: "dev", name: "Sam", role: "engineer, writes the code", profile: "dev-h" },
-        { id: "qa", name: "Lin", role: "verifier, tests what was built", profile: "qa-h" },
+        {
+          id: "ceo",
+          name: "Mira",
+          role: "chief executive, splits goals into work",
+          profile: "ceo-h",
+          ...(opts.pulse?.ceo ? { pulse: opts.pulse.ceo } : {}),
+        },
+        {
+          id: "dev",
+          name: "Sam",
+          role: "engineer, writes the code",
+          profile: "dev-h",
+          ...(opts.pulse?.dev ? { pulse: opts.pulse.dev } : {}),
+        },
+        {
+          id: "qa",
+          name: "Lin",
+          role: "verifier, tests what was built",
+          profile: "qa-h",
+          ...(opts.pulse?.qa ? { pulse: opts.pulse.qa } : {}),
+        },
       ],
       channels: [
         { id: "general", description: "the whole team" },
@@ -377,6 +399,159 @@ test("the roster rejects duplicate handles instead of guessing who @dev means", 
     );
     void orch.shutdown();
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("a member with a pulse wakes on its own, and silence keeps the room quiet", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const h = makeTeam(dir, { pulse: { ceo: { everyMs: 1000 } }, replies: { ceo: ["SILENT"] } });
+  try {
+    // Nobody speaks: only the timer can create this turn.
+    await until(
+      () => h.team.transcript("ceo", 5).some((t) => t.kind === "pulse"),
+      5000,
+      "a pulse turn",
+    );
+    await h.team.idle(10_000);
+
+    const pulse = h.team.transcript("ceo", 5).find((t) => t.kind === "pulse")!;
+    assert.equal(pulse.status, "succeeded");
+    assert.equal(pulse.messageId, undefined, "a pulse has nothing to answer");
+    assert.equal(pulse.rootId, undefined, "a pulse does not continue someone else's thread");
+
+    // The prompt has to make silence cheap and explicit, or every wake-up
+    // becomes a "no update" post.
+    const prompt = h.orch.taskStatus(pulse.taskId!)!.prompt;
+    assert.match(prompt, /Nobody is talking to you/);
+    assert.match(prompt, /SILENT/);
+    assert.match(prompt, /every 1 second/, "the member is told its own cadence");
+
+    assert.equal(
+      chat(h.team.messages("general")).filter((m) => m.author === "ceo").length,
+      0,
+      "SILENT must post nothing",
+    );
+    assert.equal(
+      h.team.messages("general").filter((m) => m.kind === "system").length,
+      0,
+      "silence must not be announced either",
+    );
+  } finally {
+    await cleanup(h, dir);
+  }
+});
+
+test("a pulse that has something to say starts its own thread and can hand off", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const h = makeTeam(dir, {
+    pulse: { ceo: { everyMs: 3_600_000 } },
+    replies: { ceo: ["Build is green. @dev, ship it."], dev: ["Shipped."] },
+  });
+  try {
+    const queued = h.team.pulseNow("ceo");
+    assert.ok(queued, "an idle member with a pulse can be woken on demand");
+    await h.team.idle(10_000);
+
+    const log = h.team.messages("general").filter((m) => m.kind === "chat");
+    assert.deepEqual(log.map((m) => m.author), ["ceo", "dev"]);
+    assert.deepEqual(log[0]!.mentions, ["dev"], "the wake-up message is a normal message");
+
+    const dev = h.team.transcript("dev", 1)[0]!;
+    assert.equal(dev.hops, 1);
+    assert.equal(dev.rootId, log[0]!.id, "the pulse message roots the new thread");
+    assert.equal(
+      h.team.transcript("ceo", 1)[0]!.rootId,
+      undefined,
+      "but the pulse turn itself belongs to no thread, so it cannot spend another one's budget",
+    );
+  } finally {
+    await cleanup(h, dir);
+  }
+});
+
+test("a pulse never talks over work that is already in progress", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const h = makeTeam(dir, {
+    pulse: { ceo: { everyMs: 3_600_000 }, qa: { everyMs: 3_600_000, idleOnly: false } },
+    replies: { ceo: ["SILENT"], dev: ["Done. @qa check it."], qa: ["Checked."] },
+  });
+  try {
+    h.team.post({ channel: "general", text: "@dev do it" });
+    assert.equal(
+      h.team.pulseNow("ceo"),
+      undefined,
+      "an idleOnly member stays asleep while anyone in the team is working",
+    );
+    assert.ok(
+      h.team.pulseNow("qa"),
+      "idleOnly: false opts out of the room-wide gate (for a lead reporting progress)",
+    );
+
+    await h.team.idle(20_000);
+    assert.ok(
+      h.team.pulseNow("ceo"),
+      "once the room is quiet again the same member is allowed to wake",
+    );
+  } finally {
+    await cleanup(h, dir);
+  }
+});
+
+test("a member without a pulse only ever answers", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const h = makeTeam(dir);
+  try {
+    assert.equal(h.team.pulseNow("ceo"), undefined, "no pulse configured, no wake-up");
+    h.team.post({ channel: "general", text: "@ceo status?" });
+    await h.team.idle(10_000);
+    assert.equal(h.team.transcript("ceo", 5).filter((t) => t.kind === "pulse").length, 0);
+    assert.equal(h.team.status().members.find((m) => m.id === "ceo")!.pulseEveryMs, undefined);
+  } finally {
+    await cleanup(h, dir);
+  }
+});
+
+test("a team database from before pulses still opens and keeps its turns", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const dbPath = path.join(dir, "team.sqlite");
+  // The v1 shape: every turn had to answer a message (both columns NOT NULL).
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`CREATE TABLE turns (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    memberId TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    messageId TEXT NOT NULL,
+    rootId TEXT NOT NULL,
+    hops INTEGER NOT NULL,
+    taskId TEXT,
+    status TEXT NOT NULL,
+    queuedAt INTEGER NOT NULL,
+    startedAt INTEGER,
+    endedAt INTEGER,
+    approvalId TEXT,
+    error TEXT
+  );`);
+  legacy
+    .prepare(
+      `INSERT INTO turns (id, memberId, channel, messageId, rootId, hops, status, queuedAt)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    )
+    .run("turn-old", "ceo", "general", "msg-1", "msg-1", 0, "succeeded", 1);
+  legacy.close();
+
+  const store = new TeamStore(dbPath);
+  try {
+    const old = store.getTurn("turn-old")!;
+    assert.equal(old.messageId, "msg-1", "existing rows survive the rebuild");
+    assert.equal(old.kind, "message", "history defaults to message turns");
+
+    const pulse = store.createTurn({ memberId: "ceo", channel: "general", kind: "pulse", hops: 0 });
+    assert.equal(pulse.kind, "pulse");
+    assert.equal(pulse.messageId, undefined);
+    assert.ok(pulse.seq > old.seq, "the id sequence continues instead of restarting");
+  } finally {
+    store.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -167,6 +167,7 @@ team:
       mention: ceo             # optional; unique across id + mention
       cwd: repos/acme          # optional; relative to team.cwd
       notes: Keep updates short.
+      pulse: { everyMs: 600000, idleOnly: true }   # optional: speak unprompted
   channels:
     - id: general              # `#general`; the default when none are declared
       description: the whole team
@@ -187,6 +188,7 @@ team:
 | `tokenEnv` | — | required off-loopback; the *name* of the env var holding the token |
 | `members[]` | — | at least one; each `profile` must resolve |
 | `channels[]` | `[general]` | rooms; `members` narrows who is addressable |
+| `members[].pulse` | off | `{ everyMs, idleOnly, channel }` — wake this member on its own schedule; `SILENT` posts nothing, `idleOnly` (default `true`) only fires when the team is quiet, and `channel` defaults to `general`. Each pulse is a paid turn |
 
 Member ids and `mention` handles share one namespace (a member's id is also
 addressable), so `@dev` can never be ambiguous. A member's pinned session is

@@ -161,6 +161,45 @@ in its channel. It is not replayed automatically: the agent may already have
 edited files, and a silent retry could apply the same change twice. Queued turns
 were never started, so they run on the next start.
 
+## Waking up: pulses
+
+A member that only speaks when spoken to is a very responsive tool, not a
+colleague. `pulse` lets a member wake on its own schedule and decide whether the
+room needs anything — a finished result, a risk, work it can pick up.
+
+```yaml
+team:
+  members:
+    - id: ceo
+      name: Mira
+      profile: pi
+      pulse: { everyMs: 600000, idleOnly: true }   # every 10 minutes
+```
+
+A pulse is a normal turn with **no triggering message**: the member sees the room
+as it stands plus how long it has been quiet, and is asked whether it has
+something worth saying. Three rules keep it from becoming noise:
+
+- **`SILENT` is the expected answer.** Replying `SILENT` posts nothing at all —
+  not even a "checked, nothing new" system line. A wake-up that found nothing is
+  invisible to the room but still visible in that member's `transcript`.
+- **It does not cut in.** With `idleOnly` (the default) a pulse only fires when
+  the whole team is quiet, so it never competes with real work for a slot or
+  talks over a conversation in progress. Set `idleOnly: false` for a lead that
+  should be able to report progress while others work.
+- **It starts its own thread.** The message a pulse produces is its own root, so
+  its `@mentions` get a fresh hop/turn allowance instead of spending whatever
+  conversation happened to be last in the room.
+
+`everyMs` has a 1-second floor and no upper bound; each pulse is a **real, paid
+agent turn**, so minutes are the sane range and `limits.maxTotalTokens` /
+`maxTotalCost` are the backstop. Pulses are off unless configured — a roster that
+does not mention `pulse` behaves exactly as before.
+
+Wake one member by hand with `agentmesh team pulse <member>` (same guards: if the
+room is busy, it stays asleep and says so). `team status` marks who wakes on their
+own, and `team transcript` labels those turns `(pulse)`.
+
 ## Watching the work
 
 The group chat is not a summary written by the CEO. Every member's turns are

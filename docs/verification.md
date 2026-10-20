@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 155 tests, offline, ~27s
+npm test            # 160 tests, offline, ~27s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -323,7 +323,7 @@ The remote *security* model (flags, deployment shape, rotation drill) is documen
 in [remote.md](remote.md#security-model); the coverage list above mirrors
 [remote.md#remote-tests](remote.md#remote-tests).
 
-## `test/team.test.ts` — 13 cases
+## `test/team.test.ts` — 18 cases
 
 The team layer, driven end-to-end over the mock harness (deterministic, offline)
 plus a real HTTP server on an ephemeral port:
@@ -355,6 +355,15 @@ plus a real HTTP server on an ephemeral port:
   line.
 - **Memory.** A `MEMORY.md` written by hand is injected into the next turn's prompt
   together with identity and role.
+- **Pulses.** A member configured with `pulse` wakes on its own timer with no
+  triggering message, is told its own cadence, and answering `SILENT` posts
+  nothing at all; a pulse with something to say roots a fresh thread (so its
+  `@mention` gets its own allowance) while the pulse turn itself belongs to no
+  thread; an `idleOnly` member stays asleep while anyone works and wakes once the
+  room is quiet; a member without `pulse` never wakes.
+- **Forward migration.** A `team.sqlite` whose `turns` table still has
+  `messageId NOT NULL` (the pre-pulse shape) opens, keeps its rows, defaults them
+  to `message` turns, and continues its id sequence.
 - **HTTP.** `/team` is 401 without a token and 200 with one, `/healthz` stays open,
   `POST /team/messages` runs the chain, paged messages and the per-member
   transcript round-trip.

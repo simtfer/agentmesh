@@ -83,8 +83,9 @@ function printMembers(members: TeamMemberState[]): void {
   for (const m of members) {
     const worker = m.workerId ? ` worker=${m.workerId}` : "";
     const queued = m.queued > 0 ? ` queued=${m.queued}` : "";
+    const pulse = m.pulseEveryMs ? ` pulse=${Math.round(m.pulseEveryMs / 1000)}s` : "";
     process.stdout.write(
-      `   ${m.id.padEnd(10)} ${m.status.padEnd(8)} @${m.mention.padEnd(10)} ${m.profile}${worker}${queued}\n`,
+      `   ${m.id.padEnd(10)} ${m.status.padEnd(8)} @${m.mention.padEnd(10)} ${m.profile}${worker}${queued}${pulse}\n`,
     );
   }
 }
@@ -120,7 +121,9 @@ function printTranscript(entries: TeamTranscriptEntry[]): void {
   }
   for (const t of entries) {
     process.stdout.write(
-      `\n   ${t.id}  ${t.memberId}  ${t.status}${t.taskId ? `  task=${t.taskId}` : ""}\n`,
+      `\n   ${t.id}  ${t.memberId}  ${t.status}${t.kind === "pulse" ? "  (pulse)" : ""}${
+        t.taskId ? `  task=${t.taskId}` : ""
+      }\n`,
     );
     process.stdout.write(
       `   ${hhmm(t.queuedAt)} → ${t.endedAt ? hhmm(t.endedAt) : "running"}  hops=${t.hops}  ${t.channel}\n`,
@@ -392,6 +395,21 @@ async function cmdTranscript(args: TeamCommandArgs): Promise<void> {
   printTranscript(r.turns);
 }
 
+async function cmdPulse(args: TeamCommandArgs): Promise<void> {
+  const member = args.rest[0];
+  if (!member) throw new Error("usage: team pulse <member>");
+  const r = await request<{ memberId: string; queued: boolean; turnId?: string }>(
+    args,
+    `/team/members/${encodeURIComponent(member)}/pulse`,
+    { method: "POST" },
+  );
+  process.stdout.write(
+    r.queued
+      ? `   woke ${r.memberId} (turn ${r.turnId}) — watch with: agentmesh team log --follow\n`
+      : `   ${r.memberId} stayed asleep: no pulse configured, or the room is busy\n`,
+  );
+}
+
 async function cmdRespond(args: TeamCommandArgs): Promise<void> {
   const [approvalId, action] = args.rest;
   const allowed = ["accept", "decline", "cancel"] as const;
@@ -453,6 +471,8 @@ export async function runTeamCommand(
     }
     case "transcript":
       return cmdTranscript(args);
+    case "pulse":
+      return cmdPulse(args);
     case "approve":
       return cmdApprove(args);
     case "respond":
@@ -467,6 +487,7 @@ export async function runTeamCommand(
           `  agentmesh team log [channel] [--limit N] [--follow]\n` +
           `  agentmesh team members | channels | status\n` +
           `  agentmesh team transcript <member> [--limit N]\n` +
+          `  agentmesh team pulse <member>           wake one member now\n` +
           `  agentmesh team approve <approvalId> <decision>\n` +
           `  agentmesh team respond <approvalId> <accept|decline|cancel> [--content json]\n\n` +
           `  client target: --url http://host:port or AGENTMESH_TEAM_URL\n` +

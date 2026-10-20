@@ -179,6 +179,21 @@ export async function startTeamServer(opts: TeamServerOptions): Promise<TeamServ
       return;
     }
 
+    // Wake one member by hand. Same guards as the timer, so a manual nudge
+    // cannot do what the schedule would refuse (talking over a busy room).
+    const pulse = /^\/team\/members\/([^/]+)\/pulse$/.exec(path);
+    if (pulse && method === "POST") {
+      const memberId = decodeURIComponent(pulse[1]!);
+      if (!team.member(memberId)) throw new HttpError(404, `no such team member: ${memberId}`);
+      const turn = team.pulseNow(memberId);
+      send(res, turn ? 202 : 200, {
+        memberId,
+        queued: Boolean(turn),
+        ...(turn ? { turnId: turn.id } : {}),
+      });
+      return;
+    }
+
     if (path === "/team/approvals" && method === "GET") {
       send(res, 200, { approvals: team.approvals() });
       return;

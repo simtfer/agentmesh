@@ -50,8 +50,8 @@
 | CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 干净通过；`npm test` **155/155**（tasks(32) + handoff(12) + artifact(7) +
-paths(3) + contract(10) + dag(18) + budget(11) + remote(26) + deploy(8) + orchestrator(11) + skill(4) + team(13)）；
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **160/160**（tasks(32) + handoff(12) + artifact(7) +
+paths(3) + contract(10) + dag(18) + budget(11) + remote(26) + deploy(8) + orchestrator(11) + skill(4) + team(18)）；
 （远程 daemon 支持**会话复用**：同一 `workerId` 连续 `task_submit` 复用 B 侧 agent 会话，
 `daemon.workerIdleMs` 兜底回收；**固定会话**：profile 配 `session` 或提交带 `sessionKey`，
 会话落盘、daemon 重启后同 key 恢复——已用真实 pi 验证：停 daemon 再用同 key 提交，
@@ -451,6 +451,18 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
       可按成员查看工具调用与阻塞状态（流式增量合并成可读的行），`team approve` / `team respond`
       直接解决卡住的轮次。
     12 项新用例见 `test/team.test.ts`（测试总数 142 → 155）。
+12. ~~**Stage 9 · 自主心跳（pulse）**~~ ✅ 已落地：让成员在没人说话时自己醒来。
+    - **pulse 是一轮没有触发消息的 turn**：`turns.messageId`/`rootId` 由 NOT NULL 放宽为可空
+      （SQLite 无法原地放宽约束，因此做了一次**表重建迁移**，老库打开即补，历史行默认 `kind='message'`）。
+    - **沉默是一等答案**：回 `SILENT` 什么都不发，连系统提示都不发——否则每次醒来都在群里刷
+      「无更新」。什么都没发现的醒来对房间不可见，但仍在成员的 transcript 里。
+    - **不插话**：`idleOnly`（默认）要求全队安静才醒，既不抢并发槽也不打断进行中的对话；
+      `idleOnly: false` 留给需要在别人干活时汇报的负责人。
+    - **不花别人的额度**：pulse 产生的消息自成一个 root，里面的 @ 拿全新深度/轮次额度；
+      pulse 这个 turn 本身不属于任何线程，`countTurnsForRoot` 不会把它算进别人的线程。
+    - `everyMs` 下限 1 秒（防止 50ms 醒来一次烧钱），每次醒来都是真实计费，预算天花板兜底；
+      可选 `team pulse <member>` 手动戳一下，走同一套守卫。
+    5 项新用例（定时器、SILENT、守卫、未配置、旧库迁移），测试总数 155 → 160。
 
-> Stage 0–3 已完成并通过 155 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算）。
-> 下一步：团队层的自主心跳与只读 Web 控制台、跨物理链路实跑（DNS/路由/防火墙）、跨机交接产物传输。
+> Stage 0–3 已完成并通过 160 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算、团队层与自主心跳）。
+> 下一步：只读 Web 控制台、混合 harness 的真实团队实跑、跨物理链路实跑（DNS/路由/防火墙）、跨机交接产物传输。
