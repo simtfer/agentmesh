@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 175 tests, offline, ~39s
+npm test            # 176 tests, offline, ~45s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -451,7 +451,7 @@ The same path driven over a *real interface* (not loopback) is `npm run
 deploy:tls`; it is a script rather than a test because it needs `openssl` and a
 non-internal IPv4 address, which a hermetic suite cannot assume.
 
-## `test/orchestrator.test.ts` — 11 cases
+## `test/orchestrator.test.ts` — 12 cases
 
 The synchronous façade: dispatch spawns a worker and completes the loop; a spawned
 worker is reusable for follow-ups via `workerId`; events surface as task output
@@ -463,6 +463,12 @@ to the live worker instead of starting a second; different keys stay separate; a
 profile-level `session` applies with no per-spawn key; a pinned session refuses
 `worktree`; attaching while the conversation is mid-turn is refused (`is busy`)
 rather than queued.
+
+Restart reconciliation: a store seeded with `queued`, `running`, `waiting` and
+`succeeded` records, then handed to a new orchestrator whose `reconcile()` runs —
+the three unsettled rows settle `failed` with code `interrupted` (the `queued`
+one saying explicitly that it never ran), the terminal row is untouched, and the
+reason lands in the event stream rather than only in the status column.
 
 ## `test/skill.test.ts` — 4 cases
 
@@ -622,9 +628,9 @@ Honest limits of the evidence above — these are not covered by the suite yet:
   fields therefore mean "unknown", never zero.
 - **Long-running soak.** Queueing and fairness are tested as unit scenarios, not
   as a multi-hour soak.
-- **Cross-host artifacts are loopback-only so far.** Diff handoffs do cross the
-  wire now (verified against a real daemon on 127.0.0.1), but not yet over a
-  physical link or through TLS/mTLS; a single artifact is capped at 4 MiB by the
+- **Cross-host artifacts stop at the frame.** Handoffs do cross a real link now
+  — a 614 KB diff was staged on an ECS over the public internet through mTLS
+  (see the run above) — but a single artifact is still capped at 4 MiB by the
   protocol frame, and `base: "predecessor"` stays single-host because a commit
   object is not a byte payload.
 - **Redaction is a safety net, not a scanner.** It catches well-known key shapes
@@ -632,9 +638,16 @@ Honest limits of the evidence above — these are not covered by the suite yet:
   through, so the artifact is still untrusted data.
 - **Handoff sidecars are not garbage-collected.** They accumulate under
   `<workdir>/handoffs/` (one per diff handoff); pruning is left to the operator.
-- **Retry and dependency state live in memory.** A restart preserves the records
-  (and their `attempt`/`blockedBy` columns) but does not rehydrate the scheduler:
-  queued, blocked and backoff-waiting tasks stay where they are, exactly like
-  queued tasks before this change. Each retried attempt also gets its own worker
-  (and worktree, when the profile isolates edits), which is only cleaned up when
-  the worker is killed or the orchestrator shuts down.
+- **Retry and dependency state still live in memory.** A resident process now
+  *settles* what the last one left: `team serve` and the remote daemon call
+  `reconcile()` at startup, marking every `queued`/`starting`/`running`/
+  `waiting` record `failed` with code `interrupted`. Nothing is replayed — a
+  task that was running may already have edited files. What that does *not* do:
+  re-admit anything to the scheduler (a task recorded as `queued` never ran, so
+  its message says resubmitting is safe, but it is still a manual step),
+  re-evaluate `blocked`/`backoff-waiting` tasks rather than settling them, or
+  run at all from a short command — `dispatch` deliberately does not sweep,
+  because it may share a workdir with a live resident process and marking that
+  process's work dead is worse than the gap. Each retried attempt also gets its
+  own worker (and worktree, when the profile isolates edits), which is only
+  cleaned up when the worker is killed or the orchestrator shuts down.

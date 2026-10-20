@@ -238,6 +238,12 @@ export class Team {
       opts.persist === false ? ":memory:" : path.join(this.stateDir, "team.sqlite"),
     );
 
+    // A team turn is a task, so the same rule applies one layer down: this
+    // process owns the workdir, and whatever the last `team serve` left running
+    // has to be settled before a new turn can be scheduled. Nothing is replayed
+    // — see `TaskManager.reconcile()`.
+    this.orch.reconcile();
+
     // Recover from an unclean stop before accepting new messages. A turn that
     // was in flight cannot be replayed safely — it may already have edited
     // files — so it is failed *visibly* in its channel; queued turns were never

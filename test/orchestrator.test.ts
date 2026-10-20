@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseConfig } from "../src/config.js";
 import { Orchestrator } from "../src/orchestrator.js";
+import { MemoryTaskStore } from "../src/store/memory.js";
 
 const config = parseConfig({
   profiles: [
@@ -137,4 +138,61 @@ test("attaching to a session that is mid-turn is refused, not queued", async () 
   );
   assert.equal((await running).status, "completed");
   await orch.shutdown();
+});
+
+test("a restart settles the tasks the previous process left mid-flight", async () => {
+  // The queue is memory and the records are not, so a hard stop leaves rows that
+  // still say `queued` or `running` with nothing anywhere able to move them. That
+  // is not a cosmetic problem: `task_list` shows a task that will never finish.
+  const store = new MemoryTaskStore();
+  const base = {
+    profile: "analyst",
+    prompt: "half-finished work",
+    workingDirectory: process.cwd(),
+    timeoutMs: 1000,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  store.createTask({ ...base, taskId: "t-queued", status: "queued" });
+  store.createTask({ ...base, taskId: "t-running", status: "running" });
+  store.createTask({ ...base, taskId: "t-waiting", status: "waiting" });
+  store.createTask({ ...base, taskId: "t-done", status: "succeeded" });
+
+  const orch = new Orchestrator(config, { store, persist: false });
+  // A resident owner calls this; a short command does not (it may share the
+  // workdir with a live one). The test plays the resident owner.
+  orch.reconcile();
+  try {
+    const queued = store.getTask("t-queued")!;
+    assert.equal(queued.status, "failed");
+    assert.equal(queued.error?.code, "interrupted");
+    assert.equal(queued.stopReason, "interrupted");
+    assert.match(queued.error!.message, /never ran/, "a queued task is safe to submit again");
+
+    const running = store.getTask("t-running")!;
+    assert.equal(running.status, "failed");
+    assert.match(
+      running.error!.message,
+      /while this task was running/,
+      "no replay: it may already have edited files",
+    );
+
+    assert.equal(
+      store.getTask("t-waiting")!.status,
+      "failed",
+      "its approval lived in the dead process's memory",
+    );
+    assert.equal(
+      store.getTask("t-done")!.status,
+      "succeeded",
+      "terminal records are history, not debris",
+    );
+
+    // The reason has to reach whoever reads the task, not just the status column.
+    const last = store.listEvents("t-running").at(-1)!;
+    assert.equal(last.type, "failed");
+    assert.deepEqual(last.data, { code: "interrupted", from: "running" });
+  } finally {
+    await orch.shutdown();
+  }
 });

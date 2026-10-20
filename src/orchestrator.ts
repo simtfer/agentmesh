@@ -328,6 +328,15 @@ export class Orchestrator {
     return this.tasks.listTasks(filter);
   }
 
+  /**
+   * Settle the tasks a previous process left running. Only a resident owner of
+   * this workdir may call it — see `TaskManager.reconcile()` for why a short
+   * command must not.
+   */
+  reconcile(): void {
+    this.tasks.reconcile();
+  }
+
   /** Scheduler introspection: running/queued counts, caps, and the FIFO order. */
   schedulerStatus() {
     return this.tasks.schedulerStats();

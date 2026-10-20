@@ -928,6 +928,12 @@ export class WorkerDaemon {
   /* ------------------------------ lifecycle ----------------------------- */
 
   async start(): Promise<{ host: string; port: number; url: string }> {
+    // This process is the sole owner of the workdir it was pointed at, which is
+    // the condition for reconciling: whatever the last daemon left queued or
+    // running will never move on its own, and a master asking for it would keep
+    // reading `running` forever.
+    this.opts.orchestrator.reconcile();
+
     // A failed bind (port taken, address not local) arrives as an 'error' event,
     // not as a thrown exception — without this the process dies on an unhandled
     // event with a stack trace, which is the worst possible message for the most

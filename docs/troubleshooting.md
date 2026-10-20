@@ -24,6 +24,7 @@ Every failure lands on the task record (`error.code`) *and* the event log, so
 | `task_timeout` | the run exceeded `timeoutMs` (no deadline involved) | raise `timeoutMs` for long turns |
 | `budget_exceeded` | the task passed its own `budget` (tokens and/or cost) | raise the ceiling or split the work; it is never retried |
 | `budget_exhausted` | the process has spent `limits.maxTotalTokens` / `maxTotalCost`; new submits are refused | raise the ceiling or start a fresh process; accepted work still finishes |
+| `interrupted` | a resident process (`team serve`, the remote daemon) started and found this task left `queued`/`starting`/`running`/`waiting` by the previous one | nothing was replayed and nothing will finish it — resubmit. A task recorded as `queued` never ran, so resubmitting is safe; one that was `running` may already have edited files, so check the tree first |
 | `delegation_depth_exceeded` | the chain reached `maxDelegationDepth` | usually a master delegating in a loop — inspect the chain before raising the cap |
 | `handoff_unknown_task` | `handoff.fromTaskId` matches no stored task | check the id; a task under another `workdir` is invisible |
 | `handoff_predecessor_not_ready` | the predecessor is not `succeeded` yet | `task_wait` on it first; failed/cancelled output is never handed off |

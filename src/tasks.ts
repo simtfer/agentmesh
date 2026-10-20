@@ -394,6 +394,48 @@ export class TaskManager {
     this.profileIsRemote = opts.profileIsRemote ?? (() => false);
   }
 
+  /**
+   * Settle what an earlier process left behind.
+   *
+   * The queue is an in-memory array and the records are not, so a process that
+   * stops leaves rows that still claim to be `queued`, `starting`, `running` or
+   * `waiting` with nothing left anywhere that could move them. Left alone they
+   * are worse than a missing feature: `task_list` keeps showing a task that will
+   * never finish and `status` counts work that nobody is doing.
+   *
+   * Nothing is replayed. A task that was `running` may already have edited
+   * files — replaying it is a decision, not a repair, which is exactly why the
+   * retry path exists. A `waiting` task cannot even be replayed: its approval
+   * lived in the previous process's memory and is gone.
+   *
+   * Deliberately **not** called from the constructor. A short command
+   * (`dispatch`, `task_list`) is its own process over a database another process
+   * may be using right now, and sweeping there marks a *live* task dead — and
+   * then fails outright on the event sequence, because two stores writing the
+   * same task's events do not agree on the next number. Only a resident owner
+   * calls this: `team serve` and the remote daemon, where "I am the one writer
+   * of this workdir" is the premise of the process rather than a guess about it.
+   */
+  reconcile(): void {
+    for (const status of ["queued", "starting", "running", "waiting"] as const) {
+      for (const rec of this.store.listTasks({ status })) {
+        // A queued task never touched anything, so saying so is useful: the user
+        // can submit it again with no risk of a double effect.
+        const message =
+          status === "queued"
+            ? "interrupted: the process stopped before this task started, so it never ran and is safe to submit again"
+            : `interrupted: the process stopped while this task was ${status}`;
+        this.store.updateTask(rec.taskId, {
+          status: "failed",
+          stopReason: "interrupted",
+          error: { code: "interrupted", message, retryable: false },
+          finishedAt: Date.now(),
+        });
+        this.append(rec.taskId, "failed", message, { code: "interrupted", from: status });
+      }
+    }
+  }
+
   /* ------------------------------ submit ------------------------------ */
 
   submit(

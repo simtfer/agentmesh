@@ -560,8 +560,25 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
     - **已经好的那条不用动**：认领后进程崩溃残留的 `taken`，`interruptLiveTurns()` 在启动时
       已经改回 `dropped` 回板并在频道里留系统消息（`team.ts:245`），不是这次要修的东西。
     - 2 项新用例（过期且被拒要报、没人问过的不报），测试总数 173 → 175。
+20. ~~**Stage 17 · 重启对账**~~ ✅ 已落地：队列在内存里，记录不在。
+    - **问题**：`TaskManager` 的队列是内存数组，任务记录在 SQLite。进程被 kill 之后，记录里还写着
+      `queued`/`running`/`waiting`，而没有任何东西能推动它们——`task_list` 永远显示一条跑不完的任务，
+      `status` 把没人做的活算成在做。团队层早就有 `interruptLiveTurns`，任务层没有，**这本身就是
+      不一致**。
+    - **做法**：`reconcile()` 把四种非终态记录结算成 `failed` + `error.code = "interrupted"`，并写一条
+      事件把原因留给读任务的人。**不重放**：`running` 的任务可能已经改过文件；`waiting` 的更不可能
+      ——它的审批存在上一个进程的内存里，早就没了。
+    - **没有放进构造函数**（第一版就是这么写的，被测试抓住了）：短命令（`dispatch`、`task_list`）
+      是独立进程，可能和正在跑的驻留进程共用同一个 workdir。在那里 sweep 会把**活着的任务**标死，
+      随后还会因为两个 store 各自算 `MAX(sequence)+1` 而撞 `UNIQUE`。改成只有「这个 workdir 的
+      唯一属主」才调用：`team serve` 与远程 daemon 启动时各调一次。
+    - **没做的**：不把 `queued` 重新入队（`pump()` 依赖内存里的 `live` 记录，重建它属于另一件事），
+      `blocked`/`backoff-waiting` 也一并结算而不是重新评估依赖。
+    - 1 项新用例（四条记录覆盖四种状态 → 三条结算、终态不动、事件带原因），测试总数 175 → 176。
+    - 顺带修掉 `verification.md` 里一条**过时**的 gap：跨机附件早已跑过公网 + mTLS（Stage 15），
+      原文还写着「loopback-only」。
 
-> Stage 0–3 已完成并通过 175 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算、团队层与自主心跳、混合 harness 实跑、会话轮换、白板认领、跨 OS 链路、跨公网链路、白板过期结算）。
+> Stage 0–3 已完成并通过 176 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算、团队层与自主心跳、混合 harness 实跑、会话轮换、白板认领、跨 OS 链路、跨公网链路、白板过期结算、重启对账）。
 > 下一步：按**域名**而不是 IP 访问（证书 SAN 得对上 DNS）、真正会丢包的链路、未做 NTP 对时的时钟。
 > 域名这一条不必等自有域名：`IP.nip.io` / `IP.sslip.io` 这类通配 DNS 已验证可解析到目标 IP，
 > DNS 解析路径、SNI、`DNS:` 类型 SAN 都能真实测到；测不到的只有「改 A 记录切后端」那一层。
