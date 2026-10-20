@@ -445,6 +445,7 @@ async function cmdRespond(args: TeamCommandArgs): Promise<void> {
  */
 function boardAge(createdAt: number): string {
   const min = Math.round((Date.now() - createdAt) / 60_000);
+  if (min < 1) return "just now";
   // Anything on the expired list is at least one TTL old, so hours are the
   // useful unit there; a live item is usually minutes.
   return min >= 60 ? `${Math.round(min / 60)}h ago` : `${min}m ago`;

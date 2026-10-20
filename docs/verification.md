@@ -528,6 +528,14 @@ as browsable resources.
   turn and **zero** messages, with the item still open on the board and the
   engineer recorded as having passed. Both halves are in `team.md`: the escape
   hatch exists, and a model will not use it unless it is told why.
+- **An item expiring, watched from outside** (hand run, 2026-10-21, not in
+  `npm test`: it is a timing sample). A live `team serve` with `claimTtlMs: 2000`
+  and two mock members that both answer `SILENT`. One message, sampled twice over
+  the real HTTP API: at 0.5 s the board held it as one `open` item with
+  `passed: dev, qa`; at 2.9 s the board held nothing and `expired` held it, while
+  `status` read `expired: 2, unclaimed: 0`. That pair is the reason the change
+  exists — `unclaimed: 0` on its own is what a quiet room and a room that turned
+  your work down used to look like alike.
 - **A worker on another machine, over the public internet** (ad-hoc run,
   2026-10-21, not in `npm test`: it needs a second host). A Windows master drove a
   daemon on an Alibaba Cloud ECS — Alibaba Cloud Linux 3, kernel
