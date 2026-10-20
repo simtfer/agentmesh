@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 171 tests, offline, ~27s
+npm test            # 172 tests, offline, ~27s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -288,7 +288,7 @@ Two guards on what a fan-out costs *while it runs*: approval width and spend.
   the budget open: `budget.spentCost` shows `[{ USD, 10 }]` and the next submit is
   admitted.
 
-## `test/remote.test.ts` — 26 cases
+## `test/remote.test.ts` — 27 cases
 
 Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
 
@@ -298,6 +298,11 @@ Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
   reachable without a token while `/profiles` is not; multiple valid tokens are
   accepted during a rotation; `reloadTokens()` rotates credentials with no restart
   and refuses an empty set.
+- **Paths belong to their own host.** A remote profile's `cwd` is not
+  resolved on the master — a relative value stays relative (so it means the
+  daemon's base directory), while the same value on a local profile is resolved
+  here. That is the whole difference, and it is the bug that only showed up when
+  the two hosts ran different operating systems.
 - **Confinement.** The daemon refuses a working directory outside `allowCwd`;
   `assertSafeBind` refuses a non-loopback bind without TLS; `assertCwdAllowed`
   confines by path segment (not by string prefix).
@@ -513,6 +518,23 @@ as browsable resources.
   turn and **zero** messages, with the item still open on the board and the
   engineer recorded as having passed. Both halves are in `team.md`: the escape
   hatch exists, and a model will not use it unless it is told why.
+- **A worker on another operating system** (ad-hoc run, 2026-10-21, not in
+  `npm test`: it needs a second host and spends tokens). A Windows master drove a
+  WSL2 daemon: agentmesh was installed from the packed tarball into WSL's ext4,
+  the daemon generated its own CA and a server certificate with an IP SAN, and
+  served `https://192.168.110.27:4600` from a *different kernel* — its own TCP/IP
+  stack, filesystem and trust store. The master pinned that CA: without it the
+  handshake dies (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`), `/profiles` is `401` for a
+  missing or wrong token and `200` for the right one. A real **opencode** turn
+  then ran inside WSL: it created `from-wsl.txt` on ext4 (`/dev/sdd`, nowhere on
+  the Windows drive) and answered `uname -sr` with
+  `Linux 6.18.33.2-microsoft-standard-WSL2`. A cwd outside `allowCwd` was refused
+  (`cwd_not_whitelisted`) and recorded in the daemon's audit log with the requested
+  path and peer. The run found a real defect: the master had applied its own
+  `path.resolve` to a remote profile's `cwd`, so `/home/…` became `D:\home\…`, the
+  daemon saw a *relative* path, glued it onto its base directory and failed with
+  "working directory not found". A remote cwd now crosses the wire untouched, and
+  a profile that names none sends nothing at all (both in `test/remote.test.ts`).
 
 ## Known gaps
 
@@ -521,10 +543,15 @@ Honest limits of the evidence above — these are not covered by the suite yet:
 - **macOS.** CI covers Linux and Windows only; nothing here has been run on
   Darwin, where `node:sqlite`, the `ws` TLS stack and git are all the same but
   path handling and the default shell are not.
-- **Two physical machines.** The TLS path is verified on one host over its real
-  interface, with a real certificate chain and mTLS; what remains unexercised is
-  distance — DNS, routing, and the worker's firewall (`docs/deploy.md` covers the
-  checklist, but no run has crossed a physical link).
+- **Another kernel is not another machine.** The WSL run above crosses an OS
+  boundary — two TCP/IP stacks, two filesystems with different case and locking
+  rules, a certificate chain built on the far side — but not a network one. WSL's
+  mirrored networking hands the distro the host's own address, so there is no DNS
+  to resolve, no route to choose, no intermediate firewall to open and no
+  distance. A run between two machines (separate clocks and disks, real latency
+  and retransmits, a firewall rule that has to be changed) is still unexercised
+  end-to-end; `docs/deploy.md` has the checklist, and every key in it has been
+  exercised on one host over its real interface with a real CA and mTLS.
 - **Concurrent processes sharing one SQLite file.** Two processes *can* open the
   same DB safely (`busy_timeout` + WAL), but the suite tests this incidentally
   rather than as a documented multi-writer contract.

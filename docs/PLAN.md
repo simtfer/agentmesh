@@ -511,7 +511,22 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
       「用户写给自己的备注不是任何人的任务」之后，同一句变成一轮、零条消息、活留在白板上。
     5 项新用例（认领并完成、拒绝后回到白板、两个成员抢同一条只成一个、过期掉出白板、点名仍然直连），
     测试总数 166 → 171。
+17. ~~**Stage 14 · 跨 OS 链路**~~ ✅ 已落地：把 master 和 worker 分到两个内核上跑。
+    - **为什么不是「跨物理链路」**：WSL2 是同一台机器上的第二个内核，镜像网络让它拿到宿主机的
+      同一个地址，所以 DNS、路由、中间防火墙、时延与重传一样都没有被跨过。跨过的是**内核边界**：
+      两套 TCP/IP 栈、两套文件系统（ext4 与 NTFS，大小写与锁语义都不同）、两套信任库。
+      把这两件事混成一句「跨物理链路未验证」是文档在说谎，已拆成两条写进 `verification.md`。
+    - **跑法**：Windows 侧 master，WSL 侧 daemon。tarball 装进 ext4（不碰 `/mnt/d`，drvfs 的
+      `fsync` 与锁语义会让 SQLite 出怪问题），daemon 在**对方内核**里自己生成 CA 与带 IP SAN 的
+      服务器证书，master 只 pin 这个 CA。真 **opencode** 在 WSL 里干活：`from-wsl.txt` 落在
+      `/dev/sdd`，`uname -sr` 答出 `Linux 6.18.33.2-microsoft-standard-WSL2`。
+    - **跑出来的真 bug**：master 用**自己的** `path.resolve` 处理 remote profile 的 `cwd`，
+      `/home/…` 变成 `D:\home\…`；daemon 在 Linux 上把 `D:\home\…` 当成**相对路径**，拼到 base 下，
+      报「working directory not found」。同机 loopback 永远发现不了——两个 OS 才会。
+      修复后 remote 的 `cwd` 原样过线，不写就一个字节都不发（由 daemon 用自己默认的），
+      dispatch 结果里的 `cwd: ""` 就是「master 不知道」的诚实表示。
+    - 1 项新用例（remote 的 cwd 不解析、同值在本地 profile 上会被解析），测试总数 171 → 172。
 
-> Stage 0–3 已完成并通过 171 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算、团队层与自主心跳、混合 harness 实跑、会话轮换、白板认领）。
-> 下一步：跨物理链路实跑（DNS/路由/防火墙）、跨机交接产物传输、认领的下一步（一条被拒的活要不要
-> 升级成「派给最合适的人」而不是一直躺在白板上）。
+> Stage 0–3 已完成并通过 172 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算、团队层与自主心跳、混合 harness 实跑、会话轮换、白板认领、跨 OS 链路）。
+> 下一步：两台真机（各自时钟与磁盘、真实时延、要动的防火墙规则）、跨机交接产物传输、认领的下一步
+> （一条被拒的活要不要升级成「派给最合适的人」而不是一直躺在白板上）。

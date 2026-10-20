@@ -426,14 +426,17 @@ chains (one reused worker in a shared `cwd`) and `worker-pi-fanout` with
 This is the single most common two-host failure, and it is not a bug.
 
 `cwd` on a remote profile is a path **on B**, even though it is written in A's
-config file. The daemon resolves it and checks it against `daemon.allowCwd`
-before the worker starts:
+config file. A sends the string exactly as written — it never resolves it, because
+resolving would apply A's path rules to a path A cannot see (a Windows master turns
+`/srv/repos` into `D:\srv\repos`). The daemon resolves it and checks it against
+`daemon.allowCwd` before the worker starts:
 
 | what A sends | what B does |
 |---|---|
 | `cwd: /srv/repos` and B's `allowCwd: [/srv/repos]` | runs there |
 | `cwd: /srv/repos` and B's `allowCwd: [/srv/work]` | refuses: `working directory not in whitelist: /srv/repos (cwd_not_whitelisted)` |
-| nothing set — A's own working directory is used | usually refused, because A's `/home/me/proj` does not exist on B |
+| `repos/acme` (relative) | relative to **B's** base directory, not A's |
+| nothing set — nothing is sent | B uses its own default directory, which still has to be inside `allowCwd` |
 | `../repos` or `/srv/repos/../..` | resolved first, then checked: cannot escape a root |
 
 So: always set `cwd` explicitly on a remote profile, to a path inside B's

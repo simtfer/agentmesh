@@ -258,7 +258,9 @@ class RemoteWorkerHandle implements WorkerHandle {
               submitId,
               profile: remoteProfile,
               prompt: text,
-              cwd: this.cwd,
+              // An empty cwd is "the daemon's own default": send nothing rather
+              // than an empty string, which the far side would resolve as ".".
+              ...(this.cwd ? { cwd: this.cwd } : {}),
               ...(this.workerRef ? { workerRef: this.workerRef } : {}),
               ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}),
               ...(attachments && attachments.length > 0

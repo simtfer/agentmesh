@@ -216,7 +216,15 @@ export class Orchestrator {
     const id = this.registry.nextId(profile.name);
 
     const useWorktree = opts.worktree ?? profile.worktree ?? false;
-    let cwd = path.resolve(opts.cwd ?? profile.cwd ?? this.baseCwd);
+    // A remote profile's cwd names a path on the *daemon's* host, so it must cross
+    // the wire exactly as written. Resolving it here would apply this machine's
+    // rules to a path it cannot see: a Windows master turns `/srv/repos` into
+    // `D:\srv\repos` and the daemon then fails with "working directory not found".
+    // Empty means "the daemon knows its own default" and is omitted on the wire.
+    const remote = profile.driver === "remote";
+    let cwd = remote
+      ? (opts.cwd ?? profile.cwd ?? "")
+      : path.resolve(opts.cwd ?? profile.cwd ?? this.baseCwd);
     let worktree: WorkerRecord["worktree"];
 
     // A pinned session is a promise about *where* the conversation lives: acpx
@@ -284,7 +292,9 @@ export class Orchestrator {
     this.registry.pushEvent(id, {
       t: Date.now(),
       type: "spawn",
-      text: `${profile.name} @ ${cwd}${sessionKey ? ` (session ${sessionKey})` : ""}`,
+      text: `${profile.name} @ ${cwd || "the daemon's default cwd"}${
+        sessionKey ? ` (session ${sessionKey})` : ""
+      }`,
     });
     return id;
   }

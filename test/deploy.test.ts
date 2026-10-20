@@ -95,6 +95,10 @@ function masterOrch(
       {
         name: "r-worker",
         driver: "remote",
+        // A remote profile names a path on the *daemon's* host and the master
+        // sends it verbatim; without one the daemon falls back to its own
+        // default, which is not in `allowCwd` here.
+        cwd: baseCwd,
         remote: { endpoint: url, tokenEnv: TOKEN_ENV, remoteProfile: "worker", ...remote },
       },
     ],

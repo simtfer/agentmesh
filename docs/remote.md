@@ -73,6 +73,20 @@ Then the master drives it exactly like a local worker — `task_submit { profile
 "big-gpu-impl" }`, `task_wait`, `task_approve` when a remote permission request
 arrives. Remote events are streamed back and persisted locally.
 
+Three things about `cwd` are worth knowing before you wire two hosts together:
+
+- It names a directory **on the daemon's host**, so it crosses the wire exactly as
+  written — the master never resolves it. It used to, and on a Windows master that
+  turned `/srv/repos` into `D:\srv\repos`; the daemon then read that as a *relative*
+  path, glued it onto its base directory and failed with "working directory not
+  found". A relative value is therefore relative to the daemon's base directory,
+  not to yours.
+- Leave it out and nothing is sent: the daemon uses its own default. That default
+  still has to pass `daemon.allowCwd`, so a whitelist plus a cwd-less profile is a
+  directory that is not whitelisted — name the path instead.
+- `cwd: ""` in a dispatch result means exactly that: the profile named none, and the
+  master has nothing truthful to report about the far side.
+
 ## Handoff artifacts
 
 `inject: "diff"` handoffs work across hosts: the patch travels with the submit

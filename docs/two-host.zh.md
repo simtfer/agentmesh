@@ -372,14 +372,17 @@ A 上建议备两个 profile，而不是硬凑一个：`worker-pi` 走链条（�
 
 这是双机部署里最常见的失败，而且它不是 bug。
 
-远程 profile 上的 `cwd` 是**B 机上的路径**，哪怕它写在 A 的配置文件里。daemon 会解析它、拿
-`daemon.allowCwd` 校验，然后才启动 worker：
+远程 profile 上的 `cwd` 是**B 机上的路径**，哪怕它写在 A 的配置文件里。A 原样把它发出去，
+**不会解析**——解析等于拿 A 的路径规则去处理一个 A 看不见的路径（Windows 上的 master 会把
+`/srv/repos` 变成 `D:\srv\repos`）。daemon 会解析它、拿 `daemon.allowCwd` 校验，然后才启动
+worker：
 
 | A 发的值 | B 的处理 |
 |---|---|
 | `cwd: /srv/repos`，而 B 的 `allowCwd: [/srv/repos]` | 在那里跑 |
 | `cwd: /srv/repos`，而 B 的 `allowCwd: [/srv/work]` | 拒绝：`working directory not in whitelist: /srv/repos (cwd_not_whitelisted)` |
-| 不写——用 A 自己的工作目录 | 一般会被拒，因为 A 的 `/home/me/proj` 在 B 上不存在 |
+| `repos/acme`（相对路径） | 相对的是 **B 的**基准目录，不是 A 的 |
+| 不写——一个字节都不发 | B 用自己默认的目录，它同样要落在 `allowCwd` 里 |
 | `../repos` 或 `/srv/repos/../..` | 先解析再校验：逃不出根目录 |
 
 结论：远程 profile 一定要显式写 `cwd`，写成 B 白名单内的路径。同一个任务可能落在两台机器上时，

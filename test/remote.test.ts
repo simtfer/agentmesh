@@ -103,9 +103,12 @@ function submitRaw(ws: WS, profile: string, prompt: string, cwd: string, timeout
 function clientOrch(url: string, baseCwd: string, tokenEnv = TOKEN_ENV) {
   const cfg = parseConfig({
     profiles: [
-      { name: "r-fast", driver: "remote", remote: { endpoint: url, tokenEnv, remoteProfile: "fast" } },
-      { name: "r-approver", driver: "remote", remote: { endpoint: url, tokenEnv, remoteProfile: "approver" } },
-      { name: "r-slow", driver: "remote", remote: { endpoint: url, tokenEnv, remoteProfile: "slow" } },
+      // Every remote profile names its cwd, exactly as a real cross-host config
+      // must: the master does not invent a path on the far side, so a profile
+      // without one is the daemon's default (which must then be whitelisted).
+      { name: "r-fast", driver: "remote", cwd: baseCwd, remote: { endpoint: url, tokenEnv, remoteProfile: "fast" } },
+      { name: "r-approver", driver: "remote", cwd: baseCwd, remote: { endpoint: url, tokenEnv, remoteProfile: "approver" } },
+      { name: "r-slow", driver: "remote", cwd: baseCwd, remote: { endpoint: url, tokenEnv, remoteProfile: "slow" } },
     ],
   });
   return new Orchestrator(cfg, { baseCwd, persist: false });
@@ -911,4 +914,45 @@ test("assertCwdAllowed confines to whitelisted roots by segment", () => {
   assert.throws(() => assertCwdAllowed("/data/projects/../secrets", [root]), SecurityError);
   // empty whitelist rejects everything
   assert.throws(() => assertCwdAllowed("/data/projects/app", []), SecurityError);
+});
+
+test("a remote profile's cwd belongs to the daemon, not to this machine", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-remote-cwd-"));
+  try {
+    const cfg = parseConfig({
+      workdir: path.join(dir, ".agentmesh"),
+      profiles: [
+        {
+          name: "far",
+          driver: "remote",
+          cwd: "repos/acme",
+          remote: { endpoint: "https://daemon.invalid:8790", tokenEnv: TOKEN_ENV },
+        },
+        // Same relative string, local driver: here it *is* relative to this
+        // process, and resolving it is the whole point.
+        { name: "near", driver: "mock", cwd: "repos/acme" },
+      ],
+    });
+    const orch = new Orchestrator(cfg, { baseCwd: dir });
+    try {
+      const far = await orch.spawnWorker("far");
+      assert.equal(
+        orch.getWorkerRecord(far)!.cwd,
+        "repos/acme",
+        "the string crosses the wire untouched: the master cannot resolve a path it cannot see",
+      );
+      const near = await orch.spawnWorker("near");
+      assert.equal(
+        orch.getWorkerRecord(near)!.cwd,
+        path.resolve("repos/acme"),
+        "a local profile is resolved against this process — that is the difference",
+      );
+      await orch.killWorker(far);
+      await orch.killWorker(near);
+    } finally {
+      await orch.shutdown();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
