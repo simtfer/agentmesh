@@ -37,6 +37,8 @@ interface TeamHarnessOptions {
   stream?: number;
   /** per-member pulse settings, keyed by member id */
   pulse?: Record<string, { everyMs: number; idleOnly?: boolean }>;
+  /** per-member session rotation limit, keyed by member id */
+  sessionTurns?: Record<string, number>;
   replies?: { ceo?: string[]; dev?: string[]; qa?: string[] };
 }
 
@@ -83,6 +85,7 @@ function makeTeam(dir: string, opts: TeamHarnessOptions = {}) {
           role: "engineer, writes the code",
           profile: "dev-h",
           ...(opts.pulse?.dev ? { pulse: opts.pulse.dev } : {}),
+          ...(opts.sessionTurns?.dev ? { sessionTurns: opts.sessionTurns.dev } : {}),
         },
         {
           id: "qa",
@@ -443,6 +446,91 @@ test("a member's memory file is injected into the next turn", async () => {
     assert.match(prompt, /Team|team/);
   } finally {
     await cleanup(h, dir);
+  }
+});
+
+test("a long conversation is rotated, and the retired worker goes with it", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const h = makeTeam(dir, {
+    sessionTurns: { dev: 2 },
+    replies: { dev: ["one", "two", "three"] },
+  });
+  try {
+    for (const text of ["first", "second", "third"]) {
+      h.team.post({ channel: "general", text: `@dev ${text}` });
+      await h.team.idle(10_000);
+    }
+
+    const turns = h.team.transcript("dev", 10);
+    assert.equal(turns.length, 3);
+    assert.deepEqual(
+      turns.map((t) => t.sessionKey),
+      ["team:acme:dev", "team:acme:dev", "team:acme:dev#1"],
+      "the third turn is on a fresh conversation, and the record says so per turn",
+    );
+
+    // The roster reports where the member is *now*, not where it started.
+    const dev = h.team.status().members.find((m) => m.id === "dev")!;
+    assert.equal(dev.sessionKey, "team:acme:dev#1");
+    assert.equal(dev.sessionGeneration, 1);
+    assert.ok(
+      dev.workerId,
+      "rotation moves the conversation, not the desk: the member still has a live process",
+    );
+
+    // Rotating the key without closing the old process would leak one agent per
+    // generation — exactly the cost rotation exists to avoid.
+    const workers = h.orch.listWorkers().filter((w) => w.profile === "dev-h");
+    assert.equal(workers.length, 1);
+    assert.equal(workers[0]!.sessionKey, "team:acme:dev#1");
+
+    // Said once, in the room: a member that "forgets" should look like a fresh
+    // session, not like a defect.
+    const notices = h.team.messages("general").filter((m) => m.kind === "system");
+    assert.equal(notices.length, 1);
+    assert.match(notices[0]!.text, /fresh session/);
+  } finally {
+    await cleanup(h, dir);
+  }
+});
+
+test("the rotation clock lives in the database, so a restart does not rewind it", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const first = makeTeam(dir, {
+    sessionTurns: { dev: 2 },
+    persist: true,
+    replies: { dev: ["one", "two", "three"] },
+  });
+  try {
+    for (const text of ["first", "second", "third"]) {
+      first.team.post({ channel: "general", text: `@dev ${text}` });
+      await first.team.idle(10_000);
+    }
+    assert.equal(
+      first.team.transcript("dev", 1)[0]!.sessionKey,
+      "team:acme:dev#1",
+      "three settled turns at a limit of two put the member on generation one",
+    );
+  } finally {
+    await first.team.shutdown();
+    await first.orch.shutdown();
+  }
+
+  const second = makeTeam(dir, {
+    sessionTurns: { dev: 2 },
+    persist: true,
+    replies: { dev: ["after the restart"] },
+  });
+  try {
+    second.team.post({ channel: "general", text: "@dev again" });
+    await second.team.idle(10_000);
+    assert.equal(
+      second.team.transcript("dev", 1)[0]!.sessionKey,
+      "team:acme:dev#1",
+      "a restart must resume the current generation, not silently restart from zero",
+    );
+  } finally {
+    await cleanup(second, dir);
   }
 });
 

@@ -193,6 +193,21 @@ export class Orchestrator {
     return this.registry.bySessionKey(sessionKey);
   }
 
+  /**
+   * Close the worker that holds a conversation, freeing its agent process.
+   * Refused (returns false) while that worker is mid-task: closing it would kill
+   * work in flight, and the caller — a team rotating an old session — can simply
+   * retry next turn. The stored session survives, so re-spawning the same key
+   * later resumes the conversation.
+   */
+  async closeSession(sessionKey: string): Promise<boolean> {
+    const rec = this.registry.bySessionKey(sessionKey);
+    if (!rec) return false;
+    if (this.tasks.isWorkerBusy(rec.id)) return false;
+    await this.registry.remove(rec.id, `session ${sessionKey} retired`);
+    return true;
+  }
+
   async spawnWorker(
     profileName: string,
     opts: { cwd?: string; worktree?: boolean; baseCommit?: string; sessionKey?: string } = {},

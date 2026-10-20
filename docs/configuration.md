@@ -159,6 +159,7 @@ team:
   contextMessages: 20          # transcript lines each turn sees
   maxContextChars: 6000        # character budget on that transcript
   turnTimeoutMs: 900000        # per-member turn budget (15 min)
+  sessionTurns: 40             # default: rotate every member's session after 40 turns
   members:
     - id: ceo                  # stable key, directory name and default handle
       name: Mira
@@ -168,6 +169,7 @@ team:
       cwd: repos/acme          # optional; relative to team.cwd
       notes: Keep updates short.
       pulse: { everyMs: 600000, idleOnly: true }   # optional: speak unprompted
+      sessionTurns: 20         # optional per-member override of the team value
   channels:
     - id: general              # `#general`; the default when none are declared
       description: the whole team
@@ -189,6 +191,7 @@ team:
 | `members[]` | — | at least one; each `profile` must resolve |
 | `channels[]` | `[general]` | rooms; `members` narrows who is addressable |
 | `members[].pulse` | off | `{ everyMs, idleOnly, channel }` — wake this member on its own schedule; `SILENT` posts nothing, `idleOnly` (default `true`) only fires when the team is quiet, and `channel` defaults to `general`. Each pulse is a paid turn |
+| `sessionTurns` / `members[].sessionTurns` | off | rotate the harness conversation after N turns; the member keeps its identity, workspace and `MEMORY.md`, and later generations use `sessionKey#N`. Overridable per member |
 
 Member ids and `mention` handles share one namespace (a member's id is also
 addressable), so `@dev` can never be ambiguous. A member's pinned session is

@@ -148,6 +148,7 @@ export class Team {
         handles.set(handle, m.id);
       }
       const defaultCwd = path.resolve(baseCwd, cfg.cwd ?? ".");
+      const sessionTurns = m.sessionTurns ?? cfg.sessionTurns;
       return {
         id: m.id,
         name: (m.name ?? m.id).trim() || m.id,
@@ -158,6 +159,7 @@ export class Team {
         sessionKey: `team:${this.name}:${m.id}`,
         memoryFile: path.join(this.stateDir, "members", m.id, "MEMORY.md"),
         ...(m.notes ? { notes: m.notes } : {}),
+        ...(sessionTurns ? { sessionTurns: Math.max(1, Math.trunc(sessionTurns)) } : {}),
         ...(m.pulse
           ? {
               pulse: {
@@ -279,20 +281,30 @@ export class Team {
   status(): TeamStatus {
     const counts = this.store.openTurnCounts();
     const lastSpoke = this.store.memberLastSpoke();
+    // One read for the whole roster: a member's worker may still be on the
+    // generation it just used while `sessionFor` already reports the next one,
+    // so the lookup cannot be "the current key" — it has to be "any key this
+    // member owns". "Is someone at that desk" is the question, not "which
+    // conversation is it sitting on".
+    const live = this.orch.listWorkers();
     const members: TeamMemberState[] = this.members.map((m) => {
       const currentId = this.running.get(m.id);
       const current = currentId ? this.store.getTurn(currentId) : undefined;
       const queued = this.store.countQueued(m.id);
       const task = current?.taskId ? this.orch.taskStatus(current.taskId) : undefined;
-      // Between turns the task record is gone but the pinned worker usually is
-      // not: report the live process, so "who is at their desk" is answerable.
-      const workerId = task?.workerId ?? this.orch.getWorkerBySessionKey(m.sessionKey)?.id;
+      const session = this.sessionFor(m);
+      const workerId =
+        task?.workerId ??
+        live.find((w) => w.sessionKey !== undefined && this.ownsSessionKey(m, w.sessionKey))?.id;
       const status: TeamMemberState["status"] =
         current?.status === "waiting" ? "waiting" : current ? "running" : queued > 0 ? "queued" : "idle";
       return {
         ...m,
         status,
         queued,
+        ...(session.generation > 0
+          ? { sessionKey: session.key, sessionGeneration: session.generation }
+          : {}),
         ...(current ? { currentTurnId: current.id } : {}),
         ...(current?.taskId ? { taskId: current.taskId } : {}),
         ...(workerId ? { workerId } : {}),
@@ -642,6 +654,48 @@ export class Team {
     }
   }
 
+  /**
+   * Which conversation this member is on right now.
+   *
+   * The generation is *derived*, not stored: `settled turns / limit`, with both
+   * sides in SQLite. That is what lets rotation survive a restart without a
+   * schema change — and what stops a restart from quietly rewinding every member
+   * to a conversation it had already outgrown.
+   */
+  private sessionFor(member: TeamMember): { key: string; generation: number; atBoundary: boolean } {
+    const limit = member.sessionTurns;
+    if (!limit) return { key: member.sessionKey, generation: 0, atBoundary: false };
+    const settled = this.store.countSettledTurns(member.id);
+    const generation = Math.floor(settled / limit);
+    return {
+      key: generation === 0 ? member.sessionKey : `${member.sessionKey}#${generation}`,
+      generation,
+      atBoundary: settled > 0 && settled % limit === 0,
+    };
+  }
+
+  /** Keys this member may hold: the base one and any later generation of it. */
+  private ownsSessionKey(member: TeamMember, key: string): boolean {
+    return key === member.sessionKey || key.startsWith(`${member.sessionKey}#`);
+  }
+
+  /**
+   * Close the workers of a member's earlier generations. Rotating the key alone
+   * would leave one live agent process per generation behind — the opposite of
+   * what rotation is for. A worker that is still busy is left alone and retried
+   * on the next turn.
+   */
+  private async retireOldSessions(member: TeamMember, currentKey: string): Promise<void> {
+    const stale = this.orch
+      .listWorkers()
+      .map((w) => w.sessionKey)
+      .filter(
+        (key): key is string =>
+          typeof key === "string" && key !== currentKey && this.ownsSessionKey(member, key),
+      );
+    for (const key of stale) await this.orch.closeSession(key).catch(() => false);
+  }
+
   private async runTurn(turn: TeamTurn, member: TeamMember): Promise<void> {
     const channel = this.channelState(turn.channel);
     const pulse = turn.kind === "pulse";
@@ -649,9 +703,23 @@ export class Team {
     let final: TaskRecord | undefined;
     let taskId: string | undefined;
 
+    // Where this turn's conversation lives. Computed before submitting, because
+    // a rotated member has to run somewhere new without anything else changing.
+    const session = this.sessionFor(member);
+
     try {
       if (!pulse && !trigger) {
         throw new Error(`the message this turn answers is gone (${turn.messageId})`);
+      }
+      if (session.generation > 0) await this.retireOldSessions(member, session.key);
+      if (session.atBoundary) {
+        // Say it out loud once per rotation. A member that suddenly "forgets"
+        // looks like a defect; a member that started a fresh session looks like
+        // what it is, and the line names what actually carries continuity over.
+        this.systemMessage(
+          channel.id,
+          `${member.name} is starting a fresh session (${member.sessionTurns} turns each). What carries over is this room and MEMORY.md.`,
+        );
       }
       const prompt =
         pulse || !trigger
@@ -660,7 +728,7 @@ export class Team {
       const submitted = this.orch.submitTask({
         prompt,
         profile: member.profile,
-        sessionKey: member.sessionKey,
+        sessionKey: session.key,
         cwd: member.cwd,
         timeoutMs: this.turnTimeoutMs,
         metadata: {
@@ -672,7 +740,12 @@ export class Team {
         },
       });
       taskId = submitted.taskId;
-      this.patchTurn(turn.id, { taskId, status: "running", startedAt: Date.now() });
+      this.patchTurn(turn.id, {
+        taskId,
+        status: "running",
+        startedAt: Date.now(),
+        sessionKey: session.key,
+      });
 
       final = await this.orch.waitTask(taskId, this.turnTimeoutMs + 5_000);
       // `waitTask` also resolves on `waiting`, because an approval is a state a

@@ -174,6 +174,37 @@ in its channel. It is not replayed automatically: the agent may already have
 edited files, and a silent retry could apply the same change twice. Queued turns
 were never started, so they run on the next start.
 
+### Rotating a conversation
+
+The harness session is the one thing that grows without a ceiling: every turn
+re-sends the whole conversation, so a member that has been at work since morning
+pays for the morning on every turn. `sessionTurns` puts a lifespan on it.
+
+```yaml
+team:
+  sessionTurns: 40          # everyone, unless a member says otherwise
+  members:
+    - id: qa
+      profile: pi
+      sessionTurns: 10      # the verifier's turns are small; rotate it often
+```
+
+- **The generation is derived, not stored.** A member's key is
+  `team:<name>:<id>` for its first N turns and `team:<name>:<id>#k` after that,
+  where `k` is `settled turns ÷ N`. Both halves live in SQLite, so a restart
+  resumes the current generation instead of quietly starting over.
+- **The old worker is closed.** Rotating the key alone would leave one live agent
+  process per generation — the cost the feature exists to remove. The previous
+  worker is closed on the next turn (if it is idle; a busy one is retried later).
+- **Continuity is the room, not the session.** The next turn still gets the
+  member's identity, `notes`, recent transcript and `MEMORY.md`, and the room says
+  once per rotation that it happened. Anything the member cared about has to be in
+  one of those places — which is also why the prompt tells it to write decisions
+  down instead of relying on the conversation.
+- **Per turn, on the record.** Each turn stores the key it ran under
+  (`team transcript` prints it), so "when did this member start fresh" is a fact in
+  the data rather than a guess from the clock.
+
 ## Waking up: pulses
 
 A member that only speaks when spoken to is a very responsive tool, not a

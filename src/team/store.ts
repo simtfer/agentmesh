@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS turns (
   rootId TEXT,
   hops INTEGER NOT NULL,
   taskId TEXT,
+  sessionKey TEXT,
   status TEXT NOT NULL,
   queuedAt INTEGER NOT NULL,
   startedAt INTEGER,
@@ -54,6 +55,9 @@ const ADDED_COLUMNS: Array<{ table: string; column: string; decl: string }> = [
   { table: "messages", column: "hops", decl: "INTEGER NOT NULL DEFAULT 0" },
   { table: "messages", column: "rootId", decl: "TEXT" },
   { table: "turns", column: "kind", decl: "TEXT NOT NULL DEFAULT 'message'" },
+  // Written when the turn starts, because that is when the member's current
+  // generation — and therefore its key — is known.
+  { table: "turns", column: "sessionKey", decl: "TEXT" },
 ];
 
 /**
@@ -73,6 +77,7 @@ const TURNS_COLUMNS = [
   "rootId",
   "hops",
   "taskId",
+  "sessionKey",
   "status",
   "queuedAt",
   "startedAt",
@@ -130,6 +135,7 @@ function rowToTurn(r: Row): TeamTurn {
   const messageId = str(r.messageId);
   const rootId = str(r.rootId);
   const taskId = str(r.taskId);
+  const sessionKey = str(r.sessionKey);
   const startedAt = num(r.startedAt);
   const endedAt = num(r.endedAt);
   const approvalId = str(r.approvalId);
@@ -137,6 +143,7 @@ function rowToTurn(r: Row): TeamTurn {
   if (messageId) t.messageId = messageId;
   if (rootId) t.rootId = rootId;
   if (taskId) t.taskId = taskId;
+  if (sessionKey) t.sessionKey = sessionKey;
   if (startedAt !== undefined) t.startedAt = startedAt;
   if (endedAt !== undefined) t.endedAt = endedAt;
   if (approvalId) t.approvalId = approvalId;
@@ -381,7 +388,7 @@ export class TeamStore {
     this.db
       .prepare(
         `UPDATE turns SET memberId=?, channel=?, messageId=?, rootId=?, hops=?, taskId=?,
-          status=?, queuedAt=?, startedAt=?, endedAt=?, approvalId=?, error=? WHERE id=?`,
+          sessionKey=?, status=?, queuedAt=?, startedAt=?, endedAt=?, approvalId=?, error=? WHERE id=?`,
       )
       .run(
         next.memberId,
@@ -390,6 +397,7 @@ export class TeamStore {
         next.rootId ?? null,
         next.hops,
         next.taskId ?? null,
+        next.sessionKey ?? null,
         next.status,
         next.queuedAt,
         next.startedAt ?? null,
@@ -441,6 +449,22 @@ export class TeamStore {
     const r = this.db
       .prepare("SELECT COUNT(*) AS n FROM turns WHERE rootId=?")
       .get(rootId) as Row;
+    return num(r.n) ?? 0;
+  }
+
+  /**
+   * Turns that actually reached the harness and are over. This is the clock a
+   * rotating session runs on: the count lives in the database, so a restart does
+   * not rewind it, and a turn that never started (no task) does not age a
+   * conversation it never touched.
+   */
+  countSettledTurns(memberId: string): number {
+    const r = this.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM turns WHERE memberId=? AND taskId IS NOT NULL " +
+          "AND status IN ('succeeded','failed','cancelled')",
+      )
+      .get(memberId) as Row;
     return num(r.n) ?? 0;
   }
 

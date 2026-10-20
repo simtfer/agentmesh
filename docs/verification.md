@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 164 tests, offline, ~27s
+npm test            # 166 tests, offline, ~27s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -323,7 +323,7 @@ The remote *security* model (flags, deployment shape, rotation drill) is documen
 in [remote.md](remote.md#security-model); the coverage list above mirrors
 [remote.md#remote-tests](remote.md#remote-tests).
 
-## `test/team.test.ts` — 22 cases
+## `test/team.test.ts` — 24 cases
 
 The team layer, driven end-to-end over the mock harness (deterministic, offline)
 plus a real HTTP server on an ephemeral port:
@@ -383,6 +383,14 @@ plus a real HTTP server on an ephemeral port:
   profile name, the local side holds exactly one proxied task, and the member
   keeps its ordinary `sessionKey` and transcript. The room never learns that one
   of its colleagues lives in a different process.
+- **Session rotation.** With `sessionTurns: 2`, three turns of one member record
+  keys `team:acme:dev`, `team:acme:dev`, `team:acme:dev#1` — per turn, in the
+  store — and the roster reports the generation it is on now. Exactly one worker
+  survives: the retired generation's process is closed, not left running. A
+  restart reads the settled-turn count back out of SQLite, so the next turn
+  resumes `#1` instead of rewinding to the base key; the room gets one system
+  line per rotation so a member that "forgot" reads as a fresh session rather
+  than a defect.
 
 A real mixed-harness team run (pi + opencode in one room) is **not** part of the
 suite — it needs logged-in agents and spends tokens. It was run by hand; see
@@ -473,6 +481,15 @@ as browsable resources.
   naming the verifier in the same reply as the builder started verification before
   the file existed; the verifier honestly reported `ERR_MODULE_NOT_FOUND`, and the
   chain only converged when the engineer's own message re-raised the mention.
+- **Session rotation against real `pi`** (ad-hoc run, 2026-10-20, not in `npm test`:
+  it spends tokens). `sessionTurns: 1`, three turns: keys `team:rotate:pi`,
+  `…:pi#1`, `…:pi#2` — and the third ran after the server was stopped and
+  restarted, so the generation comes from SQLite, not from process memory. Each
+  turn answered `417` because the number was written to `MEMORY.md` in turn one;
+  the conversation itself was genuinely new each time (the room printed the
+  "starting a fresh session" line twice). Rotation is only safe because the room
+  and the memory file are the continuity — this is that claim, checked against a
+  real adapter rather than a mock.
 
 ## Known gaps
 

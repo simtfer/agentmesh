@@ -49,6 +49,8 @@ export interface TeamMemberConfig {
   notes?: string;
   /** let this member speak unprompted; omitted = it only answers */
   pulse?: TeamPulseConfig;
+  /** rotate this member's harness session after N turns; omitted = team default, else never */
+  sessionTurns?: number;
 }
 
 /**
@@ -87,6 +89,14 @@ export interface TeamConfig {
   port?: number;
   /** env var NAME holding the API bearer token; the value never lives in config */
   tokenEnv?: string;
+  /**
+   * Default session lifespan for members that do not set their own. A harness
+   * session is unbounded by default: every turn re-sends the whole conversation,
+   * so a member that has been at work since morning pays for the morning on
+   * every turn. Rotating the key caps that cost, and the room transcript plus
+   * `MEMORY.md` — not the harness session — are what actually carry continuity.
+   */
+  sessionTurns?: number;
   members: TeamMemberConfig[];
   channels?: TeamChannelConfig[];
 }
@@ -111,6 +121,13 @@ export interface TeamMember {
   notes?: string;
   /** resolved pulse settings; absent = this member only answers */
   pulse?: { everyMs: number; idleOnly: boolean; channel: string };
+  /**
+   * Turns one harness conversation may serve before the member is moved to a
+   * fresh one (absent = never). `sessionKey` stays the base key; later
+   * generations append `#<n>`, so the transcript, the room and the memory file
+   * are unchanged while the underlying conversation is new.
+   */
+  sessionTurns?: number;
 }
 
 export type TeamMessageKind = "chat" | "system";
@@ -173,6 +190,12 @@ export interface TeamTurn {
   /** distance from the root message (0 = the user addressed this member) */
   hops: number;
   taskId?: string;
+  /**
+   * The conversation key this turn ran under. Recorded per turn because a
+   * rotating member changes keys: without it, two turns of the same member look
+   * like one continuous conversation even when they were not.
+   */
+  sessionKey?: string;
   status: TeamTurnStatus;
   queuedAt: number;
   startedAt?: number;
@@ -191,6 +214,8 @@ export interface TeamMemberState extends TeamMember {
   lastMessageAt?: number;
   /** set on members that wake on their own, so the room can see who does */
   pulseEveryMs?: number;
+  /** which conversation the member is on, once it has been rotated (0/absent = first) */
+  sessionGeneration?: number;
 }
 
 export interface TeamChannelState {

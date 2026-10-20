@@ -99,6 +99,7 @@ const TeamMember = z.object({
   cwd: z.string().optional(),
   notes: z.string().optional(),
   pulse: TeamPulse.optional(),
+  sessionTurns: z.number().int().positive().optional(),
 });
 
 const TeamChannel = z.object({
@@ -125,6 +126,7 @@ const TeamSettings = z.object({
   host: z.string().optional(),
   port: z.number().int().min(0).max(65535).optional(),
   tokenEnv: z.string().optional(),
+  sessionTurns: z.number().int().positive().optional(),
   members: z.array(TeamMember).min(1),
   channels: z.array(TeamChannel).optional(),
 });

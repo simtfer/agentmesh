@@ -126,7 +126,9 @@ function printTranscript(entries: TeamTranscriptEntry[]): void {
       }\n`,
     );
     process.stdout.write(
-      `   ${hhmm(t.queuedAt)} → ${t.endedAt ? hhmm(t.endedAt) : "running"}  hops=${t.hops}  ${t.channel}\n`,
+      `   ${hhmm(t.queuedAt)} → ${t.endedAt ? hhmm(t.endedAt) : "running"}  hops=${t.hops}  ${t.channel}${
+        t.sessionKey ? `  session=${t.sessionKey}` : ""
+      }\n`,
     );
     if (t.error) process.stdout.write(`   error: ${t.error}\n`);
     for (const e of t.events) process.stdout.write(`     ${eventLine(e)}\n`);
