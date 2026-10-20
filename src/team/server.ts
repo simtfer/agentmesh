@@ -7,6 +7,7 @@ import {
   SecurityError,
 } from "../remote/security.js";
 import type { Team } from "./team.js";
+import { renderConsoleHtml } from "./console.js";
 
 export interface TeamServerOptions {
   team: Team;
@@ -114,6 +115,35 @@ export async function startTeamServer(opts: TeamServerOptions): Promise<TeamServ
 
     if (path === "/healthz") {
       send(res, 200, { ok: true, team: team.name });
+      return;
+    }
+
+    // The console *shell* is deliberately unauthenticated: a browser cannot set
+    // an Authorization header on a navigation, so gating the HTML would mean
+    // gating it on a cookie this API does not have. The document itself carries
+    // no data — every number on the page comes from an authenticated GET the
+    // page issues itself, and there is no write route on it at all.
+    if ((path === "/" || path === "/console") && method === "GET") {
+      const html = renderConsoleHtml({ teamName: team.name, requiresToken: tokens.length > 0 });
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "content-length": Buffer.byteLength(html),
+        // No external assets, no eval: only our own inline style/script and
+        // same-origin fetches. Anything else the page tries is refused.
+        "content-security-policy":
+          "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; " +
+          "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        "x-content-type-options": "nosniff",
+        "referrer-policy": "no-referrer",
+        "cache-control": "no-store",
+      });
+      res.end(html);
+      return;
+    }
+
+    if (path === "/favicon.ico") {
+      res.writeHead(204, { "cache-control": "max-age=86400" });
+      res.end();
       return;
     }
 

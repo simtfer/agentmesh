@@ -140,7 +140,7 @@ npx tsx src/cli.ts team respond <approvalId> accept --content '{"answer":"yes"}'
 
 | command | what it does |
 |---|---|
-| `serve` | load `team:`, start members lazily, serve the API; SIGINT/SIGTERM drains |
+| `serve` | load `team:`, start members lazily, serve the API and the read-only console at `/`; SIGINT/SIGTERM drains |
 | `chat` | interactive room: plain text goes to `#general`, `/dm <member>`, `/log`, `/status`, `/transcript` |
 | `say` / `dm` | post a message; `--wait` follows the thread until the team is quiet (or blocked on an approval) |
 | `log` | the room transcript, including system notices; `--follow` tails it |

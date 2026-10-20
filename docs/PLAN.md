@@ -50,8 +50,8 @@
 | CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 干净通过；`npm test` **160/160**（tasks(32) + handoff(12) + artifact(7) +
-paths(3) + contract(10) + dag(18) + budget(11) + remote(26) + deploy(8) + orchestrator(11) + skill(4) + team(18)）；
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **163/163**（tasks(32) + handoff(12) + artifact(7) +
+paths(3) + contract(10) + dag(18) + budget(11) + remote(26) + deploy(8) + orchestrator(11) + skill(4) + team(21)）；
 （远程 daemon 支持**会话复用**：同一 `workerId` 连续 `task_submit` 复用 B 侧 agent 会话，
 `daemon.workerIdleMs` 兜底回收；**固定会话**：profile 配 `session` 或提交带 `sessionKey`，
 会话落盘、daemon 重启后同 key 恢复——已用真实 pi 验证：停 daemon 再用同 key 提交，
@@ -463,6 +463,16 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
     - `everyMs` 下限 1 秒（防止 50ms 醒来一次烧钱），每次醒来都是真实计费，预算天花板兜底；
       可选 `team pulse <member>` 手动戳一下，走同一套守卫。
     5 项新用例（定时器、SILENT、守卫、未配置、旧库迁移），测试总数 155 → 160。
+13. ~~**Stage 10 · 只读 Web 控制台**~~ ✅ 已落地：`team serve` 在 `/` 上额外提供一个自包含的单页。
+    - **只发 GET**：发消息、审批、叫醒成员都留在 CLI/API。一个谁都能在浏览器里打开的页面，
+      不应该有能力让 agent 执行命令——这条不是靠文档承诺，而是靠页面里没有任何写路由。
+    - **壳公开、数据鉴权**：浏览器无法给一次导航加 `Authorization`，所以 HTML 本身免鉴权
+      （不含任何数据），页面自己向用户要 token 并存进 `sessionStorage`，每个数字都来自带鉴权的 GET。
+    - **CSP 收紧**：`default-src 'none'` + `connect-src 'self'` + `frame-ancestors 'none'`，
+      无外部资源、无 CDN、无构建步骤（`renderConsoleHtml` 就是一个纯函数，测试可直接断言产出的 HTML）。
+    - **游标轮询**：与 CLI 同一个 `?after=` 游标，每 2 秒一次，`serve` 重启后页面自己接上；
+      `/?member=<id>` 是可直接粘贴的深链，打开即展开该成员的逐轮过程（工具调用、阻塞、失败）。
+    3 项新用例（壳公开而数据 401、团队名转义、内联脚本可编译），测试总数 160 → 163。
 
-> Stage 0–3 已完成并通过 160 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算、团队层与自主心跳）。
-> 下一步：只读 Web 控制台、混合 harness 的真实团队实跑、跨物理链路实跑（DNS/路由/防火墙）、跨机交接产物传输。
+> Stage 0–3 已完成并通过 163 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算、团队层与自主心跳）。
+> 下一步：混合 harness 的真实团队实跑（pi + opencode + `remote` 成员）、成员从队列认领工作、跨物理链路实跑（DNS/路由/防火墙）、跨机交接产物传输。

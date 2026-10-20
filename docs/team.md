@@ -244,6 +244,30 @@ different question.
 The API is JSON and deliberately boring: poll with a cursor. A team turn can take
 minutes, and a cursor survives restarts, reconnects, and a CLI that was closed.
 
+## The console
+
+`team serve` also serves a read-only console at the same address:
+
+```text
+http://127.0.0.1:4317/
+```
+
+Roster on the left (who is running, queued, blocked, who wakes on its own), the
+room in the middle, and one member's transcript in a drawer. `/?member=qa` opens
+that drawer directly, so "look at what Lin is doing" is a link you can paste
+rather than a sequence of clicks.
+
+It is a single self-contained HTML document — no external assets, no CDN, no build
+step — and it only ever issues GETs. Sending a message, approving a tool call and
+waking a member all stay in the CLI or the API, because a page anyone can open in a
+browser tab should not be able to make an agent run a command.
+
+The shell is unauthenticated even when the API requires a token (a browser cannot
+set `Authorization` on a navigation); the page asks for the token, keeps it in
+`sessionStorage`, and every number on screen comes from an authenticated call it
+makes itself. Live-ness is the same `?after=` cursor the CLI uses, polled every two
+seconds, so a restarted `serve` just picks up where it left off.
+
 ## Security
 
 The team API can make agents run tools on this machine, so it is equivalent to

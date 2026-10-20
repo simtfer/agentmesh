@@ -30,7 +30,7 @@ explicit `handoff`.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/simtfer/agentmesh/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](https://github.com/simtfer/agentmesh/blob/main/package.json)
 
-160 offline tests on Linux and Windows · not published to npm yet
+163 offline tests on Linux and Windows · not published to npm yet
 
 ## What this is
 
@@ -149,9 +149,11 @@ rooms where an `@mention` hands the next turn to a teammate. Members run in
 parallel, one turn at a time each, and every turn's tool calls are inspectable —
 the group chat is the interface, not a summary of it. A member with a `pulse` also
 wakes on its own schedule and says something only when there is something to say.
+`team serve` doubles as a read-only console at `http://127.0.0.1:4317/` — roster,
+room and per-member transcript in a browser tab, no terminal required.
 
 ```bash
-agentmesh team serve &        # keeps the roster and its sessions alive
+agentmesh team serve &        # keeps the roster and its sessions alive (+ console)
 agentmesh team chat           # group chat, DMs, /transcript <member>
 ```
 
@@ -297,7 +299,7 @@ non-error symptoms (daemon 401s, TLS failures):
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 160 tests, offline, no API cost, ~27s
+npm test            # 163 tests, offline, no API cost, ~27s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run check:pack  # publish tarball contains dist/, and no sources or tests
@@ -305,7 +307,7 @@ npm run deploy:tls  # real TLS/mTLS run over this host's LAN interface (not loop
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **160/160** across twelve files, offline, in about 27 seconds. Every
+`npm test` is **163/163** across twelve files, offline, in about 27 seconds. Every
 case drives a public surface (Orchestrator, MCP tools, or the daemon's HTTP/WS
 endpoints) and asserts the resulting task record, not a mock's internal calls.
 CI runs the same gate on Linux and Windows × Node 22 and 24
@@ -325,10 +327,10 @@ speak unprompted).
 
 Next:
 
-- **A read-only console** — a web view over the team API and audit trail, so
-  watching the team is not a matter of tailing a terminal.
 - **Autonomy beyond reporting** — members picking work off a queue instead of
   waiting to be named.
+- **Mixed harnesses, proven** — a real pi + opencode team running one hand-off
+  chain, and coverage for a `remote` member (a daemon, not a local process).
 
 ## Contributing
 

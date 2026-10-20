@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 160 tests, offline, ~27s
+npm test            # 163 tests, offline, ~27s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -323,7 +323,7 @@ The remote *security* model (flags, deployment shape, rotation drill) is documen
 in [remote.md](remote.md#security-model); the coverage list above mirrors
 [remote.md#remote-tests](remote.md#remote-tests).
 
-## `test/team.test.ts` — 18 cases
+## `test/team.test.ts` — 21 cases
 
 The team layer, driven end-to-end over the mock harness (deterministic, offline)
 plus a real HTTP server on an ephemeral port:
@@ -361,6 +361,14 @@ plus a real HTTP server on an ephemeral port:
   `@mention` gets its own allowance) while the pulse turn itself belongs to no
   thread; an `idleOnly` member stays asleep while anyone works and wakes once the
   room is quiet; a member without `pulse` never wakes.
+- **Console.** `GET /` returns the read-only page: `text/html`, a
+  `default-src 'none'` CSP with `connect-src 'self'` and `frame-ancestors 'none'`,
+  no `POST` anywhere in the document, and the team name escaped rather than
+  interpolated. The shell loads without a token while every data endpoint behind
+  it still answers 401, which is the point: a page anyone can open in a tab cannot
+  reach a write route because the page has none. The inline script is compiled
+  (not run) in the suite: the page is one template literal, and a stray backtick
+  in it silently turns the rest of the document into code.
 - **Forward migration.** A `team.sqlite` whose `turns` table still has
   `messageId NOT NULL` (the pre-pulse shape) opens, keeps its rows, defaults them
   to `message` turns, and continues its id sequence.

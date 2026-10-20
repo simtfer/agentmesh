@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { Script } from "node:vm";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { parseConfig } from "../src/config.js";
@@ -9,6 +10,7 @@ import { Orchestrator } from "../src/orchestrator.js";
 import { Team } from "../src/team/team.js";
 import { TeamStore } from "../src/team/store.js";
 import { startTeamServer } from "../src/team/server.js";
+import { renderConsoleHtml } from "../src/team/console.js";
 import { extractHandles } from "../src/team/mentions.js";
 import type { TeamConfig } from "../src/team/types.js";
 
@@ -378,6 +380,57 @@ test("the HTTP API serves the team and requires a token", async () => {
     await server.close();
     await cleanup(h, dir);
   }
+});
+
+test("the console shell loads without a token, and every number on it still needs one", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const h = makeTeam(dir);
+  const server = await startTeamServer({ team: h.team, port: 0, tokens: ["s3cret"] });
+  try {
+    const res = await fetch(`${server.url}/`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /^text\/html/);
+
+    // A page anyone can open must not be able to reach anywhere or anything:
+    // no external assets, no eval source, no framing, no form posts.
+    const csp = res.headers.get("content-security-policy") ?? "";
+    assert.match(csp, /default-src 'none'/);
+    assert.match(csp, /connect-src 'self'/);
+    assert.match(csp, /frame-ancestors 'none'/);
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+
+    const html = await res.text();
+    assert.match(html, /read-only/);
+    assert.match(html, /WANTS_TOKEN = true/, "the page knows to ask for a token");
+    // Read-only is a property of the document, not a promise in the docs.
+    assert.doesNotMatch(html, /method:\s*["']POST["']/);
+    assert.doesNotMatch(html, /team\/approvals/);
+
+    // The shell is public; the data behind it is not.
+    assert.equal((await fetch(`${server.url}/team`)).status, 401);
+    assert.equal((await fetch(`${server.url}/team/messages?channel=general`)).status, 401);
+    assert.equal((await fetch(`${server.url}/favicon.ico`)).status, 204);
+  } finally {
+    await server.close();
+    await cleanup(h, dir);
+  }
+});
+
+test("the console refuses to trust the team name", () => {
+  const html = renderConsoleHtml({ teamName: '<img src=x onerror="alert(1)">', requiresToken: false });
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.match(html, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
+  assert.match(html, /WANTS_TOKEN = false/, "an open team must not nag for a token");
+});
+
+test("the console's inline script compiles", () => {
+  const html = renderConsoleHtml({ teamName: "acme", requiresToken: false });
+  const script = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1];
+  assert.ok(script, "the page ships its own script");
+  // Compiles, never runs. The page is one big template literal, so a stray
+  // backtick inside it closes the string early and leaves the rest as code —
+  // which is exactly how the first draft of this file ended up answering 500.
+  new Script(script);
 });
 
 test("the roster rejects duplicate handles instead of guessing who @dev means", () => {

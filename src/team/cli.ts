@@ -245,6 +245,7 @@ async function cmdServe(args: TeamCommandArgs, loadConfig: () => Promise<MeshCon
   process.stderr.write(
     `[agentmesh] members: ${team.members.map((m) => `${m.name} (@${m.mention})`).join(", ")}\n`,
   );
+  process.stderr.write(`[agentmesh] console (read-only): ${server.url}/\n`);
 
   let stop!: () => void;
   const done = new Promise<void>((resolve) => (stop = resolve));

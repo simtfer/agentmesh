@@ -65,6 +65,8 @@ export type { TeamOptions, PostInput } from "./team/team.js";
 export { TeamStore } from "./team/store.js";
 export { startTeamServer } from "./team/server.js";
 export type { TeamServerOptions, TeamServerHandle } from "./team/server.js";
+export { renderConsoleHtml } from "./team/console.js";
+export type { ConsoleOptions } from "./team/console.js";
 export { renderTurnPrompt } from "./team/prompt.js";
 export { extractHandles, resolveMentions, mentionsHuman } from "./team/mentions.js";
 export type {
