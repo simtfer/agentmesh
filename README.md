@@ -16,14 +16,14 @@ restarting; start a fresh one and what carries over is only the checkout, or an
 explicit `handoff`.
 
 ```
-┌─────────────┐   MCP tools    ┌──────────────────────────┐   ACP (JSON-RPC/stdio)   ┌──────────────┐
-│ master agent │ ─────────────▶ │ agentmesh adapter        │ ───────────────────────▶ │ worker: pi   │
-│ (Claude Code)│  spawn/dispatch│  • MCP server (in)       │   via acpx runtime       ├──────────────┤
-│  ...any MCP  │ ◀───────────── │  • Orchestrator          │ ◀─────────────────────── │ worker:      │
-│    client    │   results      │  • Worker registry       │   streamed events        │   opencode   │
-└─────────────┘                │  • git-worktree isolation│                          ├──────────────┤
-                               └──────────────────────────┘                          │ worker: ...  │
-                                                                                      └──────────────┘
+┌──────────────┐   MCP tools    ┌──────────────────────────┐   ACP (JSON-RPC/stdio)  ┌──────────────┐
+│ master agent │ ─────────────▶ │ agentmesh adapter        │ ──────────────────────▶ │ worker: pi   │
+│ (Claude Code)│ spawn/dispatch │  • MCP server (in)       │     via acpx runtime    ├──────────────┤
+│  ...any MCP  │ ◀───────────── │  • Orchestrator          │ ◀────────────────────── │ worker:      │
+│    client    │    results     │  • Worker registry       │     streamed events     │   opencode   │
+└──────────────┘                │  • git-worktree isolation│                         ├──────────────┤
+                                └──────────────────────────┘                         │ worker: ...  │
+                                                                                     └──────────────┘
 ```
 
 [![CI](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml/badge.svg)](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml)

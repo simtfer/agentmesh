@@ -7,14 +7,14 @@
 一个任务就是一次往返——下发、回传、决定下一步——这个循环属于 master，不属于适配器。复用同一个 worker（`workerId`）时，它会在多轮之间保持会话，master 就能和另一台机器上的 worker 真正“接着聊”；把会话固定下来（`session`），这段对话还能活过 daemon 重启；每次开新 worker 的话，能延续下来的只有它运行的那份 checkout，或者一次显式的 `handoff`。
 
 ```
-┌─────────────┐   MCP tools    ┌──────────────────────────┐   ACP (JSON-RPC/stdio)   ┌──────────────┐
-│ master agent │ ─────────────▶ │ agentmesh adapter        │ ───────────────────────▶ │ worker: pi   │
-│ (Claude Code)│  spawn/dispatch│  • MCP server (in)       │   via acpx runtime       ├──────────────┤
-│  ...any MCP  │ ◀───────────── │  • Orchestrator          │ ◀─────────────────────── │ worker:      │
-│    client    │   results      │  • Worker registry       │   streamed events        │   opencode   │
-└─────────────┘                │  • git-worktree isolation│                          ├──────────────┤
-                               └──────────────────────────┘                          │ worker: ...  │
-                                                                                      └──────────────┘
+┌──────────────┐   MCP tools    ┌──────────────────────────┐   ACP (JSON-RPC/stdio)  ┌──────────────┐
+│ master agent │ ─────────────▶ │ agentmesh adapter        │ ──────────────────────▶ │ worker: pi   │
+│ (Claude Code)│ spawn/dispatch │  • MCP server (in)       │     via acpx runtime    ├──────────────┤
+│  ...any MCP  │ ◀───────────── │  • Orchestrator          │ ◀────────────────────── │ worker:      │
+│    client    │    results     │  • Worker registry       │     streamed events     │   opencode   │
+└──────────────┘                │  • git-worktree isolation│                         ├──────────────┤
+                                └──────────────────────────┘                         │ worker: ...  │
+                                                                                     └──────────────┘
 ```
 
 [![CI](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml/badge.svg)](https://github.com/simtfer/agentmesh/actions/workflows/ci.yml)
