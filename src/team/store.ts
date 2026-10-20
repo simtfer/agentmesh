@@ -567,6 +567,49 @@ export class TeamStore {
   }
 
   /**
+   * Work that ran out of time *after* somebody read it.
+   *
+   * `board()` drops everything past the TTL, and that is deliberate: last
+   * week's remark should not still be nudging the team. What it must not drop
+   * silently is the one case the user has to decide about — every member read
+   * it, every one of them passed, and the hour ran out. That is a verdict, and
+   * a verdict nobody was told is worse than a nudge.
+   *
+   * Items nobody was ever offered are excluded on purpose. In a room where no
+   * member claims, nothing is ever claimed and every message expires; calling
+   * that "nobody took it" would be noise about a feature never switched on.
+   *
+   * `channel` undefined counts every room, which is what the status line wants.
+   */
+  expiredBoard(channel: string | undefined, ttlMs: number, now = Date.now()): TeamBoardItem[] {
+    if (ttlMs <= 0) return []; // a TTL of 0 means nothing ever expires
+    const cutoff = now - ttlMs;
+    const rows = this.db
+      .prepare(
+        `SELECT m.*
+           FROM messages m
+          WHERE m.kind = 'chat' AND m.author = 'user'
+            AND (m.mentions IS NULL OR m.mentions = '[]')
+            AND m.createdAt < ?
+            ${channel === undefined ? "" : "AND m.channel = ?"}
+            AND NOT EXISTS (SELECT 1 FROM claims d WHERE d.messageId = m.id AND d.decision = 'done')
+            AND NOT EXISTS (SELECT 1 FROM claims t WHERE t.messageId = m.id AND t.decision = 'taken')
+            AND EXISTS (SELECT 1 FROM claims p WHERE p.messageId = m.id AND p.decision IN ('declined','dropped'))
+          ORDER BY m.seq ASC`,
+      )
+      .all(...(channel === undefined ? [cutoff] : [cutoff, channel])) as Row[];
+    const declined = this.db.prepare(
+      "SELECT memberId FROM claims WHERE messageId = ? AND decision IN ('declined','dropped') ORDER BY at ASC",
+    );
+    // No `claimedBy` here: a live claim is excluded above, so anything left has
+    // nobody working on it. That is the entire point of the query.
+    return rows.map((r) => ({
+      message: rowToMessage(r),
+      declinedBy: (declined.all(String(r.id)) as Row[]).map((d) => String(d.memberId)),
+    }));
+  }
+
+  /**
    * Take a message off the board, atomically.
    *
    * Two members waking at the same moment must not both start the same piece of

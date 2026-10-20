@@ -169,7 +169,7 @@ export async function startTeamServer(opts: TeamServerOptions): Promise<TeamServ
     // member picks it up, not when a client asks.
     if (path === "/team/board" && method === "GET") {
       const channel = url.searchParams.get("channel") ?? "general";
-      send(res, 200, { channel, items: team.board(channel) });
+      send(res, 200, { channel, items: team.board(channel), expired: team.expired(channel) });
       return;
     }
 

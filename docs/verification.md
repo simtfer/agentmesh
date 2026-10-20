@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 173 tests, offline, ~34s
+npm test            # 175 tests, offline, ~39s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -331,7 +331,7 @@ The remote *security* model (flags, deployment shape, rotation drill) is documen
 in [remote.md](remote.md#security-model); the coverage list above mirrors
 [remote.md#remote-tests](remote.md#remote-tests).
 
-## `test/team.test.ts` — 29 cases
+## `test/team.test.ts` — 31 cases
 
 The team layer, driven end-to-end over the mock harness (deterministic, offline)
 plus a real HTTP server on an ephemeral port:
@@ -399,7 +399,14 @@ plus a real HTTP server on an ephemeral port:
   gets it — a pass is recorded per member, not per item. Two members configured
   on the same room cannot both take one message: the store's `BEGIN IMMEDIATE`
   claim leaves exactly one `claimedBy` and one turn. Work older than
-  `claimTtlMs` drops off the board. Naming someone still routes straight to them
+  `claimTtlMs` drops off the board — and if a member had read it and passed, it
+  drops into an `expired` list instead of vanishing: `team board` prints it under
+  the live items with the handles that passed, `GET /team/board` carries it as a
+  second field, and `status` counts it. An item **nobody was ever offered** is
+  left out of that list entirely, because a room that never claims nothing should
+  be nagged about a feature it did not switch on; an item somebody passed on and
+  somebody else finished is out too, since that is work done. Nothing claims from
+  the expired list. Naming someone still routes straight to them
   and never touches the board.
 - **Session rotation.** With `sessionTurns: 2`, three turns of one member record
   keys `team:acme:dev`, `team:acme:dev`, `team:acme:dev#1` — per turn, in the

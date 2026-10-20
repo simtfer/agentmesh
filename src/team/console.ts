@@ -317,12 +317,15 @@ export function renderConsoleHtml(opts: ConsoleOptions): string {
     if (s.queued) c.push(s.queued + " queued");
     if (s.waiting) c.push(s.waiting + " waiting");
     if (s.unclaimed) c.push(s.unclaimed + " on the board");
+    // Not a fourth kind of busy: these are done being offered, and a person has
+    // to decide whether to post them again. Shown in the same line as a prompt.
+    if (s.expired) c.push(s.expired + " expired");
     $("counts").textContent = s.members.length + " members" + (c.length ? " · " + c.join(" · ") : " · quiet");
 
     // Polling twice a second and rebuilding the sidebar every time would eat
     // hovers and scroll position while nothing changed. Rebuild only on change.
     var key = JSON.stringify([
-      state.channel, state.member, s.running, s.queued, s.waiting, s.unclaimed,
+      state.channel, state.member, s.running, s.queued, s.waiting, s.unclaimed, s.expired,
       s.members.map(function (m) { return [m.id, m.name, m.role, m.status, m.queued, m.pulseEveryMs, m.claims]; }),
       s.channels.map(function (x) { return [x.id, x.title, x.kind, x.messageCount, x.lastMessageAt, x.description, x.members]; }),
       s.approvals

@@ -354,6 +354,7 @@ export class Team {
       running: counts.running,
       waiting: counts.waiting,
       unclaimed: this.store.unclaimedCount(this.claimTtlMs),
+      expired: this.store.expiredBoard(undefined, this.claimTtlMs).length,
       maxHops: this.maxHops,
       maxTurnsPerMessage: this.maxTurnsPerMessage,
     };
@@ -367,6 +368,20 @@ export class Team {
   board(channel = "general"): TeamBoardItem[] {
     this.channelState(channel); // validate
     return this.store.board(channel, this.claimTtlMs);
+  }
+
+  /**
+   * What fell off the board because time ran out, but which a member had
+   * already read and turned down.
+   *
+   * This is not a second board and nothing may claim from it: the work is over,
+   * and the TTL says so. It exists so that "the team looked at this and none of
+   * them took it" reaches the person who posted it, instead of the item simply
+   * disappearing between two status lines.
+   */
+  expired(channel?: string): TeamBoardItem[] {
+    if (channel !== undefined) this.channelState(channel); // validate
+    return this.store.expiredBoard(channel, this.claimTtlMs);
   }
 
   /**

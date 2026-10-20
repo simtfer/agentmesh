@@ -253,6 +253,12 @@ export interface TeamStatus {
   waiting: number;
   /** unaddressed messages still waiting on the board */
   unclaimed: number;
+  /**
+   * Items that timed out after a member had already read them. `unclaimed`
+   * going to zero is only good news when nothing landed here: work nobody was
+   * offered expires quietly, but work the team read and passed on does not.
+   */
+  expired: number;
   maxHops: number;
   maxTurnsPerMessage: number;
 }

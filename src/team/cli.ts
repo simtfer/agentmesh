@@ -103,7 +103,7 @@ function printStatus(s: StatusPayload): void {
   process.stdout.write(
     `${s.team} · ${s.members.length} members · ${s.running} running, ${s.queued} queued, ${s.waiting} waiting${
       s.unclaimed ? `, ${s.unclaimed} on the board` : ""
-    } · hops≤${s.maxHops}\n`,
+    }${s.expired ? `, ${s.expired} expired` : ""} · hops≤${s.maxHops}\n`,
   );
   printMembers(s.members);
   printChannels(s.channels);
@@ -443,24 +443,42 @@ async function cmdRespond(args: TeamCommandArgs): Promise<void> {
  * a member is on it. The column that matters is the age: an item from six hours
  * ago is a decision for the user, not a nudge for the team.
  */
+function boardAge(createdAt: number): string {
+  const min = Math.round((Date.now() - createdAt) / 60_000);
+  // Anything on the expired list is at least one TTL old, so hours are the
+  // useful unit there; a live item is usually minutes.
+  return min >= 60 ? `${Math.round(min / 60)}h ago` : `${min}m ago`;
+}
+
+function printBoardItem(item: TeamBoardItem, who: string): void {
+  const passed = item.declinedBy.length > 0 ? `  passed: ${item.declinedBy.join(", ")}` : "";
+  const text = item.message.text.replace(/\s+/g, " ").slice(0, 100);
+  process.stdout.write(
+    `   ${String(item.message.seq).padStart(4)}  ${who.padEnd(14)} ${boardAge(item.message.createdAt).padEnd(9)} ${text}${passed}\n`,
+  );
+}
+
 async function cmdBoard(args: TeamCommandArgs): Promise<void> {
   const channel = args.rest[0] ?? "general";
-  const r = await request<{ channel: string; items: TeamBoardItem[] }>(
+  const r = await request<{ channel: string; items: TeamBoardItem[]; expired?: TeamBoardItem[] }>(
     args,
     `/team/board?channel=${encodeURIComponent(channel)}`,
   );
-  if (r.items.length === 0) {
+  const gone = r.expired ?? [];
+  if (r.items.length === 0 && gone.length === 0) {
     process.stdout.write(`   ${r.channel}: nothing on the board\n`);
     return;
   }
   for (const item of r.items) {
-    const age = Math.round((Date.now() - item.message.createdAt) / 60_000);
-    const who = item.claimedBy ? `${item.claimedBy} has it` : "open";
-    const passed = item.declinedBy.length > 0 ? `  passed: ${item.declinedBy.join(", ")}` : "";
-    const text = item.message.text.replace(/\s+/g, " ").slice(0, 100);
+    printBoardItem(item, item.claimedBy ? `${item.claimedBy} has it` : "open");
+  }
+  // Kept apart from the live items on purpose: nothing may claim from this
+  // list, it is a report that the room read the work and passed on it.
+  if (gone.length > 0) {
     process.stdout.write(
-      `   ${String(item.message.seq).padStart(4)}  ${who.padEnd(14)} ${`${age}m ago`.padEnd(9)} ${text}${passed}\n`,
+      `   ${r.channel}: ${gone.length} expired before anybody took it — the room read these and passed\n`,
     );
+    for (const item of gone) printBoardItem(item, "expired");
   }
 }
 

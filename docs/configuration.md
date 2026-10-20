@@ -195,7 +195,7 @@ team:
 | `channels[]` | `[general]` | rooms; `members` narrows who is addressable |
 | `members[].pulse` | off | `{ everyMs, idleOnly, channel }` — wake this member on its own schedule; `SILENT` posts nothing, `idleOnly` (default `true`) only fires when the team is quiet, and `channel` defaults to `general`. Each pulse is a paid turn |
 | `sessionTurns` / `members[].sessionTurns` | off | rotate the harness conversation after N turns; the member keeps its identity, workspace and `MEMORY.md`, and later generations use `sessionKey#N`. Overridable per member |
-| `claimTtlMs` | `3600000` | how long a message the user posted without naming anyone stays on the room's board; `0` never expires. Only the user's unaddressed messages are claimable |
+| `claimTtlMs` | `3600000` | how long a message the user posted without naming anyone stays on the room's board; `0` never expires. Only the user's unaddressed messages are claimable. Expiry stops it being offered, not being reported: an item a member read and passed on is still listed by `team board` and counted by `status` |
 | `members[].claims` | `[]` | channels where this member picks up unaddressed work. The first free claimant is offered the item; `SILENT` passes it to the next, so a pass is recorded per member, not per item |
 
 Member ids and `mention` handles share one namespace (a member's id is also

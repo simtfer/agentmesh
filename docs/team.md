@@ -288,12 +288,22 @@ Rules that keep this from becoming an inbox nobody reads:
 - **An item expires.** `claimTtlMs` (default one hour, `0` = never) marks where
   work stops being work and becomes history — last week's remark is a decision
   for the user, not a nudge for the team.
+
+  Expiring is not the same as disappearing. An item a member *read and passed
+  on* moves to an `expired` list: `team board` prints it under the live items
+  with the handles that passed, and `team status` counts it in the header
+  (`2 expired`). Nothing re-offers it and nothing assigns it — a refusal stands,
+  and re-asking a member that already said no is how a team spends its budget
+  spinning. The point is narrower: the decision you made when posting it should
+  not end in silence. An item **nobody was ever offered** — a room where no
+  member claims — is not reported at all, because nobody refused anything there.
 - **It does not wait for a quiet room.** A pulse waits for silence; a claim does
   the opposite, because the whole point is that this member is free while others
   are not.
 
-`agentmesh team board [channel]` lists what is open and who has what; the same
-data is at `GET /team/board`. Claim turns are labelled `(claimed)` in
+`agentmesh team board [channel]` lists what is open and who has what, then the
+expired items underneath; the same data is at `GET /team/board` (as `items` and
+`expired`). Claim turns are labelled `(claimed)` in
 `team transcript`, so "why did Sam answer a message that was not for him" is one
 command away. A message taken straight off the board is also the trigger of a
 turn the caller can follow — `team say --wait` waits for the claimant, not for

@@ -673,6 +673,73 @@ test("the board forgets work that is too old to be useful", () => {
   }
 });
 
+test("work the room passed on is reported after it leaves the board, not deleted with it", () => {
+  const store = new TeamStore(":memory:");
+  try {
+    const old = Date.now() - 2 * 3600_000;
+    const passed = store.createMessage({
+      channel: "general",
+      author: "user",
+      authorName: "user",
+      text: "rewrite the retry notes",
+      createdAt: old,
+    });
+    store.setClaim(passed.id, "dev", "declined");
+    store.setClaim(passed.id, "qa", "declined");
+    const recent = store.createMessage({
+      channel: "general",
+      author: "user",
+      authorName: "user",
+      text: "still recent enough to claim",
+    });
+    store.setClaim(recent.id, "dev", "declined");
+    // Somebody passed, somebody else took it and finished: that is a job done,
+    // not a job nobody wanted.
+    const finished = store.createMessage({
+      channel: "general",
+      author: "user",
+      authorName: "user",
+      text: "migration notes",
+      createdAt: old,
+    });
+    store.setClaim(finished.id, "ceo", "declined");
+    store.setClaim(finished.id, "dev", "done");
+
+    assert.equal(store.board("general", 3600_000).length, 1, "only the recent item is live work");
+    const gone = store.expiredBoard("general", 3600_000);
+    assert.deepEqual(
+      gone.map((i) => i.message.text),
+      ["rewrite the retry notes"],
+    );
+    assert.deepEqual(gone[0]!.declinedBy, ["dev", "qa"], "who read it and passed, oldest first");
+    assert.equal(gone[0]!.claimedBy, undefined, "a report, not work — nobody holds it");
+    assert.equal(store.expiredBoard(undefined, 3600_000).length, 1, "the status count matches");
+  } finally {
+    store.close();
+  }
+});
+
+test("an expiry nobody was ever offered is silence, not a refusal", () => {
+  const store = new TeamStore(":memory:");
+  try {
+    // A room where no member claims: messages expire one at a time and no
+    // member ever reads them. Reporting that as "nobody took it" would be a
+    // complaint about a feature that was never switched on.
+    store.createMessage({
+      channel: "general",
+      author: "user",
+      authorName: "user",
+      text: "nobody's queue",
+      createdAt: Date.now() - 2 * 3600_000,
+    });
+    assert.deepEqual(store.expiredBoard("general", 3600_000), []);
+    assert.equal(store.expiredBoard(undefined, 3600_000).length, 0, "the status count agrees");
+    assert.deepEqual(store.expiredBoard("general", 0), [], "a TTL of 0 never expires anything");
+  } finally {
+    store.close();
+  }
+});
+
 test("naming someone still hands them the work directly", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
   const h = makeTeam(dir, { claims: { dev: ["general"] } });
@@ -722,6 +789,15 @@ test("the HTTP API serves the team and requires a token", async () => {
       await fetch(`${server.url}/team/members/ceo/transcript?limit=5`, { headers: auth })
     ).json()) as { turns: Array<{ status: string }> };
     assert.equal(tr.turns[0]!.status, "succeeded");
+
+    // The route carries both halves of the board: live work, and what expired
+    // after somebody had already read it. A CLI that only ever saw `items`
+    // could not tell "the room is quiet" from "the room passed on your work".
+    const board = (await (
+      await fetch(`${server.url}/team/board?channel=general`, { headers: auth })
+    ).json()) as { items: unknown[]; expired: unknown[] };
+    assert.deepEqual(board.items, [], "the addressed message was answered, so nothing is open");
+    assert.deepEqual(board.expired, [], "and nothing expired either");
   } finally {
     await server.close();
     await cleanup(h, dir);
