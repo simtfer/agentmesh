@@ -6,6 +6,7 @@ an MCP client (`mcp` mode) for real orchestration.
 ## Contents
 
 - [Commands](#commands)
+- [Team commands](#team-commands)
 - [Attach a real master](#attach-a-real-master)
 - [One-shot vs resident](#one-shot-vs-resident)
 
@@ -38,11 +39,13 @@ npx tsx src/cli.ts daemon   --config agentmesh.yaml --host 127.0.0.1 --port 8790
 | `tasks` | list persisted tasks from the store |
 | `daemon` | run the Worker Daemon for cross-machine workers |
 
-**Approvals have no CLI subcommand.** A pending approval lives in the orchestrator
-that owns the running task; a second process holding the same SQLite file cannot
-answer it, so `agentmesh approve` would either lie or hang. Use the MCP surface
-(`task_approve`, or `task_pending_approvals` to list them) from the same process
-that submitted the task — that is the master agent's job.
+**Task approvals have no one-shot CLI subcommand.** A pending approval lives in
+the orchestrator that owns the running task; a second process holding the same
+SQLite file cannot answer it, so `agentmesh approve` would either lie or hang. Use
+the MCP surface (`task_approve`, or `task_pending_approvals` to list them) from the
+same process that submitted the task — that is the master agent's job. (A team is
+different: `team serve` owns the approvals, so `team approve` reaches the process
+that can actually resolve one.)
 
 ## Attach a real master
 
@@ -112,3 +115,39 @@ the changelog"*). It calls `dispatch_task`.
 This is the single most common false alarm — a task that looks "stuck" after
 `cli submit` is usually a task whose process is already gone. See
 [`troubleshooting.md`](./troubleshooting.md).
+
+## Team commands
+
+`team serve` is the resident process; every other `team` command is a client of
+its JSON API, so they can run from another terminal (or another machine, with
+`--url` and a token).
+
+```bash
+# host: owns the roster and its agent sessions
+npx tsx src/cli.ts team serve --config agentmesh.yaml --port 4317
+
+# client (default target http://127.0.0.1:4317, token from AGENTMESH_TEAM_TOKEN)
+npx tsx src/cli.ts team chat
+npx tsx src/cli.ts team say general "Ship /health this week. @ceo, take it." --wait
+npx tsx src/cli.ts team dm qa "Any risk before we ship?" --wait
+npx tsx src/cli.ts team log general --limit 20 [--follow]
+npx tsx src/cli.ts team members | channels | status
+npx tsx src/cli.ts team transcript dev --limit 5
+npx tsx src/cli.ts team approve <approvalId> allow_once
+npx tsx src/cli.ts team respond <approvalId> accept --content '{"answer":"yes"}'
+```
+
+| command | what it does |
+|---|---|
+| `serve` | load `team:`, start members lazily, serve the API; SIGINT/SIGTERM drains |
+| `chat` | interactive room: plain text goes to `#general`, `/dm <member>`, `/log`, `/status`, `/transcript` |
+| `say` / `dm` | post a message; `--wait` follows the thread until the team is quiet (or blocked on an approval) |
+| `log` | the room transcript, including system notices; `--follow` tails it |
+| `status` | per-member state, queue depth, live worker, channels, pending approvals |
+| `transcript` | one member's turns **with the task events behind them** (tool calls, waiting, failures); streamed deltas are folded into one line |
+| `approve` | resolve a permission request blocking a turn (`allow_once`, `reject_always`, …) |
+| `respond` | answer an elicitation (`accept` / `decline` / `cancel`, optional `--content` JSON) |
+
+`team chat` is the only place where the client prints a prompt, so it is the one to
+use interactively; everything else is pipe-friendly plain text. Full semantics:
+[`team.md`](./team.md).

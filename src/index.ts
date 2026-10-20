@@ -60,3 +60,23 @@ export {
   SecurityError,
 } from "./remote/security.js";
 export * as remoteProtocol from "./remote/protocol.js";
+export { Team } from "./team/team.js";
+export type { TeamOptions, PostInput } from "./team/team.js";
+export { TeamStore } from "./team/store.js";
+export { startTeamServer } from "./team/server.js";
+export type { TeamServerOptions, TeamServerHandle } from "./team/server.js";
+export { renderTurnPrompt } from "./team/prompt.js";
+export { extractHandles, resolveMentions, mentionsHuman } from "./team/mentions.js";
+export type {
+  TeamConfig,
+  TeamMemberConfig,
+  TeamChannelConfig,
+  TeamMember,
+  TeamMemberState,
+  TeamMessage,
+  TeamChannelState,
+  TeamTurn,
+  TeamTurnStatus,
+  TeamStatus,
+  TeamTranscriptEntry,
+} from "./team/types.js";

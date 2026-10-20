@@ -187,6 +187,12 @@ export class Orchestrator {
     return this.registry.get(id);
   }
 
+  /** The live worker holding a pinned conversation, if any. A team asks this to
+   *  report "this member has a running agent" between turns. */
+  getWorkerBySessionKey(sessionKey: string) {
+    return this.registry.bySessionKey(sessionKey);
+  }
+
   async spawnWorker(
     profileName: string,
     opts: { cwd?: string; worktree?: boolean; baseCommit?: string; sessionKey?: string } = {},

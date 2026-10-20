@@ -7,6 +7,8 @@
  * either, decided purely by config + how it is launched.
  */
 
+import type { TeamConfig } from "./team/types.js";
+
 export type WorkerStatus = "starting" | "idle" | "busy" | "closed" | "error";
 
 export type WorkerEventType =
@@ -123,6 +125,18 @@ export interface WorkerHandle {
 export interface MockBehavior {
   /** canned reply, or a template function of the task text */
   reply?: string;
+  /**
+   * Scripted replies, consumed one per turn by each worker; the last one
+   * repeats. Lets a test model a teammate that answers differently as a
+   * conversation develops (first assign work, then report done).
+   */
+  replies?: string[];
+  /**
+   * Split the reply into this many streaming `text` deltas instead of one.
+   * Real streaming drivers emit per-token events; modelling that lets a test
+   * assert the transcript folds deltas back into readable lines.
+   */
+  stream?: number;
   delayMs?: number;
   /** if the task contains this substring, the turn fails (for testing) */
   failOn?: string;
@@ -283,6 +297,8 @@ export interface MeshConfig {
   /** where git worktrees / session state live (default: ./.agentmesh) */
   workdir?: string;
   daemon?: DaemonSettings;
+  /** optional roster of named members that talk in channels (see docs/team.md) */
+  team?: TeamConfig;
   /**
    * Resource & recursion limits (PLAN §7). A master is itself an agent, so
    * without a cap a delegation chain (or a master↔worker loop) can recurse

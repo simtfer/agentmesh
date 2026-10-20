@@ -1,0 +1,217 @@
+# 团队：有名字的成员，共享的房间
+
+**团队（team）** 是 worker 之上的一层。worker 是执行槽位；成员是有名字、有职责、有工作区、
+有可延续的对话和记忆文件的同事。成员在房间里说话，`@提及` 就是把下一轮交给某个同事的动作。
+
+这不是「master 把任务拆成子任务」。团队层不决定谁做什么：用户点名，成员彼此点名。
+路由引擎只负责投递消息，并给对话加上边界。
+
+```
+         你
+          │  发言 / 私聊
+          ▼
+   ┌─────────────── team 进程 ──────────────────┐
+   │  频道 + 私聊（SQLite）    每个成员的收件箱   │
+   │        │                        │           │
+   │        └──── @提及 ─────────────┘           │
+   │                 │                           │
+   │      ┌──────────┼──────────┐                │
+   │      ▼          ▼          ▼                │
+   │    Mira       Sam        Lin                │
+   │  （CEO）    （工程师）   （验证）            │
+   │  会话+记忆   会话+记忆   会话+记忆           │
+   └─────────────────────────────────────────────┘
+```
+
+每个成员都是一个固定会话的 agentmesh worker：`sessionKey = team:<name>:<member id>`。
+就是这一个细节让人「持续存在」——下一轮、以及进程重启之后，恢复的是同一个 agent 会话和它的历史。
+
+## 快速开始
+
+```yaml
+# agentmesh.yaml
+workdir: .agentmesh
+
+profiles:
+  - name: claude-code
+    driver: acpx
+    agent: claude              # acpx 内置名，或自定义 command
+  - name: pi
+    driver: acpx
+    agent: pi
+
+team:
+  name: acme
+  port: 4317
+  tokenEnv: AGENTMESH_TEAM_TOKEN   # 值只放在环境变量里
+  members:
+    - id: ceo
+      name: Mira
+      role: 拆解目标、分配工作、向用户汇报
+      profile: claude-code
+      notes: 汇报要短。只在周五发布。
+    - id: dev
+      name: Sam
+      role: 工程师，写代码、修问题
+      profile: pi
+    - id: qa
+      name: Lin
+      role: 验证者，测试做出来的东西
+      profile: pi
+  channels:
+    - id: general
+      description: 全员
+    - id: ops
+      members: [ceo, qa]        # dev 在这个房间不可被点名
+```
+
+```bash
+agentmesh team serve --config agentmesh.yaml   # 常驻
+agentmesh team chat                            # 和房间对话
+```
+
+`team serve` 是长期运行的部分：agent 会话归它所有。CLI 只是它 JSON API 的客户端，
+关掉终端不会杀掉团队。
+
+## 成员名册
+
+| 键 | 含义 |
+|---|---|
+| `id` | 稳定身份；默认同时是 `@handle` |
+| `name` | 展示名，队友看到的名字 |
+| `role` | 一行职责，注入每个队友的 prompt |
+| `profile` | 这个成员由哪个 harness 运行（`claude`、`pi`、`opencode`……） |
+| `mention` | 不带 `@` 的句柄；默认等于 `id`；id 与句柄必须唯一 |
+| `cwd` | 工作区；相对 `team.cwd`，再相对 mesh 根目录 |
+| `notes` | 常驻说明，每轮前置注入 |
+
+两个成员可以共用一个 profile——会话依然独立，因为 session key 里含成员 id。
+两个成员**不能**共用句柄；团队会直接拒绝启动，而不是猜 `@dev` 指的是谁。
+
+`profile` 就是混合技术栈所在：CEO 可以是 Claude Code，工程师是 Pi，验证者是 OpenCode。
+团队层只看见「一个成员」。
+
+## 房间、私聊与提及
+
+**频道**在配置里声明。`members` 限定谁在这里可被点名；不写就是全员。点到一个不在这个房间的人，
+不会路由，频道里会出现一行系统提示（静默不投递看起来就像对方无视了请求）。
+
+**私聊**不用声明：`dm:user:<member>` 因为有人说过话而存在。用户在私聊里说话**不需要 @**——
+这个窗口里本来就只有一个人。私聊里被点名的队友会被拉进这条线，并在此后一直是参与者，
+所以一次介绍是持久的。
+
+**提及**从消息文本里解析：`@ceo`、`@dev`，大小写不敏感，支持 Unicode 字母（`@研发`）。
+邮箱形态不算提及（`a@dev.io` 不会匹配）。`@user` / `@you` / `@human` 是找人类，永不排队。
+
+成员的回复**原样**进入房间。协议就这一条：成员写的是消息，不是关于消息的汇报；聊天记录就是状态。
+
+## 轮次、调度与两道闸
+
+一条带提及的消息，会为每个被提及的成员创建一个**轮次（turn）**。一个轮次就是该成员固定会话上的
+一个 agentmesh 任务。
+
+- **同一成员串行。** 一份对话里不能交织两段 prompt，所以成员的收件箱是 FIFO，
+  上一轮结算后才开始下一轮。
+- **成员之间并行。** 不同的人可以同时干活；团队把 `limits.maxConcurrentTasks` 当作背压
+  （多出来的轮次留在名册里排队，而不是在任务调度器里被拒）。`0` 表示团队层不设上限。
+- **深度闸。** `team.maxHops`（默认 6）限制一条消息能传多远；到达上限的轮次不能再交接。
+- **线程闸。** `team.maxTurnsPerMessage`（默认 16）限制一条根消息引发的总轮次，
+  防止一次点名变成全公司风暴。
+
+两道闸都是**计数**的，撞上时会在房间里发系统消息（「not queued: @dev（hand-off depth 6 reached）」），
+而不是静默失败。
+
+每个轮次的 prompt 包含：成员身份与职责、当前房间和里面的人、最近的聊天记录、触发消息、
+成员的 `notes`，以及它 `MEMORY.md` 的内容。它还会说明回复约定——回复会原样发到房间，
+写 `@handle` 会给对方排一轮——这是成员唯一需要学会的「团队协议」。
+
+## 记忆与连续性
+
+三样东西会持久化，而且它们不是一回事：
+
+| 什么 | 在哪 | 重启后 |
+|---|---|---|
+| 对话历史 | agent 自己的 ACP 会话，按 `sessionKey` 寻址 | 会，从 harness 的会话存储恢复 |
+| 长期笔记 | `<stateDir>/members/<id>/MEMORY.md` | 会，就是普通文件 |
+| 收件箱 | `<stateDir>/team.sqlite` 的 `turns` 表 | 排队中的会；运行中的标记失败，不重放 |
+
+`MEMORY.md` 在每轮开始时读取（上限 4 KB），并把路径告诉成员，让它自己追加决策、偏好与背景。
+它就是磁盘上的普通文本：可审阅、可 diff、可手改。
+
+进程停止时**正在运行**的轮次会被标记失败，并在对应频道里说明。它不会被自动重放：
+agent 可能已经改过文件，静默重试可能把同一个改动做两遍。排队中的轮次从未开始，下次启动会继续跑。
+
+## 观察工作过程
+
+群聊不是 CEO 写的总结。每个成员的轮次都和它背后的任务事件一起存着。
+
+```bash
+agentmesh team status                     # 谁空闲 / 在跑 / 等审批
+agentmesh team log general --limit 20     # 房间记录，含系统提示
+agentmesh team transcript dev --limit 5   # dev 实际做了什么，逐轮
+agentmesh team dm qa "有风险吗？" --wait    # 私聊并等回答
+agentmesh team approve <approvalId> allow_once             # 权限请求
+agentmesh team respond <approvalId> accept --content '{}'  # elicitation 提问
+```
+
+`transcript` 展示的是每一轮的 agent 工具调用和状态事件，不只是最终文本——和任务 API 看到的是
+同一批事件，只是按成员切开了。流式 harness 每个 token 报一个事件，transcript 会把**同一流上
+连续的增量合并成一行**，并标出流名与增量数（正式回答是 `text×20`，思考过程是 `thought×33`），
+而工具调用仍是一行一个，因为每次调用都是一个独立的动作。
+
+`approve` 和 `respond` 刻意分开：权限请求是一个**决定**（`allow_once`、`reject_always`……），
+elicitation 是一个**回答**（`accept` / `decline` / `cancel` 加内容）。底层是同一个 broker，
+问题不同。
+
+| 端点 | 用途 |
+|---|---|
+| `GET /team` | 状态、成员、频道、待审批 |
+| `GET /team/channels` | 已存在的房间与私聊 |
+| `GET /team/messages?channel=&after=&limit=` | 分页记录（把 `after` 当游标） |
+| `POST /team/messages` | `{channel, text}`，或 `{to, text}` 走私聊；返回它排出的轮次 |
+| `GET /team/turns/<id>` | 单个轮次的状态——等待中的 CLI 靠它跟进 |
+| `GET /team/members/<id>/transcript?limit=` | 轮次 + 任务事件 |
+| `GET /team/approvals` · `POST /team/approvals` | 列出并处理阻塞（权限用 `decision`，elicitation 用 `action` + `content`） |
+
+API 是 JSON，且刻意做得无聊：带游标轮询。一轮团队对话可能跑几分钟，
+游标能扛住重启、断线，以及一个被关掉的 CLI。
+
+## 安全
+
+团队 API 能让 agent 在这台机器上执行工具，所以它等价于本地 shell：
+
+- 默认只绑 `127.0.0.1`；
+- 绑非 loopback 地址**必须**带 bearer token（`team.tokenEnv`，值只来自环境变量）；
+- 要出机器就自己在前面加 TLS（反向代理）——内置服务器不做 TLS 终止；
+- 每个成员的工具权限仍由它的 harness profile（`permissionMode`、harness 自身配置）决定，
+  不是团队层授予的。
+
+## 这一层的边界
+
+把话说清楚，免得期待超出实际：
+
+- **没有 GUI。** `team chat`、`team log` 和 HTTP API 就是界面。API 的形状是为了将来能在上面
+  做一个只读 Web 控制台。
+- **没有心跳。** 成员被点名或被提及时才说话，不会定时醒来汇报进度。主动行为需要一个定时的
+  「pulse」轮次和相应预算——没有做。
+- **默认共享 checkout。** 成员默认同一个 `cwd`，互相看得见文件。要隔离，就给每个成员预先建一个
+  稳定的 worktree 目录并设为 `cwd`——**不要**用 `worktree: true`，它与固定会话冲突
+  （每次 spawn 新路径会让会话静默重开）。
+- **一个进程一个团队。** 两个团队需要两个 `serve` 进程，`stateDir` 和端口都要分开。
+- **成本是真的。** 每轮都是真实 harness 上的完整 agent 轮次；成员并行会成倍花钱。
+  用 `limits.maxTotalTokens` / `maxTotalCost` 做进程级上限。
+
+## 故障对照
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| CLI 报 `401 unauthorized` | 客户端 token 缺失，或与服务端不一致 | 两边都设 `AGENTMESH_TEAM_TOKEN`（或 `--token-env NAME`） |
+| `team server returned 404: no such channel` | 频道名写错，或给不存在的成员发私聊 | `agentmesh team channels` |
+| `@某人` 之后没反应 | 对方不在这个频道，或撞上了两道闸 | 看 `team log` 里的系统提示 |
+| 某个成员一直不回 | 它的 harness 没装好/没登录 | 在团队外单独跑一次该 profile；见 `agentmesh list` |
+| 轮次失败 `session ... busy` | 残留任务还占着会话 | 团队本身按成员排队；持续出现就 `agentmesh tasks` 等它结算 |
+| 重启后出现 `interrupted` | 进程在轮次中途停了 | 重新发一次；排队中的已经自动继续 |
+
+相关：[`configuration.md`](./configuration.md)（全部配置键）、[`cli.md`](./cli.md)（命令）、
+[`verification.md`](./verification.md)（测试覆盖）、[`remote.md`](./remote.md)
+（成员跑在另一台机器上时用 `driver: remote` profile）。

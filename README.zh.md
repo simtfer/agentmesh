@@ -21,7 +21,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/simtfer/agentmesh/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](https://github.com/simtfer/agentmesh/blob/main/package.json)
 
-142 个离线测试，覆盖 Linux 与 Windows · 尚未发布到 npm
+155 个离线测试，覆盖 Linux 与 Windows · 尚未发布到 npm
 
 ## 这是什么
 
@@ -34,7 +34,8 @@
 
 它**不是**什么——免得被用到错误的场景：
 
-- **不是 agent IDE 或 GUI。** 没有桌面端、没有聊天面板、没有可视化画布。master 就是你本来在用的 agent。
+- **不是 agent IDE 或 GUI。** 没有桌面端、没有可视化画布；团队的房间是 CLI 加一个小 HTTP API。
+  master 仍是你本来在用的 agent。
 - **不是 agent 框架。** 它不定义 agent 循环、提示词格式或模型抽象；它驱动的是已经存在、且会说 ACP 的 agent。
 - **不是工作流引擎。** 任务是扁平的；`dependsOn` 把它们组成一张**静态 DAG**——无环、无条件分支、无循环、无 DSL。任务之间的*产物*传递仍然只走显式 `handoff`。
 - **不是沙箱。** 隔离靠 git worktree 加权限模式；它不做容器化，也不对 worker 进程做其他形式的限制。
@@ -105,6 +106,20 @@ queued ─▶ starting ─▶ running ─▶ succeeded
 - **worker 输出是不可信数据**，永远不是指令——包括通过 handoff 传进来的一切。
 
 完整状态转移与审批环：[`docs/lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md)（英文）。
+
+## 团队：有名字的成员
+
+**团队**把 worker 变成有名字的同事。每个成员是一个固定会话的 agent 进程，有自己的 harness profile、
+工作区和 `MEMORY.md`；成员共享房间，`@提及` 把下一轮交给某位队友。成员之间并行，单个成员串行，
+每一轮的工具调用都可查看——群聊本身就是界面，而不是它的总结。
+
+```bash
+agentmesh team serve &        # 常驻：保住名册与各自的会话
+agentmesh team chat           # 群聊、私聊、/transcript <成员>
+```
+
+名册、频道、私聊、重启恢复，以及这一层**有意不做**的事：
+[`docs/team.zh.md`](https://github.com/simtfer/agentmesh/blob/main/docs/team.zh.md)。
 
 ## 配置
 
@@ -190,6 +205,7 @@ stdio 上共 18 个工具。核心循环：
 | [`quickstart.md`](https://github.com/simtfer/agentmesh/blob/main/docs/quickstart.md) · [`quickstart.zh.md`](https://github.com/simtfer/agentmesh/blob/main/docs/quickstart.zh.md) | 十五分钟跑通 A（master）+ B（worker） |
 | [`two-host.md`](https://github.com/simtfer/agentmesh/blob/main/docs/two-host.md) · [`two-host.zh.md`](https://github.com/simtfer/agentmesh/blob/main/docs/two-host.zh.md) | A、B 两侧的完整配置与启动 |
 | [`cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md) | 命令 + 接入 OpenCode / Pi |
+| [`team.md`](https://github.com/simtfer/agentmesh/blob/main/docs/team.md) · [`team.zh.md`](https://github.com/simtfer/agentmesh/blob/main/docs/team.zh.md) | 有名字的成员、房间、@ 交接、逐成员过程 |
 | [`lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md) | 8 态机、委派方式、审批 |
 | [`mcp-tools.md`](https://github.com/simtfer/agentmesh/blob/main/docs/mcp-tools.md) | 18 个工具 + 自托管手册 |
 | [`handoff.md`](https://github.com/simtfer/agentmesh/blob/main/docs/handoff.md) | 把任务接在前驱输出上 |
@@ -207,7 +223,7 @@ stdio 上共 18 个工具。核心循环：
 
 ```bash
 npm run typecheck   # tsc --noEmit，干净
-npm test            # 142 个测试，全离线，无 API 费用，约 27 秒
+npm test            # 155 个测试，全离线，无 API 费用，约 27 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
 npm run check:pack  # 发布包里有 dist/，且不含源码与测试
@@ -215,15 +231,16 @@ npm run deploy:tls  # 在本机真实网卡上跑 TLS/mTLS（不走 loopback）
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **142/142**，分十一个文件，全离线，约 27 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。CI 在 Linux 与 Windows × Node 22 / 24 上跑同一套关卡（[`.github/workflows/ci.yml`](https://github.com/simtfer/agentmesh/blob/main/.github/workflows/ci.yml)）；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md)（英文）。
+`npm test` 为 **155/155**，分十二个文件，全离线，约 27 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。CI 在 Linux 与 Windows × Node 22 / 24 上跑同一套关卡（[`.github/workflows/ci.yml`](https://github.com/simtfer/agentmesh/blob/main/.github/workflows/ci.yml)）；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md)（英文）。
 
 ## 路线图
 
-已经可用：基于 SQLite 的异步 8 态生命周期、人在环路审批、真实 ACP worker、有界加权公平调度（含截止时间与 DAG 重试）、跨 Worker 交接（含把 diff 交给另一台机器上的 worker）、强制 JSON 契约与成本汇总、硬性花费预算、自托管委派手册，以及支持双向 TLS 的远程 daemon。
+已经可用：基于 SQLite 的异步 8 态生命周期、人在环路审批、真实 ACP worker、有界加权公平调度（含截止时间与 DAG 重试）、跨 Worker 交接（含把 diff 交给另一台机器上的 worker）、强制 JSON 契约与成本汇总、硬性花费预算、自托管委派手册、支持双向 TLS 的远程 daemon，以及团队层（有名字的成员、房间、@ 交接、逐成员过程记录）。
 
 接下来：
 
-- **可选 Web 控制台**——审计日志与 `scheduler_status` 已经提供了只读视图所需的数据。
+- **自主性与控制台**——给空闲成员一个心跳，让它们能主动汇报或认领工作；以及在团队 API
+  与审计日志之上的只读 Web 控制台。
 
 ## 贡献
 

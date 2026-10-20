@@ -5,6 +5,8 @@ import type { MeshConfig, WorkerProfile } from "./types.js";
 
 const MockBehavior = z.object({
   reply: z.string().optional(),
+  replies: z.array(z.string()).optional(),
+  stream: z.number().int().positive().optional(),
   delayMs: z.number().int().nonnegative().optional(),
   failOn: z.string().optional(),
   failFirst: z.number().int().nonnegative().optional(),
@@ -82,6 +84,44 @@ const DaemonSettings = z.object({
   auditKeep: z.number().int().nonnegative().optional(),
 });
 
+const TeamMember = z.object({
+  id: z.string().min(1),
+  name: z.string().optional(),
+  role: z.string().optional(),
+  profile: z.string().min(1),
+  mention: z.string().optional(),
+  cwd: z.string().optional(),
+  notes: z.string().optional(),
+});
+
+const TeamChannel = z.object({
+  id: z.string().min(1),
+  description: z.string().optional(),
+  members: z.array(z.string()).optional(),
+});
+
+/**
+ * A team is declared, not created at runtime: identities, harness profiles and
+ * workspaces are configuration (versionable, reviewable), while conversations
+ * and inboxes are state (in `<stateDir>/team.sqlite`). That split is what lets
+ * the same roster restart without losing what was said.
+ */
+const TeamSettings = z.object({
+  name: z.string().optional(),
+  stateDir: z.string().optional(),
+  cwd: z.string().optional(),
+  maxHops: z.number().int().positive().optional(),
+  maxTurnsPerMessage: z.number().int().positive().optional(),
+  contextMessages: z.number().int().positive().optional(),
+  maxContextChars: z.number().int().positive().optional(),
+  turnTimeoutMs: z.number().int().positive().optional(),
+  host: z.string().optional(),
+  port: z.number().int().min(0).max(65535).optional(),
+  tokenEnv: z.string().optional(),
+  members: z.array(TeamMember).min(1),
+  channels: z.array(TeamChannel).optional(),
+});
+
 const ConfigSchema = z.object({
   profiles: z.array(Profile).min(1),
   defaults: z
@@ -93,6 +133,7 @@ const ConfigSchema = z.object({
     .optional(),
   workdir: z.string().optional(),
   daemon: DaemonSettings.optional(),
+  team: TeamSettings.optional(),
   limits: z
     .object({
       maxDelegationDepth: z.number().int().nonnegative().optional(),

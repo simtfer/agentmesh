@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 142 tests, offline, ~27s
+npm test            # 155 tests, offline, ~27s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -25,7 +25,7 @@ npm run real        # real local opencode + pi workers (needs both installed & a
 npm run check:pack  # asserts the publish tarball contains dist/ and no sources
 ```
 
-`npm test` runs the eleven files below with `tsx --test`. Nothing is skipped, nothing
+`npm test` runs the twelve files below with `tsx --test`. Nothing is skipped, nothing
 is marked `todo`, and no test asserts a mock's internal calls in place of
 observable behaviour — each one drives the public surface (Orchestrator, MCP
 tools, or the daemon's HTTP/WS endpoints) and checks the resulting task record.
@@ -322,6 +322,48 @@ Loopback daemon ↔ `RemoteWorkerDriver`, over a real HTTP + WebSocket server:
 The remote *security* model (flags, deployment shape, rotation drill) is documented
 in [remote.md](remote.md#security-model); the coverage list above mirrors
 [remote.md#remote-tests](remote.md#remote-tests).
+
+## `test/team.test.ts` — 13 cases
+
+The team layer, driven end-to-end over the mock harness (deterministic, offline)
+plus a real HTTP server on an ephemeral port:
+
+- **Mention parsing.** `a@dev.io` is not a mention; `@研发` is; repeated handles
+  collapse; matching is case-insensitive.
+- **The group chain.** One user message mentioning the CEO walks CEO → engineer →
+  verifier; each reply is posted to the room, each `@mention` resolves to exactly
+  one member, and three members end up with three live workers on three pinned
+  sessions.
+- **DM privacy and pull-in.** A DM stays out of `#general`; a teammate named in a
+  DM is pulled into that thread and remains a participant; the DM never needs an
+  explicit `@` for its own partner.
+- **Serial per member, parallel across members.** Two messages to one member
+  produce non-overlapping turns (the second starts after the first ends) and one
+  worker; one message mentioning two members has both running at once.
+- **The two caps.** A CEO↔engineer ping-pong stops at `maxHops` with a system line
+  naming the cap; a three-way mention with `maxTurnsPerMessage: 1` queues only one
+  turn and says why.
+- **Restart recovery.** A queued turn survives a process stop and runs on the next
+  start; the turn that was running is reported `interrupted` in the channel and is
+  not replayed.
+- **Approvals.** A member that hits a permission request is `waiting` (not
+  running, not idle), the request is listed with its kind, and `approve` resumes
+  the turn to `succeeded` without losing the member's queue slot.
+- **Transparency.** `transcript` returns a member's turn with its task status and
+  the event log behind it (tool/output events included), and a streaming member's
+  twelve text deltas fold into one readable line while tool calls stay one per
+  line.
+- **Memory.** A `MEMORY.md` written by hand is injected into the next turn's prompt
+  together with identity and role.
+- **HTTP.** `/team` is 401 without a token and 200 with one, `/healthz` stays open,
+  `POST /team/messages` runs the chain, paged messages and the per-member
+  transcript round-trip.
+- **Roster guards.** Two members claiming the same handle abort construction
+  instead of making `@dev` ambiguous.
+
+A real-harness run (Pi as a member, two turns, same session) is **not** covered by
+the suite; the session-resume mechanism it relies on is verified separately in
+[`verification.md`](#beyond-the-unit-suite) and `test/orchestrator.test.ts`.
 
 ## `test/deploy.test.ts` — 8 cases
 

@@ -42,6 +42,7 @@ profiles:
 - [Profiles](#profiles)
 - [Limits](#limits)
 - [Daemon block](#daemon-block)
+- [Team block](#team-block)
 
 ## Top-level keys
 
@@ -52,6 +53,7 @@ profiles:
 | `defaults.cwd` | process cwd | default working directory for workers |
 | `limits` | see below | caps on depth, concurrency, queueing, output, retries, spend |
 | `profiles` | — | the workers the master may spawn |
+| `team` | — | optional roster of named members talking in rooms (see below) |
 
 `agentmesh.yaml` is validated with zod at load time: an unknown `driver`, a
 missing `remote.endpoint`, or a `daemon` block without a resolvable token env var
@@ -71,7 +73,7 @@ fails before any worker starts.
 | `command` | `acpx` | explicit argv, for an agent acpx does not know by name (pairs with a custom `agent` key) |
 | `model` | `acpx` | model id passed through to the agent |
 | `permissionMode` | `acpx` | per-profile override of `defaults.permissionMode` |
-| `mock` | `mock` | `{ delayMs, toolCalls, requireApproval, failFirst }` — deterministic offline behaviour |
+| `mock` | `mock` | `{ delayMs, toolCalls, requireApproval, failFirst, replies, stream }` — deterministic offline behaviour (`stream: n` splits the reply into n deltas, to model a streaming harness) |
 | `remote` | `remote` | `{ endpoint, tokenEnv, remoteProfile, resume, reconnectAttempts, reconnectDelayMs, ca, cert, key, connectTimeoutMs }` — see [`remote.md`](./remote.md) |
 
 Notes that save debugging time:
@@ -138,3 +140,55 @@ daemon:
 Token rotation with no downtime: list several env var names
 (`VAR_OLD,VAR_NEW`) or several comma-separated values in one variable, then send
 `SIGHUP`. Full daemon behaviour: [`remote.md`](./remote.md).
+
+## Team block
+
+Optional. Declares the roster and rooms served by `agentmesh team serve`; see
+[`team.md`](./team.md) for the mental model.
+
+```yaml
+team:
+  name: acme                   # session keys become team:acme:<member>
+  stateDir: .agentmesh/team    # default: <workdir>/team
+  cwd: /srv/repos              # default workspace for members without their own
+  host: 127.0.0.1              # non-loopback requires a token
+  port: 4317
+  tokenEnv: AGENTMESH_TEAM_TOKEN   # env var NAME; value never lives here
+  maxHops: 6                   # how far one message may be handed off
+  maxTurnsPerMessage: 16       # total turns caused by one root message
+  contextMessages: 20          # transcript lines each turn sees
+  maxContextChars: 6000        # character budget on that transcript
+  turnTimeoutMs: 900000        # per-member turn budget (15 min)
+  members:
+    - id: ceo                  # stable key, directory name and default handle
+      name: Mira
+      role: splits goals and assigns work
+      profile: claude-code     # must exist under profiles
+      mention: ceo             # optional; unique across id + mention
+      cwd: repos/acme          # optional; relative to team.cwd
+      notes: Keep updates short.
+  channels:
+    - id: general              # `#general`; the default when none are declared
+      description: the whole team
+    - id: ops
+      members: [ceo, qa]       # only these members are addressable here
+```
+
+| key | default | meaning |
+|---|---|---|
+| `name` | `team` | namespace for member session keys |
+| `stateDir` | `<workdir>/team` | `team.sqlite` plus `members/<id>/MEMORY.md` |
+| `cwd` | mesh base dir | members' workspaces resolve against it |
+| `maxHops` | `6` | hand-off depth cap; the turn at the cap cannot mention further |
+| `maxTurnsPerMessage` | `16` | per-thread turn cap, counted across members |
+| `contextMessages` / `maxContextChars` | `20` / `6000` | how much transcript a turn sees |
+| `turnTimeoutMs` | `900000` | wall clock per member turn |
+| `host` / `port` | `127.0.0.1` / `4317` | `team serve` bind |
+| `tokenEnv` | — | required off-loopback; the *name* of the env var holding the token |
+| `members[]` | — | at least one; each `profile` must resolve |
+| `channels[]` | `[general]` | rooms; `members` narrows who is addressable |
+
+Member ids and `mention` handles share one namespace (a member's id is also
+addressable), so `@dev` can never be ambiguous. A member's pinned session is
+`team:<name>:<id>`; two members may share a `profile` and still keep separate
+conversations.

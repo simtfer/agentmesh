@@ -30,7 +30,7 @@ explicit `handoff`.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/simtfer/agentmesh/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](https://github.com/simtfer/agentmesh/blob/main/package.json)
 
-142 offline tests on Linux and Windows · not published to npm yet
+155 offline tests on Linux and Windows · not published to npm yet
 
 ## What this is
 
@@ -53,8 +53,8 @@ between them.
 
 What it is **not** — so nobody adopts it for the wrong job:
 
-- **Not an agent IDE or GUI.** No desktop app, no chat pane, no visual canvas. The
-  master is the agent you already use.
+- **Not an agent IDE or GUI.** No desktop app, no visual canvas; a team's rooms are
+  a CLI and a small HTTP API. The master is still the agent you already use.
 - **Not an agent framework.** It defines no agent loop, prompt format, or model
   abstraction; it drives agents that already exist and speak ACP.
 - **Not a workflow engine.** Tasks are flat. `dependsOn` gates them into a static
@@ -140,6 +140,22 @@ queued ─▶ starting ─▶ running ─▶ succeeded
   that arrives through a handoff.
 
 Full transition rules and the approval loop: [`docs/lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md).
+
+## A team of members
+
+A **team** turns workers into named colleagues. Each member is a pinned agent
+session with its own harness profile, workspace and `MEMORY.md`; members share
+rooms where an `@mention` hands the next turn to a teammate. Members run in
+parallel, one turn at a time each, and every turn's tool calls are inspectable —
+the group chat is the interface, not a summary of it.
+
+```bash
+agentmesh team serve &        # keeps the roster and its sessions alive
+agentmesh team chat           # group chat, DMs, /transcript <member>
+```
+
+Roster, channels, DMs, recovery, and what this layer deliberately does **not** do:
+[`docs/team.md`](https://github.com/simtfer/agentmesh/blob/main/docs/team.md).
 
 ## Configuration
 
@@ -262,6 +278,7 @@ non-error symptoms (daemon 401s, TLS failures):
 | [`quickstart.md`](https://github.com/simtfer/agentmesh/blob/main/docs/quickstart.md) | master A + worker B in fifteen minutes |
 | [`two-host.md`](https://github.com/simtfer/agentmesh/blob/main/docs/two-host.md) | configuring and starting A and B, in full |
 | [`cli.md`](https://github.com/simtfer/agentmesh/blob/main/docs/cli.md) | commands + attaching OpenCode / Pi |
+| [`team.md`](https://github.com/simtfer/agentmesh/blob/main/docs/team.md) | named members, rooms, @mention hand-offs, per-member transcripts |
 | [`lifecycle.md`](https://github.com/simtfer/agentmesh/blob/main/docs/lifecycle.md) | 8 states, delegating modes, approvals |
 | [`mcp-tools.md`](https://github.com/simtfer/agentmesh/blob/main/docs/mcp-tools.md) | the 18 tools + the self-hosted playbook |
 | [`handoff.md`](https://github.com/simtfer/agentmesh/blob/main/docs/handoff.md) | chaining tasks onto a predecessor's output |
@@ -279,7 +296,7 @@ non-error symptoms (daemon 401s, TLS failures):
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 142 tests, offline, no API cost, ~27s
+npm test            # 155 tests, offline, no API cost, ~27s
 npm run demo        # Scene A + Scene B both close
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run check:pack  # publish tarball contains dist/, and no sources or tests
@@ -287,7 +304,7 @@ npm run deploy:tls  # real TLS/mTLS run over this host's LAN interface (not loop
 npm run real        # real local opencode + pi (both must be installed & authenticated)
 ```
 
-`npm test` is **142/142** across eleven files, offline, in about 27 seconds. Every
+`npm test` is **155/155** across twelve files, offline, in about 27 seconds. Every
 case drives a public surface (Orchestrator, MCP tools, or the daemon's HTTP/WS
 endpoints) and asserts the resulting task record, not a mock's internal calls.
 CI runs the same gate on Linux and Windows × Node 22 and 24
@@ -301,12 +318,13 @@ Working today: async 8-state lifecycle on SQLite, human-in-the-loop approvals,
 real ACP workers, bounded weighted-fair scheduling with deadlines and DAG retries,
 cross-worker handoff (including a diff handed to a worker on another host),
 enforced JSON contracts with cost roll-up, hard spend budgets, a self-hosted
-playbook, and a remote daemon with mutual TLS.
+playbook, a remote daemon with mutual TLS, and a team layer (named members,
+rooms, @mention hand-offs, per-member transcripts).
 
 Next:
 
-- **Optional web console** — the audit trail and `scheduler_status` already expose
-  the data a read-only view would render.
+- **Autonomy and a console** — a heartbeat so idle members can report or pick up
+  work unprompted, and a read-only web console over the team API and audit trail.
 
 ## Contributing
 

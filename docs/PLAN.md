@@ -50,8 +50,8 @@
 | CLI：demo / list / mcp / dispatch / submit / tasks / approve / daemon | ✅ 完成 | `src/cli.ts` |
 | 配置：YAML + zod 校验 | ✅ 完成 | `src/config.ts`、`agentmesh.yaml` |
 
-**验证结果**：`tsc --noEmit` 干净通过；`npm test` **142/142**（tasks(32) + handoff(12) + artifact(7) +
-paths(3) + contract(10) + dag(18) + budget(11) + remote(26) + deploy(8) + orchestrator(11) + skill(4)）；
+**验证结果**：`tsc --noEmit` 干净通过；`npm test` **155/155**（tasks(32) + handoff(12) + artifact(7) +
+paths(3) + contract(10) + dag(18) + budget(11) + remote(26) + deploy(8) + orchestrator(11) + skill(4) + team(13)）；
 （远程 daemon 支持**会话复用**：同一 `workerId` 连续 `task_submit` 复用 B 侧 agent 会话，
 `daemon.workerIdleMs` 兜底回收；**固定会话**：profile 配 `session` 或提交带 `sessionKey`，
 会话落盘、daemon 重启后同 key 恢复——已用真实 pi 验证：停 daemon 再用同 key 提交，
@@ -440,6 +440,17 @@ Stage 0–3 已落地并验证，接下来的重点从「能不能跑」转向�
       （ACP 报的是累计值，逐次相加会重复计费），越过后只拒新提交（`budget_exhausted`），**已受理的任务照常跑完**：
       取消它既找不回结果也退不了钱。`usage_summary` 增加 `budget` 段暴露余量，让 master 能在发下一批**之前**查。
     11 项新用例见 `test/budget.test.ts`（测试总数 108 → 119）。
+11. ~~**Stage 8 · 团队层**~~ ✅ 已落地：把 worker 变成有名字的成员。
+    - **成员 = 固定会话 + 工作区 + 记忆**：`sessionKey = team:<name>:<id>`，`MEMORY.md` 每轮注入；
+      进程重启后会话从 harness 的会话库恢复，排队中的轮次继续，运行中的轮次标记失败并在频道里说明（不重放）。
+    - **房间与 @ 提及**：频道声明成员范围，私聊按需出现；`@handle` 解析成轮次，回复原样入房间；
+      DM 里无需 @ 即可对 partner 说话，被点名的队友会被拉进线程并留下。
+    - **调度**：同一成员串行（一份 transcript 不能交织），成员之间并行；`maxHops` 与
+      `maxTurnsPerMessage` 两道计数闸防止互 @ 风暴，撞闸时在频道里留下系统消息。
+    - **透明与长期运行**：`team serve` 持有会话；`team status/log/transcript` 与 JSON API
+      可按成员查看工具调用与阻塞状态（流式增量合并成可读的行），`team approve` / `team respond`
+      直接解决卡住的轮次。
+    12 项新用例见 `test/team.test.ts`（测试总数 142 → 155）。
 
-> Stage 0–3 已完成并通过 119 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算）。
-> 下一步：跨物理链路实跑（DNS/路由/防火墙）、跨机交接产物传输与可选 Web 控制台。
+> Stage 0–3 已完成并通过 155 项测试（含真实 opencode/pi、loopback 远程端到端、密钥轮换、审计日志、递归守卫、资源上限、Stage 5 有界队列 + 队列 TTL/截止时间 + 加权公平、DAG 依赖与退避重试、自托管 master 技能、跨 Worker 交接 Phase 1–3：result 注入 / 脱敏 diff sidecar / 前驱末态 worktree、结构化结果契约 + token/成本汇总、远程部署补强：mTLS / 审计轮转 / 真实网卡 TLS 验证，以及花费与审批预算）。
+> 下一步：团队层的自主心跳与只读 Web 控制台、跨物理链路实跑（DNS/路由/防火墙）、跨机交接产物传输。

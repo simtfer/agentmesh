@@ -26,6 +26,8 @@ class MockWorkerHandle implements WorkerHandle {
   private cancelled = false;
   /** Running session cost, mirroring how ACP reports cost as a cumulative figure. */
   private spent = 0;
+  /** How many turns this worker has taken, for `mock.replies` scripting. */
+  private turns = 0;
   constructor(
     readonly id: string,
     readonly profile: string,
@@ -105,7 +107,12 @@ class MockWorkerHandle implements WorkerHandle {
       });
     }
 
+    const scripted = this.behavior.replies?.length
+      ? this.behavior.replies[Math.min(this.turns, this.behavior.replies.length - 1)]
+      : undefined;
+    this.turns += 1;
     const reply =
+      scripted ??
       this.behavior.reply ??
       `[${this.profileName}] done in ${this.cwd}: "${text.slice(0, 80)}${
         text.length > 80 ? "…" : ""
@@ -163,7 +170,12 @@ class MockWorkerHandle implements WorkerHandle {
       };
     }
 
-    emit({ type: "text", text: reply });
+    const deltas = Math.max(1, Math.trunc(this.behavior.stream ?? 1));
+    for (let i = 0; i < deltas; i++) {
+      const from = Math.floor((reply.length * i) / deltas);
+      const to = Math.floor((reply.length * (i + 1)) / deltas);
+      emit({ type: "text", text: reply.slice(from, to), data: { stream: "output" } });
+    }
     emit({ type: "done", text: "end_turn", data: { stopReason: "end_turn" } });
     return { status: "completed", text: reply, stopReason: "end_turn", events };
   }

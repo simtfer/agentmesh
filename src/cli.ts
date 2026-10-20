@@ -5,6 +5,7 @@ import { loadConfig, parseConfig } from "./config.js";
 import { Orchestrator } from "./orchestrator.js";
 import { runMcpServer } from "./mcp/server.js";
 import { WorkerDaemon } from "./remote/daemon.js";
+import { runTeamCommand } from "./team/cli.js";
 import type { MeshConfig, TaskEvent, PermissionDecision } from "./types.js";
 
 interface Args {
@@ -28,6 +29,11 @@ interface Args {
   tlsCa?: string;
   allowInsecure?: boolean;
   orphanGraceMs?: number;
+  url?: string;
+  limit?: number;
+  follow?: boolean;
+  wait?: boolean;
+  content?: string;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -53,6 +59,11 @@ function parseArgs(argv: string[]): Args {
       case "--tls-key": out.tlsKey = next(); break;
       case "--tls-ca": out.tlsCa = next(); break;
       case "--orphan-grace-ms": out.orphanGraceMs = Number(next()); break;
+      case "--url": out.url = next(); break;
+      case "--limit": out.limit = Number(next()); break;
+      case "--follow": out.follow = true; break;
+      case "--wait": out.wait = true; break;
+      case "--content": out.content = next(); break;
       case "--worktree": out.worktree = true; break;
       case "--allow-insecure": out.allowInsecure = true; break;
       default:
@@ -108,8 +119,23 @@ Usage:
     --orphan-grace-ms keeps a dropped task alive N ms so a client can re-attach
     and resume its stream (default 0 = cancel immediately, no orphans).
 
+  # a team of named members in shared rooms (see docs/team.md)
+  agentmesh team serve [--config f] [--host h] [--port p] [--token-env VAR]
+  agentmesh team chat                     group chat + DMs against a running team
+  agentmesh team say <channel> "text" [--wait]
+  agentmesh team dm <member> "text" [--wait]
+  agentmesh team log [channel] [--limit N] [--follow]
+  agentmesh team members | channels | status
+  agentmesh team transcript <member>       what that member actually did
+  agentmesh team approve <approvalId> <decision>
+  agentmesh team respond <approvalId> <accept|decline|cancel> [--content json]
+
 Roles are config-driven: any MCP-capable agent (opencode, pi, ...) can be the
 master; workers are driven over ACP via acpx, locally or on a remote daemon.
+
+A team runs on top of those workers: each member is a pinned worker session
+with its own workspace and memory, and @mentions in a channel are what hand a
+turn from one member to the next.
 `;
 
 const traceLine = (id: string, ev: TaskEvent) => {
@@ -293,6 +319,22 @@ async function main(): Promise<void> {
     case "tasks": return cmdTasks(args);
     case "mcp": return cmdMcp(args);
     case "daemon": return cmdDaemon(args);
+    case "team":
+      return runTeamCommand(
+        {
+          sub: args._[1],
+          rest: args._.slice(2),
+          url: args.url,
+          tokenEnv: args.tokenEnv,
+          limit: args.limit,
+          follow: args.follow,
+          wait: args.wait,
+          host: args.host,
+          port: args.port,
+          content: args.content,
+        },
+        () => resolveConfig(args),
+      );
     case undefined: case "help": case "--help":
       process.stdout.write(HELP); return;
     default:

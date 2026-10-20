@@ -174,3 +174,26 @@ profiles:
 #                                       # default: <workdir>/daemon-audit.ndjson; "" disables
 #   auditMaxBytes: 10485760             # rotate the audit file at 10 MiB (0 = never)
 #   auditKeep: 5                        # keep 5 archives: .1 = newest, .5 = oldest
+
+# --- Team (optional) ---------------------------------------------------------
+# Named members in shared rooms. Each member is a pinned agent session with its
+# own workspace and MEMORY.md; an @mention hands the next turn to a teammate.
+# Run `agentmesh team serve` (docs/team.md), then talk with `agentmesh team chat`.
+#
+# team:
+#   name: acme
+#   port: 4317
+#   tokenEnv: AGENTMESH_TEAM_TOKEN      # env var NAME; the value stays in the env
+#   members:
+#     - id: ceo
+#       name: Mira
+#       role: splits goals, assigns work, reports to the user
+#       profile: pi
+#       notes: Keep updates short.
+#     - id: dev
+#       name: Sam
+#       role: engineer, writes and fixes code
+#       profile: opencode
+#   channels:
+#     - id: general
+#       description: the whole team
