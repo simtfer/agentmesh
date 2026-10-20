@@ -49,6 +49,12 @@ export interface TeamMemberConfig {
   notes?: string;
   /** let this member speak unprompted; omitted = it only answers */
   pulse?: TeamPulseConfig;
+  /**
+   * Rooms where this member picks up work nobody was given. A message the user
+   * posts without naming anyone is not a dead end any more: it goes on the
+   * room's board, and the first free claimant is offered it.
+   */
+  claims?: string[];
   /** rotate this member's harness session after N turns; omitted = team default, else never */
   sessionTurns?: number;
 }
@@ -90,6 +96,12 @@ export interface TeamConfig {
   /** env var NAME holding the API bearer token; the value never lives in config */
   tokenEnv?: string;
   /**
+   * How long an unaddressed message stays on the board (default one hour).
+   * There is no point offering yesterday's remark to whoever happens to be
+   * free today; `0` disables expiry.
+   */
+  claimTtlMs?: number;
+  /**
    * Default session lifespan for members that do not set their own. A harness
    * session is unbounded by default: every turn re-sends the whole conversation,
    * so a member that has been at work since morning pays for the morning on
@@ -121,6 +133,8 @@ export interface TeamMember {
   notes?: string;
   /** resolved pulse settings; absent = this member only answers */
   pulse?: { everyMs: number; idleOnly: boolean; channel: string };
+  /** rooms this member picks up unaddressed work in (empty = never) */
+  claims: string[];
   /**
    * Turns one harness conversation may serve before the member is moved to a
    * fresh one (absent = never). `sessionKey` stays the base key; later
@@ -168,9 +182,10 @@ export type TeamTurnStatus =
 
 /**
  * Why a turn exists. `message` answers something someone said; `pulse` is the
- * member waking up on its own schedule, with nothing to answer.
+ * member waking up on its own schedule, with nothing to answer; `claim` is the
+ * member picking up a message nobody was addressed in.
  */
-export type TeamTurnKind = "message" | "pulse";
+export type TeamTurnKind = "message" | "pulse" | "claim";
 
 /**
  * One member working on one message. A turn is the unit that maps onto an
@@ -236,8 +251,22 @@ export interface TeamStatus {
   queued: number;
   running: number;
   waiting: number;
+  /** unaddressed messages still waiting on the board */
+  unclaimed: number;
   maxHops: number;
   maxTurnsPerMessage: number;
+}
+
+/**
+ * One thing on a room's board: a message the user posted without addressing
+ * anybody. It is work looking for an owner rather than a dead end.
+ */
+export interface TeamBoardItem {
+  message: TeamMessage;
+  /** the member working on it now; absent = still open */
+  claimedBy?: string;
+  /** members that read it and passed, so it is not offered to them again */
+  declinedBy: string[];
 }
 
 /** A member's turn plus the task events behind it (the transparency view). */

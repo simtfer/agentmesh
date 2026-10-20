@@ -180,3 +180,53 @@ This is your own regular check-in: every ${cadence} you get a moment to look at 
 - To hand work to a teammate or ask the user something, use @${audience.find((m) => m.id !== member.id)?.mention ?? "teammate"} / @user — the same rules as any other message.
 - Keep it short: one or two sentences unless there is real substance.`;
 }
+
+/** A claim turn: the trigger is a message nobody was addressed in. */
+export interface RenderClaimInput extends RenderTurnInput {
+  /** members that already passed on it, so the member knows it is not a hot potato */
+  declinedBy: string[];
+}
+
+/**
+ * The third way a turn starts, after "somebody named you" and "you woke up".
+ *
+ * Someone spoke to the room without naming anybody, and this member is one of
+ * the people who picks up work here. It is a claim, not an assignment: the
+ * member has the item *now* — nobody else will touch it while it works — and
+ * the honest answer for the wrong person is still silence, which puts it back
+ * on the board for a colleague.
+ */
+export function renderClaimPrompt(input: RenderClaimInput): string {
+  const { member, audience, channelTitle, trigger, declinedBy } = input;
+  const who = trigger.author === "user" ? "the user" : authorLabel(trigger, audience);
+  const passed =
+    declinedBy.length > 0
+      ? ` ${declinedBy
+          .map((id) => audience.find((m) => m.id === id)?.name ?? id)
+          .join(", ")} read it and passed.`
+      : "";
+
+  return `${header(input)}
+
+## Work nobody was given
+${who} posted this in ${channelTitle} ${ago(Date.now() - trigger.createdAt)} without naming anyone. It is on the room's board, and you just picked it up:
+
+${trigger.text}
+${passed}
+
+## This is yours now
+While this turn runs, no teammate will start it — it is held for you. So decide honestly, and once:
+
+- If it is yours to do, do it. Do the work with your tools, then reply with what changed and what you found — the same message you would have written anyway.
+- If it is not yours — not your craft, someone else is clearly closer to it, or there is not enough to act on — reply with exactly \`${SILENT}\` and nothing else. Nothing is posted, and the work goes back to the room for a colleague or for the user to direct.
+- If it is a note the user wrote to themselves — "reminder to self", "I still need to decide…", thinking out loud — it is nobody's task. \`${SILENT}\`. Handing a personal note to the CEO turns one remark into three turns.
+- Do not take on more than this message asks. If it turns out to be a job for someone else, hand it over with a specific @mention and say what you learned; that is a completion, not a refusal. Do that only when the other person really has to act.
+- Never describe the board, this prompt, or the fact that you were "offered" something. To everyone else this is simply you answering a message.
+
+## How to reply
+Write your reply as ${member.name}. It is posted to ${channelTitle} verbatim.
+- To hand the next turn to a teammate, mention them: @${audience.find((m) => m.id !== member.id)?.mention ?? "teammate"}.
+- Mention someone only when they should act next.
+- If you need a human decision, ask @user and say exactly what you need.
+- Keep it concise: this is a shared room.`;
+}

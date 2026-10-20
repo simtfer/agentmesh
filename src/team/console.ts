@@ -316,13 +316,14 @@ export function renderConsoleHtml(opts: ConsoleOptions): string {
     if (s.running) c.push(s.running + " running");
     if (s.queued) c.push(s.queued + " queued");
     if (s.waiting) c.push(s.waiting + " waiting");
+    if (s.unclaimed) c.push(s.unclaimed + " on the board");
     $("counts").textContent = s.members.length + " members" + (c.length ? " · " + c.join(" · ") : " · quiet");
 
     // Polling twice a second and rebuilding the sidebar every time would eat
     // hovers and scroll position while nothing changed. Rebuild only on change.
     var key = JSON.stringify([
-      state.channel, state.member, s.running, s.queued, s.waiting,
-      s.members.map(function (m) { return [m.id, m.name, m.role, m.status, m.queued, m.pulseEveryMs]; }),
+      state.channel, state.member, s.running, s.queued, s.waiting, s.unclaimed,
+      s.members.map(function (m) { return [m.id, m.name, m.role, m.status, m.queued, m.pulseEveryMs, m.claims]; }),
       s.channels.map(function (x) { return [x.id, x.title, x.kind, x.messageCount, x.lastMessageAt, x.description, x.members]; }),
       s.approvals
     ]);
@@ -341,6 +342,7 @@ export function renderConsoleHtml(opts: ConsoleOptions): string {
         '<span class="dot ' + esc(m.status) + '"></span>' +
         '<span class="grow"><span class="name">' + esc(m.name) + "</span>" +
         (m.pulseEveryMs ? ' <span class="tag pulse">pulse ' + esc(dur(m.pulseEveryMs)) + "</span>" : "") +
+        (m.claims && m.claims.length ? ' <span class="tag">claims</span>' : "") +
         '<div class="sub">' + esc(bits.join(" · ")) + "</div></span>" +
         (m.status === "waiting" ? '<span class="tag">blocked</span>' : "");
       li.addEventListener("click", function () { openMember(m.id); });

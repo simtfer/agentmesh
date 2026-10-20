@@ -5,8 +5,9 @@ import type { TaskEvent, TaskRecord } from "../types.js";
 import { isTerminal } from "../statemachine.js";
 import { TeamStore } from "./store.js";
 import { extractHandles, resolveMentions } from "./mentions.js";
-import { renderPulsePrompt, renderTurnPrompt, SILENT } from "./prompt.js";
+import { renderClaimPrompt, renderPulsePrompt, renderTurnPrompt, SILENT } from "./prompt.js";
 import type {
+  TeamBoardItem,
   TeamChannelConfig,
   TeamChannelState,
   TeamConfig,
@@ -93,6 +94,8 @@ export class Team {
   readonly maxHops: number;
   readonly maxTurnsPerMessage: number;
   readonly turnTimeoutMs: number;
+  /** how long an unaddressed message stays claimable (0 = forever) */
+  readonly claimTtlMs: number;
 
   private readonly orch: Orchestrator;
   private readonly store: TeamStore;
@@ -115,6 +118,7 @@ export class Team {
     this.contextMessages = Math.max(1, Math.trunc(cfg.contextMessages ?? 20));
     this.maxContextChars = Math.max(1000, Math.trunc(cfg.maxContextChars ?? 6000));
     this.turnTimeoutMs = Math.max(1000, Math.trunc(cfg.turnTimeoutMs ?? 15 * 60_000));
+    this.claimTtlMs = Math.max(0, Math.trunc(cfg.claimTtlMs ?? 60 * 60_000));
 
     const baseCwd = path.resolve(opts.baseCwd ?? process.cwd());
     this.stateDir = path.resolve(opts.stateDir ?? cfg.stateDir ?? path.join(this.orch.workdir, "team"));
@@ -159,6 +163,7 @@ export class Team {
         sessionKey: `team:${this.name}:${m.id}`,
         memoryFile: path.join(this.stateDir, "members", m.id, "MEMORY.md"),
         ...(m.notes ? { notes: m.notes } : {}),
+        claims: [...new Set(m.claims ?? [])],
         ...(sessionTurns ? { sessionTurns: Math.max(1, Math.trunc(sessionTurns)) } : {}),
         ...(m.pulse
           ? {
@@ -210,6 +215,25 @@ export class Team {
       m.pulse.channel = room.id;
     }
 
+    // Same reasoning for claims: taking work out of a room you are not in is a
+    // typo in the roster, not something to discover when a message lands.
+    for (const m of this.members) {
+      for (const channelId of m.claims) {
+        const room = this.channelConfigs.find((c) => c.id === channelId);
+        if (!room) {
+          throw new Error(
+            `team member "${m.id}" claims work in "${channelId}", which is not a channel; ` +
+              `channels: ${this.channelConfigs.map((c) => c.id).join(", ")}`,
+          );
+        }
+        if (room.members && !room.members.includes(m.id)) {
+          throw new Error(
+            `team member "${m.id}" claims work in "${channelId}" but is not a member of it`,
+          );
+        }
+      }
+    }
+
     this.store = new TeamStore(
       opts.persist === false ? ":memory:" : path.join(this.stateDir, "team.sqlite"),
     );
@@ -224,6 +248,15 @@ export class Team {
     for (const t of interrupted) {
       const member = this.member(t.memberId);
       if (!member) continue;
+      // A claim held by a process that died would otherwise stay taken forever:
+      // invisible on the board, offered to nobody. Give it back to the room.
+      if (t.kind === "claim" && t.messageId) {
+        try {
+          this.store.setClaim(t.messageId, t.memberId, "dropped");
+        } catch {
+          /* the row is already the best we can do */
+        }
+      }
       this.store.createMessage({
         channel: t.channel,
         author: "system",
@@ -320,9 +353,20 @@ export class Team {
       queued: counts.queued,
       running: counts.running,
       waiting: counts.waiting,
+      unclaimed: this.store.unclaimedCount(this.claimTtlMs),
       maxHops: this.maxHops,
       maxTurnsPerMessage: this.maxTurnsPerMessage,
     };
+  }
+
+  /**
+   * What is waiting for an owner in a room. Open items have no `claimedBy`;
+   * everything else is somebody's work in progress. `declinedBy` is not
+   * gossip: it is why the item will not come back to that member.
+   */
+  board(channel = "general"): TeamBoardItem[] {
+    this.channelState(channel); // validate
+    return this.store.board(channel, this.claimTtlMs);
   }
 
   /**
@@ -471,18 +515,35 @@ export class Team {
     if (kind === "system") return { message: msg, turns: [] };
 
     const turns = this.route(msg, channel, resolved.unknown);
-    // A user message that addresses nobody is a dead end; say so once rather than
-    // letting it look like the team ignored them.
-    if (author === "user" && mentions.length === 0 && channel.kind === "channel" && channel.members.length > 1) {
-      this.systemMessage(
-        channel.id,
-        `nobody was addressed — mention someone (@${channel.members
-          .slice(0, 3)
-          .map((m) => m.mention)
-          .join(", @")}${channel.members.length > 3 ? ", …" : ""}) or @all.`,
-      );
+    // A message that addresses nobody is either handed to the room's board or a
+    // dead end. Which one it is depends on whether anyone picks up work here,
+    // and the user should be able to tell the difference without reading docs.
+    let claimed: TeamTurn[] = [];
+    if (author === "user" && mentions.length === 0 && channel.kind === "channel") {
+      if (this.claimantsIn(channel).length > 0) {
+        // Offer it here rather than waiting for the pump, so `--wait` can follow
+        // the turn this very message caused.
+        claimed = this.offerClaims(channel.id);
+        // Silence is only confusing when nobody was free to take it.
+        if (claimed.length === 0) {
+          this.systemMessage(
+            channel.id,
+            `nobody was named, so this is on the board — ${this.claimantsIn(channel)
+              .map((m) => m.name)
+              .join(", ")} pick up unaddressed work in ${channel.title}, when free.`,
+          );
+        }
+      } else if (channel.members.length > 1) {
+        this.systemMessage(
+          channel.id,
+          `nobody was addressed — mention someone (@${channel.members
+            .slice(0, 3)
+            .map((m) => m.mention)
+            .join(", @")}${channel.members.length > 3 ? ", …" : ""}) or @all.`,
+        );
+      }
     }
-    return { message: msg, turns };
+    return { message: msg, turns: [...turns, ...claimed] };
   }
 
   /** Start (or continue) a private thread with one member. */
@@ -577,6 +638,68 @@ export class Team {
 
   /* ---------------------------- scheduling ---------------------------- */
 
+  /** Members that pick up unaddressed work in this room. */
+  private claimantsIn(channel: ResolvedChannel): TeamMember[] {
+    if (channel.kind !== "channel") return [];
+    return channel.members.filter((m) => m.claims.includes(channel.id));
+  }
+
+  /**
+   * Offer unclaimed work to the members who want it.
+   *
+   * There is no dispatcher and no assignment: the board is the queue and the
+   * pull is the member's own. Two rules keep it from becoming a scrum —
+   * whoever has been quiet longest is asked first (so the same helpful
+   * colleague does not end up with every job), and an item somebody already
+   * passed on is never offered to them again. Claiming is atomic in the store,
+   * so two members waking together cannot both take the same message.
+   */
+  private offerClaims(only?: string): TeamTurn[] {
+    if (this.closed) return [];
+    const rooms = only
+      ? [this.channelState(only)]
+      : this.channelConfigs.map((c) => this.channelState(c.id));
+    const lastSpoke = this.store.memberLastSpoke();
+    const offered: TeamTurn[] = [];
+
+    for (const room of rooms) {
+      const claimants = this.claimantsIn(room);
+      if (claimants.length === 0) continue;
+      const open = this.store.board(room.id, this.claimTtlMs).filter((item) => !item.claimedBy);
+      if (open.length === 0) continue;
+      const ordered = [...claimants].sort(
+        (a, b) => (lastSpoke.get(a.id) ?? 0) - (lastSpoke.get(b.id) ?? 0),
+      );
+
+      for (const member of ordered) {
+        // One turn at a time per member is the team's oldest rule: a transcript
+        // must not interleave. Work goes to someone who is actually free.
+        if (this.running.has(member.id) || this.store.countQueued(member.id) > 0) continue;
+        const item = open.find((i) => !i.declinedBy.includes(member.id));
+        if (!item) continue;
+        if (!this.store.claimFor(item.message.id, member.id)) continue;
+        try {
+          const turn = this.store.createTurn({
+            memberId: member.id,
+            channel: room.id,
+            messageId: item.message.id,
+            rootId: item.message.rootId,
+            hops: item.message.hops,
+            kind: "claim",
+          });
+          this.store.attachClaimTurn(item.message.id, member.id, turn.id);
+          offered.push(turn);
+        } catch {
+          // Leave the item where we found it rather than holding it for a turn
+          // that will never exist.
+          this.store.setClaim(item.message.id, member.id, "dropped");
+        }
+      }
+    }
+    if (offered.length > 0) this.schedulePump();
+    return offered;
+  }
+
   /**
    * Timers, one per member that opted in. They are deliberately unref'd: a
    * pulse must never be the reason a process stays alive, and a team that
@@ -643,6 +766,10 @@ export class Team {
    */
   private pump(): void {
     if (this.closed) return;
+    // Claims first: a message nobody was given is work waiting for a free pair
+    // of hands, and offering it here means the same pump that notices an idle
+    // member also starts it.
+    this.offerClaims();
     const cap = this.orch.config.limits?.maxConcurrentTasks ?? 0;
     for (const member of this.members) {
       if (this.running.has(member.id)) continue;
@@ -699,6 +826,7 @@ export class Team {
   private async runTurn(turn: TeamTurn, member: TeamMember): Promise<void> {
     const channel = this.channelState(turn.channel);
     const pulse = turn.kind === "pulse";
+    const claim = turn.kind === "claim";
     const trigger = turn.messageId ? this.store.getMessage(turn.messageId) : undefined;
     let final: TaskRecord | undefined;
     let taskId: string | undefined;
@@ -724,7 +852,9 @@ export class Team {
       const prompt =
         pulse || !trigger
           ? this.buildPulsePrompt(member, channel)
-          : this.buildPrompt(member, channel, trigger);
+          : claim
+            ? this.buildClaimPrompt(member, channel, trigger)
+            : this.buildPrompt(member, channel, trigger);
       const submitted = this.orch.submitTask({
         prompt,
         profile: member.profile,
@@ -779,7 +909,14 @@ export class Team {
       // A pulse that has nothing to say posts nothing at all. Not even a system
       // line: the room did not ask, so "checked, nothing new" is noise by
       // definition (and the turn is still visible in the member's transcript).
-      if (pulse && (text.length === 0 || isSilent(text))) return;
+      if ((pulse || claim) && (text.length === 0 || isSilent(text))) {
+        // The same gesture means two different things. For a pulse it is "I have
+        // nothing to add"; for a claim it is "this is not mine" — so the item
+        // goes back to the room, minus this member.
+        if (claim) this.markClaim(turn, "declined");
+        return;
+      }
+      if (claim) this.markClaim(turn, "done");
       if (text.length === 0) {
         this.systemMessage(
           channel.id,
@@ -812,6 +949,9 @@ export class Team {
         endedAt: Date.now(),
         error: `${code}: ${detail}`,
       });
+      // A claim that could not be worked goes back to the board for a
+      // colleague. A failed turn is not a decision about the work itself.
+      if (claim) this.markClaim(turn, "dropped");
       this.systemMessage(
         channel.id,
         `${member.name}'s turn ${final.status === "cancelled" ? "was cancelled" : "failed"} (${code}). ${detail}`,
@@ -851,7 +991,22 @@ export class Team {
 
   private failTurn(turn: TeamTurn, member: TeamMember, channel: ResolvedChannel, message: string): void {
     this.patchTurn(turn.id, { status: "failed", endedAt: Date.now(), error: message });
+    if (turn.kind === "claim") this.markClaim(turn, "dropped");
     this.systemMessage(channel.id, `${member.name}'s turn could not start: ${message}`);
+  }
+
+  /**
+   * Record how a claim ended. `done` keeps the message off the board for good;
+   * `declined`/`dropped` only stop *this* member being offered it again, so the
+   * work returns to the room instead of dying with one refusal or one crash.
+   */
+  private markClaim(turn: TeamTurn, decision: "done" | "declined" | "dropped"): void {
+    if (turn.kind !== "claim" || !turn.messageId) return;
+    try {
+      this.store.setClaim(turn.messageId, turn.memberId, decision);
+    } catch {
+      // shutting down
+    }
   }
 
   private finish(memberId: string, turnId: string): void {
@@ -923,6 +1078,35 @@ export class Team {
       maxContextChars: this.maxContextChars,
       everyMs: member.pulse?.everyMs ?? MIN_PULSE_MS,
       lastActivityAt: recent.length > 0 ? recent[recent.length - 1]!.createdAt : 0,
+    });
+  }
+
+  /**
+   * A claim prompt has a trigger, but nobody was named in it: the member is
+   * reading something posted to the room and deciding whether it is theirs.
+   * `declinedBy` is passed so the member can see it is not the first to look.
+   */
+  private buildClaimPrompt(
+    member: TeamMember,
+    channel: ResolvedChannel,
+    trigger: TeamMessage,
+  ): string {
+    const history = this.store
+      .listMessages(channel.id, this.contextMessages, 0)
+      .filter((m) => m.seq < trigger.seq);
+    const item = this.store.board(channel.id, this.claimTtlMs).find((i) => i.message.id === trigger.id);
+    return renderClaimPrompt({
+      teamName: this.name,
+      member,
+      channelId: channel.id,
+      channelTitle: channel.title,
+      ...(channel.description ? { channelDescription: channel.description } : {}),
+      audience: channel.members,
+      transcript: history,
+      trigger,
+      declinedBy: item?.declinedBy ?? [],
+      memory: this.readMemory(member),
+      maxContextChars: this.maxContextChars,
     });
   }
 
@@ -1052,6 +1236,8 @@ export class Team {
     for (let i = 0; i < 40 && this.running.size > 0; i++) await sleep(25);
     for (const turnId of this.running.values()) {
       try {
+        const turn = this.store.getTurn(turnId);
+        if (turn?.kind === "claim") this.markClaim(turn, "dropped");
         this.store.patchTurn(turnId, {
           status: "failed",
           endedAt: Date.now(),

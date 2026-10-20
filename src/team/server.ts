@@ -165,6 +165,14 @@ export async function startTeamServer(opts: TeamServerOptions): Promise<TeamServ
       return;
     }
 
+    // The board: work nobody was given. Read-only — claiming happens when a
+    // member picks it up, not when a client asks.
+    if (path === "/team/board" && method === "GET") {
+      const channel = url.searchParams.get("channel") ?? "general";
+      send(res, 200, { channel, items: team.board(channel) });
+      return;
+    }
+
     if (path === "/team/messages" && method === "GET") {
       const channel = url.searchParams.get("channel") ?? "general";
       send(res, 200, {

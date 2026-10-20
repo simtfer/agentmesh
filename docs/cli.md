@@ -132,6 +132,7 @@ npx tsx src/cli.ts team say general "Ship /health this week. @ceo, take it." --w
 npx tsx src/cli.ts team dm qa "Any risk before we ship?" --wait
 npx tsx src/cli.ts team log general --limit 20 [--follow]
 npx tsx src/cli.ts team members | channels | status
+npx tsx src/cli.ts team board [channel]      # work nobody was named in
 npx tsx src/cli.ts team transcript dev --limit 5
 npx tsx src/cli.ts team pulse ceo            # wake one member now (same guards as its timer)
 npx tsx src/cli.ts team approve <approvalId> allow_once
@@ -144,7 +145,8 @@ npx tsx src/cli.ts team respond <approvalId> accept --content '{"answer":"yes"}'
 | `chat` | interactive room: plain text goes to `#general`, `/dm <member>`, `/log`, `/status`, `/transcript` |
 | `say` / `dm` | post a message; `--wait` follows the thread until the team is quiet (or blocked on an approval) |
 | `log` | the room transcript, including system notices; `--follow` tails it |
-| `status` | per-member state, queue depth, live worker, channels, pending approvals |
+| `status` | per-member state, queue depth, live worker, channels, pending approvals, and how much is waiting on the board |
+| `board` | messages the user posted without naming anyone: who has what, what is still open, who passed, and how old it is |
 | `transcript` | one member's turns **with the task events behind them** (tool calls, waiting, failures); streamed deltas are folded into one line |
 | `pulse` | wake one member by hand; refuses (and says so) while the room is busy |
 | `approve` | resolve a permission request blocking a turn (`allow_once`, `reject_always`, …) |

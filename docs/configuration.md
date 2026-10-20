@@ -160,6 +160,7 @@ team:
   maxContextChars: 6000        # character budget on that transcript
   turnTimeoutMs: 900000        # per-member turn budget (15 min)
   sessionTurns: 40             # default: rotate every member's session after 40 turns
+  claimTtlMs: 3600000          # how long an unaddressed message stays claimable
   members:
     - id: ceo                  # stable key, directory name and default handle
       name: Mira
@@ -170,6 +171,7 @@ team:
       notes: Keep updates short.
       pulse: { everyMs: 600000, idleOnly: true }   # optional: speak unprompted
       sessionTurns: 20         # optional per-member override of the team value
+      claims: [general]        # optional: pick up messages nobody was named in
   channels:
     - id: general              # `#general`; the default when none are declared
       description: the whole team
@@ -192,6 +194,8 @@ team:
 | `channels[]` | `[general]` | rooms; `members` narrows who is addressable |
 | `members[].pulse` | off | `{ everyMs, idleOnly, channel }` — wake this member on its own schedule; `SILENT` posts nothing, `idleOnly` (default `true`) only fires when the team is quiet, and `channel` defaults to `general`. Each pulse is a paid turn |
 | `sessionTurns` / `members[].sessionTurns` | off | rotate the harness conversation after N turns; the member keeps its identity, workspace and `MEMORY.md`, and later generations use `sessionKey#N`. Overridable per member |
+| `claimTtlMs` | `3600000` | how long a message the user posted without naming anyone stays on the room's board; `0` never expires. Only the user's unaddressed messages are claimable |
+| `members[].claims` | `[]` | channels where this member picks up unaddressed work. The first free claimant is offered the item; `SILENT` passes it to the next, so a pass is recorded per member, not per item |
 
 Member ids and `mention` handles share one namespace (a member's id is also
 addressable), so `@dev` can never be ambiguous. A member's pinned session is

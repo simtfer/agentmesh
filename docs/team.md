@@ -249,6 +249,71 @@ Wake one member by hand with `agentmesh team pulse <member>` (same guards: if th
 room is busy, it stays asleep and says so). `team status` marks who wakes on their
 own, and `team transcript` labels those turns `(pulse)`.
 
+## The board
+
+A message that mentions nobody used to be a dead end: the team said "nobody was
+addressed" and the work sat there. It is really work looking for an owner, so a
+member can opt into picking it up.
+
+```yaml
+team:
+  claimTtlMs: 3600000        # how long an unaddressed message stays claimable
+  members:
+    - id: dev
+      name: Sam
+      profile: pi
+      claims: [general]      # pick up messages nobody was named in
+```
+
+Post to `#general` without a handle and the message goes on the room's **board**.
+The first free claimant is offered it: a normal turn whose trigger is that
+message, told plainly that nobody named it and that the work is held for it while
+it decides. Three outcomes, three meanings:
+
+- **It does the work.** The reply is posted like any other message and the item
+  leaves the board.
+- **It replies `SILENT`.** Nothing is posted, and the item goes to the next
+  claimant — passing is a fact about that member, not a verdict on the work.
+- **The turn fails.** Same as silence: the work returns to the room.
+
+Rules that keep this from becoming an inbox nobody reads:
+
+- **Only the user's unaddressed messages go on the board.** Members report and
+  chat without mentioning anybody all the time; that is conversation, not work.
+- **One owner at a time, decided in SQLite.** Claiming is one `BEGIN IMMEDIATE`
+  transaction, so two members waking at the same moment cannot both take the same
+  item; everybody else simply looks at the next one.
+- **Whoever has been quiet longest is asked first**, so the same helpful
+  colleague does not end up with every job.
+- **An item expires.** `claimTtlMs` (default one hour, `0` = never) marks where
+  work stops being work and becomes history — last week's remark is a decision
+  for the user, not a nudge for the team.
+- **It does not wait for a quiet room.** A pulse waits for silence; a claim does
+  the opposite, because the whole point is that this member is free while others
+  are not.
+
+`agentmesh team board [channel]` lists what is open and who has what; the same
+data is at `GET /team/board`. Claim turns are labelled `(claimed)` in
+`team transcript`, so "why did Sam answer a message that was not for him" is one
+command away. A message taken straight off the board is also the trigger of a
+turn the caller can follow — `team say --wait` waits for the claimant, not for
+silence.
+
+**A one-person room never uses the board.** With nobody else to name, a user
+message there is addressed to that member implicitly, so the claim path only
+starts once a room has two or more members.
+
+**Asking for silence is not the same as getting it.** The prompt gives the member
+a way out (`SILENT`), but a helpful model would rather route the work than drop
+it. In a real pi run, the message *"Reminder to myself: I still need to decide
+the enterprise pricing before Thursday"* was claimed, handed to the CEO, answered
+again by the engineer after the CEO said "no action needed from @dev", and cost
+three turns before the room went quiet — one remark, three bills. Saying in the
+claim prompt that a note the user wrote to themselves is nobody's task brought
+the same message down to one turn and zero messages, with the item still open on
+the board. `claims` is a routing hint, not a filter: if a room must stay quiet,
+address the person you mean.
+
 ## Watching the work
 
 The group chat is not a summary written by the CEO. Every member's turns are
@@ -333,9 +398,9 @@ Honest boundaries, so nobody expects more than is there:
   `/` are the interface. The page shows the room and the turns behind each message;
   it cannot post, approve, or wake anyone — that stays in the CLI.
 - **Proactivity has to be switched on.** By default a member still only speaks when
-  addressed or mentioned. `pulse` lets one wake on a timer, but every wake-up is a
-  real billed turn. What is *not* built is a member claiming work off a queue by
-  itself — the room is the queue.
+  addressed or mentioned. `pulse` lets one wake on a timer, and `claims` lets it
+  pick up messages nobody was named in — but both are configuration, and every
+  turn either one causes is a real billed turn.
 - **A shared checkout, by default.** Members default to the same `cwd`, so they see
   each other's files. For isolated trees, create one stable worktree directory per
   member and set it as `cwd` — do **not** use `worktree: true`, which is refused
@@ -355,6 +420,7 @@ Honest boundaries, so nobody expects more than is there:
 | `team server returned 404: no such channel` | typo, or a DM for an unknown member | `agentmesh team channels` |
 | nothing happens after `@someone` | they are not in that channel, or both caps were hit | check the system line in `team log` |
 | a member never answers | its harness is not installed/authenticated | run that profile once outside the team; see `agentmesh list` |
+| a member answers a message nobody addressed to it | it has `claims` on that channel, so unaddressed messages are offered to it | `team board` shows what it took; remove the channel from `claims` to stop it |
 | a turn failed with `session ... busy` | a leftover task still holds the session | the team queues per member; if it persists, `agentmesh tasks` and let it settle |
 | `interrupted` after a restart | the process stopped mid-turn | send the message again; queued work already resumed |
 

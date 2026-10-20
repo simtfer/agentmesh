@@ -17,7 +17,7 @@ section in the README; keep the per-case lists here so the front page stays read
 
 ```bash
 npm run typecheck   # tsc --noEmit, clean
-npm test            # 166 tests, offline, ~27s
+npm test            # 171 tests, offline, ~27s
 npm run demo        # Scene A + Scene B, ends with "Scene A CLOSED ✅ | Scene B CLOSED ✅"
 npm run smoke       # real MCP server over stdio through the full lifecycle
 npm run deploy:tls  # TLS + mTLS over this host's LAN address (not loopback), ~2s
@@ -323,7 +323,7 @@ The remote *security* model (flags, deployment shape, rotation drill) is documen
 in [remote.md](remote.md#security-model); the coverage list above mirrors
 [remote.md#remote-tests](remote.md#remote-tests).
 
-## `test/team.test.ts` — 24 cases
+## `test/team.test.ts` — 29 cases
 
 The team layer, driven end-to-end over the mock harness (deterministic, offline)
 plus a real HTTP server on an ephemeral port:
@@ -383,6 +383,16 @@ plus a real HTTP server on an ephemeral port:
   profile name, the local side holds exactly one proxied task, and the member
   keeps its ordinary `sessionKey` and transcript. The room never learns that one
   of its colleagues lives in a different process.
+- **The board.** A message the user posts without naming anybody is handed to a
+  member that has `claims` on the room, as a turn that starts from that message
+  and says plainly that nobody addressed it; the artifact exists afterwards and
+  the item leaves the board. A claimant that answers `SILENT` posts nothing, the
+  message stays on the board with that one member excluded, and the next claimant
+  gets it — a pass is recorded per member, not per item. Two members configured
+  on the same room cannot both take one message: the store's `BEGIN IMMEDIATE`
+  claim leaves exactly one `claimedBy` and one turn. Work older than
+  `claimTtlMs` drops off the board. Naming someone still routes straight to them
+  and never touches the board.
 - **Session rotation.** With `sessionTurns: 2`, three turns of one member record
   keys `team:acme:dev`, `team:acme:dev`, `team:acme:dev#1` — per turn, in the
   store — and the roster reports the generation it is on now. Exactly one worker
@@ -490,6 +500,19 @@ as browsable resources.
   "starting a fresh session" line twice). Rotation is only safe because the room
   and the memory file are the continuity — this is that claim, checked against a
   real adapter rather than a mock.
+- **The board against real `pi`** (ad-hoc run, 2026-10-20, not in `npm test`: it
+  spends tokens). A two-member room where only the engineer has `claims`. An
+  unaddressed "create `hello.txt` containing …" was taken as a `claim` turn, the
+  file was written by pi's own tools, `claims.decision` ended as `done` and the
+  CEO was never woken. The second message — *"Reminder to myself: I still need to
+  decide the enterprise pricing before Thursday"* — is the interesting one: pi did
+  **not** take the silence exit. It claimed, handed the item to the CEO, and the
+  CEO's "no action needed from @dev" woke the engineer again: three turns, three
+  messages, for a note the user wrote to himself. Adding one line to the claim
+  prompt (a note to yourself is nobody's task) brought the same message to one
+  turn and **zero** messages, with the item still open on the board and the
+  engineer recorded as having passed. Both halves are in `team.md`: the escape
+  hatch exists, and a model will not use it unless it is told why.
 
 ## Known gaps
 

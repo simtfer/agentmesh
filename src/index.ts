@@ -67,7 +67,7 @@ export { startTeamServer } from "./team/server.js";
 export type { TeamServerOptions, TeamServerHandle } from "./team/server.js";
 export { renderConsoleHtml } from "./team/console.js";
 export type { ConsoleOptions } from "./team/console.js";
-export { renderTurnPrompt } from "./team/prompt.js";
+export { renderTurnPrompt, renderClaimPrompt } from "./team/prompt.js";
 export { extractHandles, resolveMentions, mentionsHuman } from "./team/mentions.js";
 export type {
   TeamConfig,
@@ -76,6 +76,7 @@ export type {
   TeamMember,
   TeamMemberState,
   TeamMessage,
+  TeamBoardItem,
   TeamChannelState,
   TeamTurn,
   TeamTurnStatus,

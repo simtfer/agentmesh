@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type {
+  TeamBoardItem,
   TeamMessage,
   TeamMessageKind,
   TeamTurn,
@@ -48,6 +49,15 @@ CREATE TABLE IF NOT EXISTS turns (
 CREATE INDEX IF NOT EXISTS idx_turns_member ON turns(memberId, status, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_root ON turns(rootId);
 CREATE INDEX IF NOT EXISTS idx_turns_status ON turns(status, seq);
+CREATE TABLE IF NOT EXISTS claims (
+  messageId TEXT NOT NULL,
+  memberId TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  turnId TEXT,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (messageId, memberId)
+);
+CREATE INDEX IF NOT EXISTS idx_claims_message ON claims(messageId, decision);
 `;
 
 /** Columns added after the first release; `CREATE TABLE IF NOT EXISTS` won't add them. */
@@ -499,6 +509,117 @@ export class TeamStore {
       this.patchTurn(t.id, { status: "failed", endedAt, error: reason });
     }
     return turns;
+  }
+
+  /* ------------------------------ the board ---------------------------- */
+
+  /**
+   * The room's board: messages the user posted without addressing anybody.
+   *
+   * A message like that used to be a dead end that the team apologised for.
+   * It is really work looking for an owner, so it is kept here — with the same
+   * age limit a queue would have, because there is no point offering yesterday's
+   * remark to whoever happens to be free today. Finished work drops off the
+   * board; it is in the transcript, which is where history belongs.
+   */
+  board(channel: string, ttlMs: number, now = Date.now()): TeamBoardItem[] {
+    const cutoff = ttlMs > 0 ? now - ttlMs : 0;
+    const rows = this.db
+      .prepare(
+        `SELECT m.*,
+                (SELECT c.memberId FROM claims c
+                  WHERE c.messageId = m.id AND c.decision IN ('taken','done') LIMIT 1) AS claimedBy
+           FROM messages m
+          WHERE m.channel = ? AND m.kind = 'chat' AND m.author = 'user'
+            AND (m.mentions IS NULL OR m.mentions = '[]')
+            AND m.createdAt >= ?
+            AND NOT EXISTS (SELECT 1 FROM claims d WHERE d.messageId = m.id AND d.decision = 'done')
+          ORDER BY m.seq ASC`,
+      )
+      .all(channel, cutoff) as Row[];
+    const declined = this.db.prepare(
+      "SELECT memberId FROM claims WHERE messageId = ? AND decision IN ('declined','dropped') ORDER BY at ASC",
+    );
+    return rows.map((r) => {
+      const item: TeamBoardItem = {
+        message: rowToMessage(r),
+        declinedBy: (declined.all(String(r.id)) as Row[]).map((d) => String(d.memberId)),
+      };
+      const claimedBy = str(r.claimedBy);
+      if (claimedBy) item.claimedBy = claimedBy;
+      return item;
+    });
+  }
+
+  /** How much work is waiting for an owner, for the status line. */
+  unclaimedCount(ttlMs: number, now = Date.now()): number {
+    const cutoff = ttlMs > 0 ? now - ttlMs : 0;
+    const r = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM messages m
+          WHERE m.kind = 'chat' AND m.author = 'user'
+            AND (m.mentions IS NULL OR m.mentions = '[]')
+            AND m.createdAt >= ?
+            AND NOT EXISTS (SELECT 1 FROM claims c WHERE c.messageId = m.id AND c.decision IN ('taken','done'))`,
+      )
+      .get(cutoff) as Row;
+    return num(r.n) ?? 0;
+  }
+
+  /**
+   * Take a message off the board, atomically.
+   *
+   * Two members waking at the same moment must not both start the same piece of
+   * work, so the check and the write happen in one `BEGIN IMMEDIATE`
+   * transaction: the winner gets `true`, everybody else gets `false` and looks
+   * for the next item. SQLite has a single writer, which is exactly what makes
+   * this cheap.
+   */
+  claimFor(messageId: string, memberId: string): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const taken = this.db
+        .prepare("SELECT memberId FROM claims WHERE messageId=? AND decision IN ('taken','done') LIMIT 1")
+        .get(messageId) as Row | undefined;
+      const passed = taken
+        ? undefined
+        : (this.db
+            .prepare("SELECT decision FROM claims WHERE messageId=? AND memberId=? LIMIT 1")
+            .get(messageId, memberId) as Row | undefined);
+      if (taken || passed) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      this.db
+        .prepare("INSERT INTO claims (messageId, memberId, decision, turnId, at) VALUES (?,?, 'taken', NULL, ?)")
+        .run(messageId, memberId, Date.now());
+      this.db.exec("COMMIT");
+      return true;
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** Point a claim at the turn that is about to work on it. */
+  attachClaimTurn(messageId: string, memberId: string, turnId: string): void {
+    this.db
+      .prepare("UPDATE claims SET turnId=? WHERE messageId=? AND memberId=?")
+      .run(turnId, messageId, memberId);
+  }
+
+  /**
+   * How the claim ended. `done` keeps the message off the board for good;
+   * `declined`/`dropped` only stop *this* member being offered it again, so the
+   * work returns to the room instead of dying with one refusal.
+   */
+  setClaim(messageId: string, memberId: string, decision: "done" | "declined" | "dropped"): void {
+    this.db
+      .prepare(
+        `INSERT INTO claims (messageId, memberId, decision, turnId, at) VALUES (?,?,?, NULL, ?)
+         ON CONFLICT(messageId, memberId) DO UPDATE SET decision=excluded.decision, at=excluded.at`,
+      )
+      .run(messageId, memberId, decision, Date.now());
   }
 
   close(): void {

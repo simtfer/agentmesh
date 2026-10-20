@@ -39,6 +39,10 @@ interface TeamHarnessOptions {
   pulse?: Record<string, { everyMs: number; idleOnly?: boolean }>;
   /** per-member session rotation limit, keyed by member id */
   sessionTurns?: Record<string, number>;
+  /** per-member claim settings, keyed by member id (list of channels) */
+  claims?: Record<string, string[]>;
+  /** how long an unaddressed message stays claimable */
+  claimTtlMs?: number;
   replies?: { ceo?: string[]; dev?: string[]; qa?: string[] };
 }
 
@@ -78,6 +82,7 @@ function makeTeam(dir: string, opts: TeamHarnessOptions = {}) {
           role: "chief executive, splits goals into work",
           profile: "ceo-h",
           ...(opts.pulse?.ceo ? { pulse: opts.pulse.ceo } : {}),
+          ...(opts.claims?.ceo ? { claims: opts.claims.ceo } : {}),
         },
         {
           id: "dev",
@@ -86,6 +91,7 @@ function makeTeam(dir: string, opts: TeamHarnessOptions = {}) {
           profile: "dev-h",
           ...(opts.pulse?.dev ? { pulse: opts.pulse.dev } : {}),
           ...(opts.sessionTurns?.dev ? { sessionTurns: opts.sessionTurns.dev } : {}),
+          ...(opts.claims?.dev ? { claims: opts.claims.dev } : {}),
         },
         {
           id: "qa",
@@ -93,6 +99,7 @@ function makeTeam(dir: string, opts: TeamHarnessOptions = {}) {
           role: "verifier, tests what was built",
           profile: "qa-h",
           ...(opts.pulse?.qa ? { pulse: opts.pulse.qa } : {}),
+          ...(opts.claims?.qa ? { claims: opts.claims.qa } : {}),
         },
       ],
       channels: [
@@ -101,6 +108,7 @@ function makeTeam(dir: string, opts: TeamHarnessOptions = {}) {
       ],
       ...(opts.maxHops ? { maxHops: opts.maxHops } : {}),
       ...(opts.maxTurnsPerMessage ? { maxTurnsPerMessage: opts.maxTurnsPerMessage } : {}),
+      ...(opts.claimTtlMs !== undefined ? { claimTtlMs: opts.claimTtlMs } : {}),
     },
   });
   const orch = new Orchestrator(config, { baseCwd: dir, persist: false });
@@ -531,6 +539,153 @@ test("the rotation clock lives in the database, so a restart does not rewind it"
     );
   } finally {
     await cleanup(second, dir);
+  }
+});
+
+test("a message nobody was named in is picked up by a member who claims work", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const h = makeTeam(dir, {
+    claims: { dev: ["general"] },
+    replies: { dev: ["Pinned the seed in ci.yml — the flake came from the shuffle order."] },
+  });
+  try {
+    const posted = h.team.postWithTurns({
+      channel: "general",
+      text: "The ci test is flaky. Someone should pin it.",
+    });
+    assert.equal(posted.turns.length, 1, "nobody was named, so the mention router hands it to no one");
+    assert.equal(
+      posted.turns[0]!.kind,
+      "claim",
+      "the turn exists because a claimant picked the message up, not because it was addressed",
+    );
+
+    await h.team.idle(10_000);
+
+    const log = chat(h.team.messages("general"));
+    assert.deepEqual(
+      log.map((m) => m.author),
+      ["user", "dev"],
+      "the claimant answers the message nobody was addressed in",
+    );
+    assert.match(log[1]!.text, /Pinned the seed/);
+    assert.equal(log[1]!.replyTo, posted.message.id, "the reply answers the original message");
+
+    const turns = h.team.transcript("dev");
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0]!.kind, "claim", "a claim is a turn like any other, just with a different reason");
+    assert.equal(turns[0]!.status, "succeeded");
+    assert.equal(turns[0]!.messageId, posted.message.id);
+    assert.equal(turns[0]!.hops, 0, "the message was a root, not a hand-off");
+
+    assert.deepEqual(h.team.board("general"), [], "finished work leaves the board");
+    assert.equal(h.team.status().unclaimed, 0);
+  } finally {
+    await cleanup(h, dir);
+  }
+});
+
+test("a claim that is passed on goes back to the room instead of dying with one refusal", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const h = makeTeam(dir, {
+    claims: { dev: ["general"], qa: ["general"] },
+    replies: {
+      dev: ["SILENT"],
+      qa: ["Reproduced it twice with --seed 7; the fixture leaks state between tests."],
+    },
+  });
+  try {
+    h.team.post({ channel: "general", text: "Something is wrong with the nightly job." });
+    await h.team.idle(10_000);
+
+    const log = chat(h.team.messages("general"));
+    assert.deepEqual(
+      log.map((m) => m.author),
+      ["user", "qa"],
+      "a member that passes on work says nothing at all",
+    );
+
+    const devTurns = h.team.transcript("dev");
+    assert.equal(devTurns.length, 1);
+    assert.equal(devTurns[0]!.kind, "claim");
+    assert.equal(devTurns[0]!.status, "succeeded", "passing on work is a decision, not a failure");
+
+    const qaTurns = h.team.transcript("qa");
+    assert.equal(qaTurns.length, 1, "the item was released to the next claimant, not held by the first");
+    assert.equal(qaTurns[0]!.kind, "claim");
+
+    assert.deepEqual(h.team.board("general"), [], "qa finished it, so it left the board");
+  } finally {
+    await cleanup(h, dir);
+  }
+});
+
+test("two members cannot claim the same message", () => {
+  const store = new TeamStore(":memory:");
+  try {
+    const msg = store.createMessage({
+      channel: "general",
+      author: "user",
+      authorName: "user",
+      text: "fix the flaky test",
+    });
+    assert.equal(store.claimFor(msg.id, "dev"), true);
+    assert.equal(store.claimFor(msg.id, "qa"), false, "the second claimant has to walk away");
+    assert.equal(store.claimFor(msg.id, "dev"), false, "and so has the same member asking twice");
+    const board = store.board("general", 0);
+    assert.equal(board.length, 1);
+    assert.equal(board[0]!.claimedBy, "dev");
+
+    // A refusal is a per-member fact, not a verdict on the work: the item stays
+    // claimable by everyone else, and the member that passed is not asked twice.
+    const second = store.createMessage({
+      channel: "general",
+      author: "user",
+      authorName: "user",
+      text: "and the nightly job too",
+    });
+    assert.equal(store.claimFor(second.id, "dev"), true);
+    store.setClaim(second.id, "dev", "declined");
+    assert.equal(store.claimFor(second.id, "dev"), false, "the member that passed is not asked again");
+    assert.equal(store.claimFor(second.id, "qa"), true, "but the work is still there for a colleague");
+    assert.equal(store.claimFor(second.id, "ceo"), false);
+    assert.deepEqual(store.board("general", 0)[1]!.declinedBy, ["dev"]);
+  } finally {
+    store.close();
+  }
+});
+
+test("the board forgets work that is too old to be useful", () => {
+  const store = new TeamStore(":memory:");
+  try {
+    store.createMessage({
+      channel: "general",
+      author: "user",
+      authorName: "user",
+      text: "yesterday's remark",
+      createdAt: Date.now() - 2 * 3600_000,
+    });
+    assert.equal(store.board("general", 3600_000).length, 0);
+    assert.equal(store.unclaimedCount(3600_000), 0);
+    assert.equal(store.board("general", 0).length, 1, "a TTL of 0 means never");
+  } finally {
+    store.close();
+  }
+});
+
+test("naming someone still hands them the work directly", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agentmesh-team-"));
+  const h = makeTeam(dir, { claims: { dev: ["general"] } });
+  try {
+    h.team.post({ channel: "general", text: "@dev the health check returns 500" });
+    await h.team.idle(10_000);
+
+    const turns = h.team.transcript("dev");
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0]!.kind, "message", "an addressed message is answered, not claimed");
+    assert.deepEqual(h.team.board("general"), [], "an addressed message never reaches the board");
+  } finally {
+    await cleanup(h, dir);
   }
 });
 

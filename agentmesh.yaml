@@ -197,6 +197,9 @@ profiles:
 #       name: Sam
 #       role: engineer, writes and fixes code
 #       profile: opencode
+#       # Optional: pick up messages the user posts without naming anyone.
+#       # Replying SILENT passes the work on to the next claimant.
+#       # claims: [general]
 #   channels:
 #     - id: general
 #       description: the whole team

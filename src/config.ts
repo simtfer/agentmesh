@@ -99,6 +99,8 @@ const TeamMember = z.object({
   cwd: z.string().optional(),
   notes: z.string().optional(),
   pulse: TeamPulse.optional(),
+  /** channels where this member picks up messages nobody was addressed in */
+  claims: z.array(z.string()).optional(),
   sessionTurns: z.number().int().positive().optional(),
 });
 
@@ -127,6 +129,8 @@ const TeamSettings = z.object({
   port: z.number().int().min(0).max(65535).optional(),
   tokenEnv: z.string().optional(),
   sessionTurns: z.number().int().positive().optional(),
+  /** how long an unaddressed message stays claimable (ms; 0 = forever) */
+  claimTtlMs: z.number().int().nonnegative().optional(),
   members: z.array(TeamMember).min(1),
   channels: z.array(TeamChannel).optional(),
 });

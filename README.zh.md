@@ -21,7 +21,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/simtfer/agentmesh/blob/main/LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.13-brightgreen.svg)](https://github.com/simtfer/agentmesh/blob/main/package.json)
 
-166 个离线测试，覆盖 Linux 与 Windows · 尚未发布到 npm
+171 个离线测试，覆盖 Linux 与 Windows · 尚未发布到 npm
 
 ## 这是什么
 
@@ -112,7 +112,8 @@ queued ─▶ starting ─▶ running ─▶ succeeded
 **团队**把 worker 变成有名字的同事。每个成员是一个固定会话的 agent 进程，有自己的 harness profile、
 工作区和 `MEMORY.md`；成员共享房间，`@提及` 把下一轮交给某位队友。成员之间并行，单个成员串行，
 每一轮的工具调用都可查看——群聊本身就是界面，而不是它的总结。配了 `pulse` 的成员还会按自己的节奏
-醒来，只在真有事说的时候才开口。`team serve` 同时也是一个只读控制台
+醒来，只在真有事说的时候才开口；配了 `claims` 的成员会接**没人点名**的消息，于是发到房间里、
+不带 @ 的活能找到主人，而不是换来一句耸肩。`team serve` 同时也是一个只读控制台
 （`http://127.0.0.1:4317/`）：成员栏、房间记录、某位成员的逐轮过程，浏览器里就能看，不必守着终端。
 
 ```bash
@@ -225,7 +226,7 @@ stdio 上共 18 个工具。核心循环：
 
 ```bash
 npm run typecheck   # tsc --noEmit，干净
-npm test            # 166 个测试，全离线，无 API 费用，约 27 秒
+npm test            # 171 个测试，全离线，无 API 费用，约 27 秒
 npm run demo        # Scene A + Scene B 均闭环
 npm run smoke       # 真实 MCP server 走 stdio 跑完整生命周期
 npm run check:pack  # 发布包里有 dist/，且不含源码与测试
@@ -233,7 +234,7 @@ npm run deploy:tls  # 在本机真实网卡上跑 TLS/mTLS（不走 loopback）
 npm run real        # 本机真实的 opencode + pi（两者都需已安装并认证）
 ```
 
-`npm test` 为 **166/166**，分十二个文件，全离线，约 27 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。CI 在 Linux 与 Windows × Node 22 / 24 上跑同一套关卡（[`.github/workflows/ci.yml`](https://github.com/simtfer/agentmesh/blob/main/.github/workflows/ci.yml)）；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md)（英文）。
+`npm test` 为 **171/171**，分十二个文件，全离线，约 27 秒。每个用例都驱动公开接口（Orchestrator、MCP 工具，或 daemon 的 HTTP/WS 端点）并断言最终任务记录，而不是断言 mock 的内部调用。CI 在 Linux 与 Windows × Node 22 / 24 上跑同一套关卡（[`.github/workflows/ci.yml`](https://github.com/simtfer/agentmesh/blob/main/.github/workflows/ci.yml)）；真实的 OpenCode 与 Pi worker 也已端到端跑通。逐项明细与**尚未覆盖**的缺口：[`docs/verification.md`](https://github.com/simtfer/agentmesh/blob/main/docs/verification.md)（英文）。
 
 ## 路线图
 
