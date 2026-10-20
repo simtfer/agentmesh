@@ -61,12 +61,29 @@ sign() { # sign <csr> <extfile> <out>
 }
 
 # --- CA ---------------------------------------------------------------------
+# The extension set is passed as an explicit config file rather than -addext,
+# because `req -x509` ALSO applies whatever `x509_extensions` the host's
+# openssl.cnf defines. On a distro whose default is `v3_ca` (OpenSSL 1.1.1 on
+# Alibaba Cloud Linux / RHEL, among others) that yields basicConstraints TWICE on
+# the same certificate, and a CA with duplicate extensions is not accepted as a
+# CA -- verification fails with "unable to get local issuer certificate" even
+# though the files are right. A private config file makes the result independent
+# of the host's openssl.cnf.
 genkey ca-key.pem
+cat > ca.cnf <<EOF
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = $PREFIX CA
+[v3_ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+EOF
 openssl req -x509 -new -key ca-key.pem -sha256 -days "$DAYS" \
-  -subj "/CN=$PREFIX CA" \
-  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign" \
-  -out ca.pem
+  -config ca.cnf -extensions v3_ca -out ca.pem
 
 # --- server -----------------------------------------------------------------
 genkey server-key.pem
@@ -76,6 +93,8 @@ basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
 subjectAltName=$SAN
+authorityKeyIdentifier=keyid:always
+subjectKeyIdentifier=hash
 EOF
 sign server.csr server.ext server.pem
 
@@ -87,11 +106,13 @@ if [ "$CLIENT" = "1" ]; then
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature
 extendedKeyUsage=clientAuth
+authorityKeyIdentifier=keyid:always
+subjectKeyIdentifier=hash
 EOF
   sign client.csr client.ext client.pem
 fi
 
-rm -f ./*.csr ./*.ext ./*.srl
+rm -f ./*.csr ./*.ext ./*.srl ca.cnf
 chmod 600 ./*-key.pem 2>/dev/null || true
 
 echo "wrote to $OUT"
